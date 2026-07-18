@@ -1,0 +1,8 @@
+{
+  "tenant_id": "replace-with-designated-demo-tenant-id",
+  "account_codes": ["200", "610"],
+  "provider_ids": {
+    "account-200": "replace-with-provider-id",
+    "account-610": "replace-with-provider-id"
+  }
+}

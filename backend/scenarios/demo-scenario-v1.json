@@ -1,0 +1,32 @@
+{
+  "scenario_id": "demo-scenario-v1",
+  "version": 1,
+  "deployment": {
+    "mode": "demo",
+    "data_class": "synthetic",
+    "market": "US",
+    "currency": "USD"
+  },
+  "period": {
+    "start": "2026-07-01",
+    "end": "2026-07-31"
+  },
+  "xero": {
+    "environment": "demo",
+    "required_account_codes": ["200", "610"],
+    "baseline_fingerprint_environment": "ACCOUNTINGOS_XERO_DEMO_BASELINE_FINGERPRINT",
+    "tenant_id_environment": "ACCOUNTINGOS_XERO_DEMO_TENANT_ID",
+    "draft_status": "DRAFT"
+  },
+  "plaid": {
+    "environment": "sandbox",
+    "test_user": "user_transactions_dynamic",
+    "required_capabilities": ["transactions_sync", "webhook_replay", "pending_posted"]
+  },
+  "workspace": {
+    "environment": "demo",
+    "required_capabilities": ["drive_scoped_search", "gmail_draft", "gmail_send"]
+  },
+  "expected_exception": "bank_fee_unmatched",
+  "permitted_journal_type": "accrual_adjustment"
+}

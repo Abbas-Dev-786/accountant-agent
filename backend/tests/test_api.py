@@ -26,6 +26,11 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(run.json()["status"], "synchronizing")
         self.assertEqual(run.json()["deployment"], {"mode": "demo", "data_class": "synthetic"})
 
+    def test_connections_are_scoped_to_the_requested_organization(self) -> None:
+        response = self.client.get("/api/v1/organizations/demo-org/connections")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), [])
+
 
 if __name__ == "__main__":
     unittest.main()

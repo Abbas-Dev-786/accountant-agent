@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from .domain import CloseService, DeploymentConfig, JournalLine, JournalProposal, PolicyError
+from .connections import ConnectionRegistry
 
 
 def deployment_from_environment() -> DeploymentConfig:
@@ -24,6 +25,7 @@ def deployment_from_environment() -> DeploymentConfig:
 
 
 service = CloseService(deployment_from_environment())
+connections = ConnectionRegistry(service.deployment)
 app = FastAPI(title="AccountingOS API", version="0.1.0")
 
 
@@ -85,6 +87,22 @@ def get_run(run_id: str):
     return run
 
 
+def serialize_connection(connection) -> dict[str, object]:
+    return {
+        "id": connection.connection_id,
+        "organization_id": connection.organization_id,
+        "provider": connection.provider,
+        "provider_environment": connection.provider_environment,
+        "provider_tenant_or_account_id": connection.provider_tenant_or_account_id,
+        "status": connection.status.value,
+        "granted_scopes": list(connection.granted_scopes),
+        "last_verified_at": connection.last_verified_at.isoformat() if connection.last_verified_at else None,
+        "last_success_at": connection.last_success_at.isoformat() if connection.last_success_at else None,
+        "consent_expires_at": connection.consent_expires_at.isoformat() if connection.consent_expires_at else None,
+        "remediation": connection.remediation,
+    }
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "mode": service.deployment.mode, "data_class": service.deployment.data_class}
@@ -100,6 +118,11 @@ def create_close_run(request: CreateRunRequest) -> dict[str, str]:
 @app.get("/api/v1/close-runs/{run_id}")
 def get_close_run(run_id: str) -> dict[str, object]:
     return serialize_run(get_run(run_id))
+
+
+@app.get("/api/v1/organizations/{organization_id}/connections")
+def get_connections(organization_id: str) -> list[dict[str, object]]:
+    return [serialize_connection(connection) for connection in connections.for_organization(organization_id)]
 
 
 @app.post("/api/v1/close-runs/{run_id}/prepare-review")
@@ -132,4 +155,3 @@ def approve_close_run(run_id: str, request: ApprovalRequest) -> dict[str, object
     except PolicyError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return serialize_run(run)
-

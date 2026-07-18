@@ -1,0 +1,10 @@
+{
+  "providers": [
+    {"provider": "xero", "environment": "demo", "proven": true, "captured_at": "2026-07-18T00:00:00Z", "evidence_ref": "replace-with-runbook-or-ticket", "request_ids": ["replace-with-request-id"]},
+    {"provider": "plaid", "environment": "sandbox", "proven": true, "captured_at": "2026-07-18T00:00:00Z", "evidence_ref": "replace-with-runbook-or-ticket", "request_ids": ["replace-with-request-id"]},
+    {"provider": "workspace", "environment": "demo", "proven": true, "captured_at": "2026-07-18T00:00:00Z", "evidence_ref": "replace-with-runbook-or-ticket", "request_ids": ["replace-with-request-id"]},
+    {"provider": "b2", "environment": "demo", "proven": true, "captured_at": "2026-07-18T00:00:00Z", "evidence_ref": "replace-with-runbook-or-ticket", "request_ids": ["replace-with-request-id"]},
+    {"provider": "oidc", "environment": "demo", "proven": true, "captured_at": "2026-07-18T00:00:00Z", "evidence_ref": "replace-with-runbook-or-ticket", "request_ids": ["replace-with-request-id"]},
+    {"provider": "openai", "environment": "demo", "proven": true, "captured_at": "2026-07-18T00:00:00Z", "evidence_ref": "replace-with-runbook-or-ticket", "request_ids": ["replace-with-request-id"]}
+  ]
+}

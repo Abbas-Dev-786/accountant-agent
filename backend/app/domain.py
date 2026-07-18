@@ -68,6 +68,11 @@ class SourceRecordVersion:
     provider_record_id: str
     content_hash: str
     observed_at: datetime
+    # Canonical JSON is retained with the immutable version so downstream
+    # workers can inspect the normalized facts without calling a provider.
+    payload_json: str = ""
+    currency: str | None = None
+    accounting_date: str | None = None
 
 
 @dataclass(frozen=True)

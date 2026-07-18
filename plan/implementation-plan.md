@@ -182,6 +182,15 @@ blocks with the true provider condition. No cached/local data is substituted.
 - Do not call Fivetran in the demo.
 - Do not compute accounting reports from mutable raw rows.
 
+### Current implementation checkpoint
+
+`backend/app/providers.py`, `backend/app/normalization.py`, and
+`backend/app/ingestion.py` now provide the bounded Xero demo and Plaid Sandbox
+contracts, deterministic normalized versions, cursor-safe recovery, and an
+atomic worker-facing snapshot coordinator. See
+[`phase-2-operator-runbook.md`](phase-2-operator-runbook.md) for the evidence
+command and the deliberate persistence boundary.
+
 ## Phase 3 — Evidence and Policy-Controlled Email
 
 ### Outcome
@@ -448,6 +457,24 @@ Before declaring the demo milestone done, confirm:
   paths are demonstrated.
 - [ ] No demo pathway can access production credentials, data, callbacks, or
   artifacts.
+
+## Implementation checkpoints
+
+The remaining phase foundations are now present in the backend:
+
+- Phase 3: `backend/app/evidence.py` — scoped evidence, checklists, and Gmail
+  policy/idempotency.
+- Phase 4: `backend/app/reconciliation.py` and `backend/app/reports.py` —
+  deterministic matches, exceptions, journals, and report invariants.
+- Phase 5: `backend/app/ai.py` — bounded structured explanations and fail-closed
+  citation validation.
+- Phase 6: `backend/app/actions.py` — frozen approvals and Xero DRAFT gateway.
+- Phase 7: `backend/app/expansion.py` — separate US/India release gates.
+
+The external provider clients, PostgreSQL persistence, B2 Object Lock, and
+market/compliance evidence remain explicit release prerequisites; the code uses
+injected clients so these boundaries are testable without pretending that
+external sign-off has occurred.
 
 ## Definition of progress
 

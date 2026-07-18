@@ -9,20 +9,18 @@ boundary.
 
 - [Phase-by-phase implementation plan](implementation-plan.md) — Phases 0–7,
   dependencies, work items, tests, release gates, and explicit exclusions.
+- [Remaining work plan](remaining-work-plan.md) — persistence, real demo
+  integrations, worker/API/UI completion, and separate live-market releases.
+- [Phases 3–7 operator runbook](phase-3-7-operator-runbook.md) — implemented
+  safety boundaries and remaining external release evidence.
 
 ## Current position
 
-The repository has the first foundation slice:
-
-- a Python domain core for deployment guards, snapshots, approvals, balanced
-  journal proposals, and Xero draft reconciliation;
-- a FastAPI shell for health and close-run state;
-- a static Next.js demo shell;
-- unit and API tests for the implemented safety rules.
-
-This is **not** an integrated demo yet. Phase 0 proves external capabilities;
-Phases 1–6 build the isolated synthetic demo; Phase 7 is a separately gated
-live-product expansion.
+The repository has implemented foundations for Phases 0–7, with 62 backend
+tests and a successful Next.js production build. The provider and compliance
+gates that require external credentials, PostgreSQL/B2 infrastructure, or
+market sign-off remain explicitly open; no mocked result is treated as live
+acceptance.
 
 ## Operating rules for every phase
 
@@ -44,4 +42,3 @@ and attach the listed verification evidence before marking the phase complete.
 If a prerequisite is not available, keep the phase blocked and continue only
 with independent work from a later phase; do not replace it with a fake provider
 result.
-

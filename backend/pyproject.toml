@@ -1,0 +1,20 @@
+[project]
+name = "accountingos-api"
+version = "0.1.0"
+description = "AccountingOS close-readiness API"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115,<1.0",
+  "pydantic>=2.9,<3.0",
+  "uvicorn[standard]>=0.30,<1.0",
+]
+
+[project.optional-dependencies]
+test = ["httpx2>=2,<3"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"

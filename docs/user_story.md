@@ -1,13 +1,14 @@
 # AccountingOS Demo MVP Narrative
 
-**Version:** 1.2  
+**Version:** 1.3
 **Status:** Approved for synthetic demo acceptance  
 **Rule:** Demo records are synthetic, but provider calls and approval/action
 paths are real. The demo never touches a live customer organization.
 
 The demo uses an isolated US deployment, a designated Xero Demo Company, Plaid
 Sandbox, and a Google test Workspace. All displayed business values come from a
-versioned synthetic scenario seeded into those providers. The UI must show
+versioned synthetic scenario bootstrapped into Plaid and Workspace and verified
+against the prepared Xero baseline. The UI must show
 `DEMO — SYNTHETIC DATA` throughout the run.
 
 ## Demo Preparation
@@ -17,10 +18,11 @@ Before presenting, verify rather than fabricate:
 - Xero Demo Company and Plaid Sandbox connections are healthy.
 - The configured provider environments are `demo`/`sandbox`; no production
   credential, tenant, Item, callback, or artifact is reachable.
-- The versioned scenario seed completed and all expected provider identifiers
-  are recorded.
+- The versioned scenario bootstrap seeded Plaid and Workspace records, verified
+  the prepared Xero baseline, and recorded all expected provider identifiers.
+  Xero reset, when needed, was completed through the explicit operator runbook.
 - Test Drive, Gmail, B2, and OpenAI connections are healthy.
-- The rolling synthetic period contains enough activity to demonstrate the
+- The manifest-defined synthetic period contains enough activity to demonstrate the
   workflow.
 - The controller is present and authorized to make the exact approvals required
   during the acceptance run. Journal proposals are never pre-approved before the
@@ -225,7 +227,8 @@ The demo must remain truthful under provider failure:
 
 - Xero demo adapter delayed: show the sync blocker.
 - Plaid item error: show reconnect/wait guidance.
-- Scenario seed partial: show the affected provider record and remediation.
+- Scenario bootstrap partial or Xero-baseline mismatch: show the affected
+  provider record and remediation.
 - Google token expired: show reconnection.
 - OpenAI unavailable: preserve deterministic work and show AI task failure.
 - Xero write failed: preserve approval, reconcile possible prior creation, and

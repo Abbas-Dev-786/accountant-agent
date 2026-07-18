@@ -8,7 +8,7 @@ demo milestone and a later live product for Xero organizations.
 Read these documents in order:
 
 1. `demo_architecture.md` - isolated demo environment, provider boundaries,
-   scenario seeding, and demo acceptance rules.
+   scenario bootstrap/baseline verification, and demo acceptance rules.
 2. `PRD.md` - product outcome, demo/live data boundaries, action policy, scope,
    and acceptance criteria.
 3. `live_integrations.md` - demo provider setup plus later production/provider

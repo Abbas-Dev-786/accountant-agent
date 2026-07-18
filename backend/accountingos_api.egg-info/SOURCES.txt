@@ -1,0 +1,11 @@
+pyproject.toml
+accountingos_api.egg-info/PKG-INFO
+accountingos_api.egg-info/SOURCES.txt
+accountingos_api.egg-info/dependency_links.txt
+accountingos_api.egg-info/requires.txt
+accountingos_api.egg-info/top_level.txt
+app/__init__.py
+app/domain.py
+app/main.py
+tests/test_api.py
+tests/test_domain.py

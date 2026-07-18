@@ -1,6 +1,6 @@
 # AccountingOS Demo MVP and Live Product Technical Design
 
-**Version:** 1.2  
+**Version:** 1.3
 **Status:** Approved for demo implementation; live expansion remains gated  
 **Decision date:** 2026-07-18
 
@@ -130,11 +130,16 @@ records through the shared `SourceBatch` contract.
 ### `organizations`
 
 - `id`, `name`, `market`: `US` or `IN`
-- `deployment_mode`: `demo` or `production`
-- `data_class`: `synthetic` or `live`
 - `functional_currency`: `USD` or `INR`
 - `accounting_timezone`
 - `status`, `created_at`
+
+The deployment configuration, not this table, is the authority for
+`deployment_mode` and `data_class`. The server derives and persists those
+values on a close run. Constraints permit only `demo`/`synthetic` in the demo
+deployment and only `production`/`live` in a production deployment. A demo
+deployment additionally permits only the US/USD configuration described in the
+PRD; India/INR is production-only.
 
 ### `organization_users`
 
@@ -153,7 +158,8 @@ records through the shared `SourceBatch` contract.
 - `provider_environment`: `sandbox`, `demo`, or `production`
 
 Database constraints and startup checks reject environment mismatches. The
-deployment mode is never supplied by a browser request.
+deployment mode and data class are never supplied by a browser request or
+organization creation request.
 
 ### `close_configuration_versions`
 
@@ -260,23 +266,30 @@ immutable `source_snapshot`.
 
 - `id`, `organization_id`, `period_start`, `period_end`
 - `configuration_version`
-- provider watermarks and completion timestamps
+- `deployment_id`, immutable `deployment_mode`, immutable `data_class`
+- `snapshot_cutoff_at`, `source_batch_ids`, and provider watermarks/completion
+  timestamps captured in the same database transaction as membership
 - `status`: `building`, `complete`, `invalidated`
 - `created_at`, `invalidated_at`, `invalidation_reason`
 
 ### `snapshot_records`
 
-- `snapshot_id`, `record_type`, `normalized_record_id`
+- `snapshot_id`, `record_type`, immutable `normalized_record_version_id`,
+  `source_batch_id`
 - provider, provider tenant/account, provider record ID
 - provider updated timestamp, ingestion timestamp, content hash
-- unique source identity within the snapshot
+- unique `(snapshot_id, normalized_record_version_id)` and unique provider
+  source identity within the snapshot
 
-The snapshot contains permitted copies or references to immutable, append-only
-normalized record versions obtained from live systems. A provider ID and hash
-that point only to a mutable raw/provider row are not a reproducible snapshot.
-If a provider record changes after the snapshot, normalization creates a new
-record version; the existing package remains reproducible and the controller
-must refresh to create a new snapshot/package version.
+Every normalized record has a stable logical ID, immutable version ID, source
+batch ID, observed-at timestamp, and content hash. The snapshot contains
+permitted copies or references to those immutable, append-only versions. A
+provider ID and hash that point only to a mutable raw/provider row are not a
+reproducible snapshot. Membership and the source-batch completion state commit
+atomically; if a required source changes before that commit, the snapshot build
+restarts. If a provider record changes later, normalization creates a new record
+version; the existing package remains reproducible and the controller must
+refresh to create a new snapshot/package version.
 
 ## 8. Canonical Normalized Records
 
@@ -295,9 +308,11 @@ Every normalized financial record includes organization, currency, accounting
 date, provider, provider ID, original amount, original payload hash, and
 ingestion source. Normalization cannot change source amounts to force a match.
 
-## 9. Live Workflow DAG
+## 9. Close-Readiness Workflow DAG
 
-The only MVP template is `live-close-readiness-v1`.
+The only MVP template is `close-readiness-v1`. It runs against the demo source
+adapters in the isolated demo deployment and against production source adapters
+only after the relevant release gates pass.
 
 ```text
 T01 Validate organization configuration and connections
@@ -441,9 +456,14 @@ Task idempotency key:
 
 ### Xero Draft Journal Creation
 
-1. Persist the approved action and a deterministic AccountingOS proposal marker.
+1. Persist the approved action, immutable request hash, and deterministic Xero
+   marker before contacting Xero. The marker is
+   `AOSMJv1/<action_execution_uuid>/<proposal_hash_prefix>` at the beginning of
+   the server-generated narration; the complete expected narration is stored
+   with the action and is never model-supplied.
 2. Acquire a database advisory lock for the organization/proposal.
-3. Query Xero for an existing manual journal carrying the marker.
+3. Query Xero for an existing manual journal using the exact stored narration,
+   then verify the marker, proposal hash, and all approved fields locally.
 4. If found, compare all lines and adopt its Xero ID only when identical.
 5. Otherwise create the journal with status forced to `DRAFT`.
 6. Persist the Xero ID and response, then read it back and compare status, date,
@@ -583,7 +603,8 @@ In addition to organization, connection, configuration, raw, and snapshot tables
 ### `close_runs`
 
 - organization, period, workflow/configuration version
-- source snapshot ID, status, active package version
+- deployment ID, immutable deployment mode/data class, source snapshot ID,
+  status, and active package version
 - controller, row version, timestamps
 
 ### `source_syncs`
@@ -591,6 +612,14 @@ In addition to organization, connection, configuration, raw, and snapshot tables
 - provider, connection, request type, request/provider IDs
 - requested range, cursor/consent/sync watermarks
 - status, row counts, warnings, started/completed timestamps
+
+### `source_batches`
+
+- provider, connection, source sync, adapter/environment identity, and source
+  watermark
+- immutable payload/copy manifest, normalized record-version IDs, completeness,
+  warnings, request/event IDs, and committed timestamp
+- one committed batch is the snapshot membership boundary for one provider
 
 ### `webhook_receipts`
 
@@ -630,7 +659,8 @@ In addition to organization, connection, configuration, raw, and snapshot tables
 
 ### `approvals`, `ai_invocations`, `action_executions`, `audit_events`
 
-- immutable decision, reproducibility, idempotency, and timeline records
+- immutable decision, reproducibility, idempotency, external marker, request
+  hash, and timeline records
 - globally increasing audit sequence for SSE replay
 
 ## 17. API Surface
@@ -717,6 +747,8 @@ The user timeline is built from persisted audit events, not process logs.
 - Email policy and MCP tool authorization.
 - AI evidence and amount validation.
 - Idempotency and deterministic action markers.
+- Xero marker lookup using exact narration, including a malformed, duplicated,
+  and controller-tampered draft.
 
 ### Provider Contract
 
@@ -745,7 +777,7 @@ The user timeline is built from persisted audit events, not process logs.
 - Provider timeout with an unsearchable or ambiguous external-action result.
 - Package immutability before approval, during action failure, and after retry.
 - Duplicate/out-of-order provider webhooks.
-- Expired OAuth, revoked Plaid Item, demo scenario seed failure, and later
+- Expired OAuth, revoked Plaid Item, demo scenario-bootstrap failure, and later
   expired/partial Setu consent.
 - Prompt injection in email/document evidence.
 - Cross-organization record, evidence, tool, and SSE access attempts.
@@ -782,10 +814,12 @@ storage region.
   proposal markers, rate limits, and read-back behavior.
 - Confirm Plaid Sandbox Link, dynamic transaction seeding, cursor sync,
   pending/posted behavior, webhook replay, and Item error behavior.
-- Verify demo scenario seeding and reset/repeat behavior.
+- Verify the prepared Xero baseline, Plaid/Workspace bootstrap, and the manual
+  Xero reset/repeat runbook.
 
-Exit: the synthetic scenario can be seeded and read coherently from both
-providers; no unverified demo-provider assumption remains.
+Exit: the prepared Xero baseline plus seeded Plaid/Workspace scenario can be
+verified and read coherently from all demo providers; no unverified
+demo-provider assumption remains.
 
 ### Phase 1: Demo Organization and Connection Platform
 

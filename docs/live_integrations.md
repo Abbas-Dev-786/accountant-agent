@@ -1,6 +1,6 @@
 # Demo and Live Integration Specification
 
-**Version:** 1.2  
+**Version:** 1.3
 **Status:** Required companion to `PRD.md` and `TDD.md`  
 **Rule:** Demo runs use isolated synthetic providers; production and live
 acceptance runs use live authenticated providers only.
@@ -60,8 +60,9 @@ Fivetran must never be treated as a write-back or journal-posting mechanism.
 - Record the provider environment as `demo` and reject production tenants.
 - Verify account codes, pagination, rate limits, draft status semantics,
   deterministic proposal markers, and line-by-line read-back.
-- Run the scenario seeder and verify every expected provider identifier before a
-  close run can start.
+- Run the scenario bootstrap: seed Plaid and Workspace data, then verify every
+  expected Xero-baseline provider identifier before a close run can start. A
+  Xero Demo Company reset is an explicit operator runbook step.
 
 ### Demo Runtime Checks
 
@@ -72,12 +73,35 @@ Fivetran must never be treated as a write-back or journal-posting mechanism.
    watermark.
 4. No production credential, tenant, Item, callback, or artifact is reachable.
 
+### Required Xero Scope Profile
+
+Controller login is handled by the managed OIDC provider; Xero OAuth requests
+only organization-data scopes. New Xero applications use these granular scopes:
+
+- `offline_access`
+- `accounting.settings.read`
+- `accounting.contacts.read`
+- `accounting.invoices.read`
+- `accounting.payments.read`
+- `accounting.banktransactions.read`
+- `accounting.manualjournals` for the narrowly bounded draft-journal create and
+  read-back path
+- `accounting.reports.trialbalance.read`
+- `accounting.reports.profitandloss.read`
+- `accounting.reports.balancesheet.read`
+
+The MVP does not request the Xero Journals endpoint or `accounting.journals.read`.
+That endpoint has separate Xero access requirements and is unnecessary for the
+defined direct-verification/report-control path. The Phase 0 capability spike
+must record the exact granted scope set and fail onboarding if it differs from
+this profile.
+
 ### Production Setup Checklist
 
 - Register a Xero production app and configure OAuth callback URLs for US and IN
   deployments.
-- Request only the scopes required for organization, accounting reads, and
-  approved draft-journal creation.
+- Request exactly the Xero scope profile above; no broad deprecated scope or
+  additional write scope is permitted.
 - Complete the OAuth authorization-code flow with state, PKCE, redirect URI, and
   tenant-selection validation. Validate issuer and nonce only if the selected
   provider flow uses OpenID Connect.
@@ -102,8 +126,8 @@ Before a run:
 After an approved journal write:
 
 1. The policy gateway confirms the controller approval and exact proposal hash.
-2. The MCP server queries for an existing AccountingOS proposal marker before
-   creating anything.
+2. The MCP server queries for the exact stored AccountingOS narration/marker
+   before creating anything, then verifies the full approved request hash.
 3. The journal request sets status to `DRAFT`.
 4. The returned journal identifier is persisted.
 5. The journal is read back and compared line-by-line with the approved proposal.
@@ -119,7 +143,8 @@ and read-back behavior.
 - Fivetran delayed/failed sync: block until a successful sync is observed.
 - Tenant mismatch: fail closed; never process the returned tenant.
 - API rate limit: bounded retry with provider-respecting backoff.
-- Draft creation timeout: search by deterministic proposal marker before retry.
+- Draft creation timeout: search by the exact stored narration/marker before
+  retry; a malformed, duplicated, or altered draft is an `action_failed` state.
 - Unknown or ambiguous search result: mark the action outcome unknown and stop
   automatic retry until an operator can reconcile the provider state.
 - Read-back mismatch: mark action failed and require controller review.
@@ -129,13 +154,13 @@ and read-back behavior.
 ### Demo Setup Checklist
 
 - Create Plaid Sandbox credentials and use a Sandbox Link token.
-- Use a Sandbox Item configured for Transactions and the scenario seeder's
-  supported dynamic test user.
+- Use a Sandbox Item configured for Transactions and the scenario bootstrap's
+  supported custom or dynamic test user.
 - Configure the demo webhook URL and verification/replay checks.
 - Store the Sandbox access token in the demo secret store; store only opaque
   Item/account references in the demo database.
-- Generate a rolling synthetic period and record the Item, accounts, cursor,
-  scenario version, and provider request IDs.
+- Generate the manifest-defined synthetic period and record the Item, accounts,
+  cursor, scenario version, and provider request IDs.
 
 ### Production Setup Checklist
 

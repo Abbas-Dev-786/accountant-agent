@@ -1,6 +1,6 @@
 # AccountingOS Demo Architecture
 
-**Version:** 1.2  
+**Version:** 1.3
 **Status:** Approved for implementation  
 **Decision date:** 2026-07-18
 
@@ -32,10 +32,12 @@ Production: production web/API/worker/webhooks
             Plaid Production/Setu + real Xero organization + Google production
 ```
 
-The deployment mode is immutable configuration. It is never selected by a
-browser request or organization field. Every connection stores its provider
-environment and every run records `demo` or `production` plus a data class of
-`synthetic` or `live`.
+The deployment mode and data class are immutable deployment configuration. They
+are never selected by a browser request or stored as mutable organization
+attributes. Every connection stores its provider environment. The server copies
+the deployment mode (`demo` or `production`) and data class (`synthetic` or
+`live`) into each run when it is created; database constraints reject any value
+that differs from the deployment configuration.
 
 Startup and database guards reject:
 
@@ -76,18 +78,24 @@ The demo Xero adapter and the future Fivetran adapter implement the same
 contract. Normalization, snapshots, reconciliation, reports, and workflow tasks
 do not branch on provider SDK response shapes.
 
-## Scenario seeding
+## Scenario bootstrap
 
-Every demo run starts from a versioned scenario manifest. The seeder creates or
-verifies coherent records across Plaid Sandbox, Xero Demo Company, and the test
-Workspace. The manifest defines the rolling accounting period, accounts,
-transactions, references, fees, evidence, expected exceptions, and permitted
-journal proposal.
+Every demo run selects a versioned scenario manifest. The bootstrap seeds Plaid
+Sandbox and the test Workspace, then verifies a prepared Xero Demo Company
+baseline against the manifest. It does not claim to reset the Xero Demo Company
+through the API: resetting that company is an explicit operator runbook step.
 
-The seeder is idempotent and records provider IDs. A partial seed marks the
-scenario unusable; it never lets a run proceed with silently incomplete data.
-Repeated presentations use a new scenario version or a reset Demo Company, so
-draft journals and evidence are not mistaken for a clean run.
+The manifest defines the fixed accounting period, expected Xero baseline
+fingerprint and provider IDs, Plaid accounts and transactions, evidence,
+references, fees, expected exceptions, and permitted journal proposal. The
+Plaid portion uses a custom Sandbox user or dynamic test user; its data must be
+created within the provider's supported date and account limitations.
+
+The bootstrap is idempotent and records every provider ID. A partial seed or a
+Xero-baseline mismatch marks the scenario unusable; it never lets a run proceed
+with silently incomplete data. Repeated presentations use a new scenario
+version or an operator-performed Xero Demo Company reset followed by baseline
+verification, so draft journals and evidence are not mistaken for a clean run.
 
 ## Agent execution
 
@@ -110,7 +118,7 @@ arbitrary tools, or write directly to a provider.
 
 1. Connect a demo organization to Plaid Sandbox, Xero Demo Company, and the
    test Workspace.
-2. Seed and verify one versioned scenario.
+2. Bootstrap and verify one versioned scenario.
 3. Synchronize all providers and atomically record source watermarks.
 4. Build an immutable snapshot and run deterministic evidence and reconciliation
    controls.
@@ -129,4 +137,3 @@ arbitrary tools, or write directly to a provider.
 - journal posting, payment, period locking, deletion, or voiding;
 - silently substituting local data for a failed provider;
 - calling synthetic data a live close or an approved accounting period.
-

@@ -1,7 +1,7 @@
 # Documentation Contradictions: Final Decision Ledger
 
 **Revalidated:** 2026-07-18  
-**Current specification:** Demo MVP and live expansion v1.2  
+**Current specification:** Demo MVP and live expansion v1.3
 **Demo market:** United States  
 **Later live markets:** United States and India
 
@@ -120,7 +120,7 @@ provider calls and action controls with synthetic records:
 ```text
 Plaid Sandbox + Xero Demo Company + Google test Workspace
                          |
-               versioned scenario seeder
+              versioned scenario bootstrap
                          |
                  canonical SourceBatch
                          |
@@ -134,7 +134,9 @@ Plaid Sandbox + Xero Demo Company + Google test Workspace
 ```
 
 `XeroDirectDemoAdapter` and `PlaidSandboxAdapter` implement the same source
-contract that later production adapters use. Demo and production have separate
+contract that later production adapters use. The demo bootstrap seeds Plaid and
+the test Workspace, then verifies a prepared Xero Demo Company baseline; a Xero
+reset is an explicit operator runbook step. Demo and production have separate
 databases, secrets, callbacks, artifacts, and environment guards. Fivetran,
 Setu, Plaid Production, and real customer organizations remain later live
 milestones.
@@ -188,6 +190,23 @@ The final pass resolved the remaining implementation-level conflicts:
   selection.
 - Fixture-era claims about one expected exception, dynamic MVP planning, and the
   first component to build were removed from the supporting workflow document.
+
+## Build-Readiness Amendments
+
+The v1.3 amendment resolves the remaining build-blocking ambiguities without
+expanding product scope:
+
+- Deployment mode and data class are immutable deployment configuration, never
+  mutable organization attributes; they are copied into server-created runs.
+- The demo bootstrap seeds Plaid and the test Workspace, but verifies a prepared
+  Xero Demo Company baseline. Xero reset is an explicit operator runbook step.
+- Snapshots now name immutable normalized record versions, source batches,
+  atomic membership/cutoff semantics, and the constraints required for
+  reproducibility.
+- Xero draft creation now has a concrete server-generated narration marker,
+  stored request hash, exact-marker lookup, and altered-draft failure path.
+- The exact granular Xero scope profile is defined, and the separate Journals
+  endpoint is explicitly excluded from the MVP.
 
 ## Build Decision
 

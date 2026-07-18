@@ -1,0 +1,2 @@
+"""AccountingOS backend package."""
+

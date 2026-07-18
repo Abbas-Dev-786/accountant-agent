@@ -1,6 +1,6 @@
 # AccountingOS Demo MVP and Live Product Requirements
 
-**Version:** 1.2  
+**Version:** 1.3
 **Status:** Approved for demo implementation; live product remains gated  
 **Decision date:** 2026-07-18  
 **Primary user:** Controller  
@@ -143,7 +143,8 @@ used so results remain reproducible.
 - Plaid Sandbox Transactions with cursor synchronization and webhook replay.
 - Google test Workspace evidence search and policy-controlled test email.
 - Demo B2 artifact storage.
-- Versioned scenario seeding across Plaid Sandbox, Xero, and Workspace.
+- Versioned scenario bootstrap: seed Plaid Sandbox and Workspace, and verify a
+  prepared Xero Demo Company baseline through an explicit reset runbook.
 - Versioned close configuration and source snapshots.
 - Fixed, versioned close-readiness workflow with persisted task execution.
 - Deterministic document, reconciliation, journal, and reporting controls.
@@ -360,8 +361,10 @@ called live until its gates pass.
 The demo milestone is complete when all of the following pass using only the
 isolated demo deployment and synthetic provider records:
 
-1. A versioned scenario seeds coherent Plaid Sandbox, Xero Demo Company, and
-   test Workspace records and records their provider IDs.
+1. A versioned scenario bootstrap seeds Plaid Sandbox and the test Workspace,
+   verifies the prepared Xero Demo Company baseline, and records every provider
+   ID. Xero reset is an explicit operator runbook step, not an unverified API
+   capability.
 2. Plaid cursor synchronization applies added, modified, and removed records
    atomically and safely handles duplicate/out-of-order webhooks.
 3. Xero Demo Company reads pass tenant, account-code, pagination, and source

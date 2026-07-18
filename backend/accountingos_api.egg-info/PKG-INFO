@@ -1,0 +1,10 @@
+Metadata-Version: 2.4
+Name: accountingos-api
+Version: 0.1.0
+Summary: AccountingOS close-readiness API
+Requires-Python: >=3.12
+Requires-Dist: fastapi<1.0,>=0.115
+Requires-Dist: pydantic<3.0,>=2.9
+Requires-Dist: uvicorn[standard]<1.0,>=0.30
+Provides-Extra: test
+Requires-Dist: httpx2<3,>=2; extra == "test"

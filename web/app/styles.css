@@ -1,0 +1,17 @@
+:root { color: #f5f0e8; background: #102821; font-family: Arial, Helvetica, sans-serif; }
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; }
+main { max-width: 1180px; margin: auto; padding: 26px 30px 72px; }
+.banner { background: #e7a63e; color: #18251e; display: inline-block; font-size: 11px; font-weight: 800; letter-spacing: .13em; padding: 8px 11px; }
+header { display: flex; align-items: end; justify-content: space-between; gap: 28px; padding: 92px 0 58px; }
+.eyebrow { color: #c1d3be; font-size: 11px; font-weight: 700; letter-spacing: .14em; margin: 0 0 13px; }
+h1, h2, p { margin-top: 0; } h1 { font-family: Georgia, serif; font-size: clamp(46px, 7vw, 82px); line-height: .97; letter-spacing: -.055em; max-width: 720px; margin-bottom: 20px; }
+h2 { font-family: Georgia, serif; font-size: 28px; letter-spacing: -.03em; margin-bottom: 16px; }
+.subtitle { color: #d8dfd1; font-size: 18px; line-height: 1.5; max-width: 610px; }
+button { background: #e7a63e; border: 0; color: #14261f; cursor: pointer; font-size: 15px; font-weight: 800; padding: 15px 21px; white-space: nowrap; }
+.grid { display: grid; gap: 16px; grid-template-columns: 1.1fr 1fr; }
+.card { background: #17362d; border: 1px solid #305145; padding: 28px; }
+.sources { grid-row: span 2; } ul { list-style: none; margin: 28px 0 0; padding: 0; } li { align-items: center; border-top: 1px solid #315348; display: grid; gap: 11px; grid-template-columns: 11px 1fr auto; padding: 19px 0; } li:last-child { border-bottom: 1px solid #315348; } li strong, li small { display: block; } li small, .policy p, .progress p { color: #c8d2c6; font-size: 14px; margin-top: 5px; } li b { color: #a7d797; font-size: 12px; } .dot { background: #91cb78; border-radius: 50%; height: 8px; width: 8px; }
+.progress p, .policy p { line-height: 1.55; max-width: 520px; }.steps { align-items: center; display: flex; margin-top: 45px; }.steps span { background: #e7a63e; border-radius: 50%; color: #14261f; display: grid; font-size: 12px; font-weight: 800; height: 25px; place-items: center; width: 25px; }.steps i { background: #4c6b5f; height: 1px; flex: 1; }.labels { color: #c1d3be; display: flex; font-size: 11px; justify-content: space-between; margin-top: 10px; }.forbidden { border-left: 3px solid #e7a63e; color: #e7ddc5; font-size: 14px; line-height: 1.5; margin-top: 26px; padding-left: 13px; }
+@media (max-width: 720px) { main { padding: 20px; } header { align-items: start; flex-direction: column; padding: 56px 0 38px; } .grid { grid-template-columns: 1fr; } .sources { grid-row: auto; } }
+

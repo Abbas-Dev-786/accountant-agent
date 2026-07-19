@@ -28,8 +28,9 @@ demo followed by a US production pilot; India is deferred.
 
 Phase 1 identity and connection primitives live in
 [`backend/app/security.py`](backend/app/security.py),
-[`backend/app/connections.py`](backend/app/connections.py), and the SQL migration
-under `backend/migrations/`.
+[`backend/app/connections.py`](backend/app/connections.py), and the SQL migrations
+under `supabase/migrations/` (the single schema source of truth; see
+[`backend/migrations/README.md`](backend/migrations/README.md)).
 
 Phase 2 ingestion primitives live in
 [`backend/app/providers.py`](backend/app/providers.py),

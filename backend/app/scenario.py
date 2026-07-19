@@ -17,7 +17,7 @@ from typing import Any
 from .domain import PolicyError
 
 
-REQUIRED_PROVIDER_EVIDENCE = frozenset({"xero", "plaid", "workspace", "b2", "oidc", "openai"})
+REQUIRED_PROVIDER_EVIDENCE = frozenset({"xero", "plaid", "workspace", "b2", "oidc", "groq"})
 
 
 def _is_placeholder(value: str) -> bool:
@@ -170,7 +170,7 @@ def verify_capability_evidence(scenario: DemoScenario, evidence: tuple[Capabilit
         "workspace": scenario.workspace_environment,
         "b2": "demo",
         "oidc": "demo",
-        "openai": "demo",
+        "groq": "demo",
     }
     for provider, environment in expected_environments.items():
         item = by_provider[provider]

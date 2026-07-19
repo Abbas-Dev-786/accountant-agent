@@ -104,9 +104,9 @@ Phase 0 credentials, scope evidence, and callback URLs.
 
 ### Work items
 
-1. Replace in-memory run storage with PostgreSQL plus Alembic migrations for
-   organizations, organization users, connections, configurations, audit events,
-   and deployment configuration.
+1. Replace in-memory run storage with Supabase Postgres plus timestamped
+   `supabase/migrations/` (Supabase CLI) for organizations, organization users,
+   connections, configurations, audit events, and deployment configuration.
 2. Implement managed OIDC authorization-code + PKCE login. Map the configured
    issuer/subject into `organization_users`; do not create local passwords.
 3. Add a server-owned deployment configuration. Persist deployment mode and data

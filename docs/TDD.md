@@ -88,7 +88,9 @@ mode switch inside production.
 ### Backend
 
 - Python 3.12.
-- FastAPI, Pydantic v2, SQLAlchemy 2, and Alembic.
+- FastAPI, Pydantic v2, and psycopg over Supabase Postgres. Schema changes are
+  timestamped migrations under `supabase/migrations/` applied with the Supabase
+  CLI — not an ORM migration tool.
 - PostgreSQL 16.
 - OpenAI SDK with structured outputs.
 - Provider clients for direct Xero demo reads, future Fivetran ingestion, Plaid,

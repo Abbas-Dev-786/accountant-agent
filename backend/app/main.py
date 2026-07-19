@@ -11,6 +11,8 @@ from pydantic import BaseModel, Field
 
 from .domain import CloseService, DeploymentConfig, JournalLine, JournalProposal, PolicyError
 from .connections import ConnectionRegistry
+from .security import create_oauth_transaction, validate_oauth_callback
+from .xero_oauth import InMemoryOAuthSessionStore, XeroOAuthClient, XeroOAuthError
 
 
 def deployment_from_environment() -> DeploymentConfig:
@@ -27,6 +29,14 @@ def deployment_from_environment() -> DeploymentConfig:
 service = CloseService(deployment_from_environment())
 connections = ConnectionRegistry(service.deployment)
 app = FastAPI(title="AccountingOS API", version="0.1.0")
+xero_oauth_client: XeroOAuthClient | None = None
+xero_oauth_sessions = InMemoryOAuthSessionStore()
+
+
+def configure_xero_oauth(client: XeroOAuthClient | None) -> None:
+    """Inject the server-side Xero client during application bootstrap/tests."""
+    global xero_oauth_client
+    xero_oauth_client = client
 
 
 class CreateRunRequest(BaseModel):
@@ -123,6 +133,47 @@ def get_close_run(run_id: str) -> dict[str, object]:
 @app.get("/api/v1/organizations/{organization_id}/connections")
 def get_connections(organization_id: str) -> list[dict[str, object]]:
     return [serialize_connection(connection) for connection in connections.for_organization(organization_id)]
+
+
+@app.get("/api/v1/organizations/{organization_id}/connections/xero/authorize")
+def authorize_xero(organization_id: str) -> dict[str, str]:
+    if xero_oauth_client is None:
+        raise HTTPException(status_code=503, detail="Xero OAuth is not configured")
+    transaction = create_oauth_transaction("xero", xero_oauth_client.config.redirect_uri)
+    xero_oauth_sessions.put(transaction, organization_id)
+    try:
+        authorization_url = xero_oauth_client.authorization_url(transaction.state, transaction.code_challenge)
+    except XeroOAuthError as exc:
+        raise HTTPException(status_code=503, detail="Xero OAuth configuration is invalid") from exc
+    return {"authorization_url": authorization_url, "state": transaction.state}
+
+
+@app.get("/api/v1/connections/xero/callback")
+def xero_callback(
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+) -> dict[str, object]:
+    if xero_oauth_client is None:
+        raise HTTPException(status_code=503, detail="Xero OAuth is not configured")
+    if not state:
+        raise HTTPException(status_code=400, detail="Xero OAuth state is required")
+    session = xero_oauth_sessions.consume(state)
+    if session is None:
+        raise HTTPException(status_code=400, detail="Xero OAuth state is invalid or already used")
+    transaction, organization_id = session
+    if error:
+        raise HTTPException(status_code=400, detail="Xero authorization was declined")
+    if not code:
+        raise HTTPException(status_code=400, detail="Xero OAuth authorization code is required")
+    try:
+        validate_oauth_callback(transaction, state, xero_oauth_client.config.redirect_uri)
+        token = xero_oauth_client.exchange_code(code, transaction.code_verifier)
+    except XeroOAuthError as exc:
+        raise HTTPException(status_code=502, detail="Xero OAuth token exchange failed") from exc
+    except PolicyError as exc:
+        raise HTTPException(status_code=400, detail="Xero OAuth callback validation failed") from exc
+    return {"status": "authorized", "organization_id": organization_id, "expires_in": token.expires_in}
 
 
 @app.post("/api/v1/close-runs/{run_id}/prepare-review")

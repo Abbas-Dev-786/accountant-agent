@@ -15,6 +15,14 @@ Populate the non-secret identifiers in `backend/.env` from
 
 ## 2. Record the prepared Xero baseline
 
+For the standard Xero OAuth/Auth Code app, authorize the isolated Demo Company
+using a one-time state/PKCE transaction and the exact granular scope profile in
+[`docs/live_integrations.md`](../docs/live_integrations.md). Store
+the client secret and rotating refresh token through the server-side secret
+manager. Do not place either token in browser variables or evidence files. The
+resulting access token is used to call `/connections`; select the returned
+`tenantId` before calling tenant-scoped Accounting API endpoints.
+
 Use the designated Xero Demo Company to collect the tenant ID, required account
 codes, and provider IDs. Write the observation in the shape shown by
 [`example-xero-baseline.json`](../backend/evidence/example-xero-baseline.json).

@@ -1,14 +1,18 @@
 # AccountingOS Remaining Work Plan
 
 **Specification baseline:** v1.3  
-**Starting point:** Phases 0–7 safety foundations are implemented and tested.  
-**Purpose:** finish the isolated synthetic demo, then separately gate live US
-and India expansion.
+**Starting point:** Phases 0–7 safety foundations are implemented and tested;
+Phase 8 persistence scaffolding, Phase 9 runtime adapters, and the Phase 10
+worker state layer are implemented but still require external/database
+evidence.
+**Purpose:** finish the isolated synthetic US demo, then gate a US production
+pilot. India is explicitly deferred until a separate scope decision.
 
 This plan covers the work that remains after the provider-contract and policy
-foundations. The current code uses injected clients and in-memory state so the
-rules are testable. The next work replaces those seams with durable persistence,
-real demo integrations, worker execution, and a usable web workflow.
+foundations. The current code now includes transport-injected provider seams,
+Supabase migration scaffolding, and server-only Groq/Supabase boundaries. The
+next work applies the migration, provisions real US demo accounts, and replaces
+the remaining in-memory workflow with durable workers and a usable web flow.
 
 ## Current baseline
 
@@ -22,13 +26,15 @@ Already implemented:
 - deterministic reconciliation, exceptions, journals, and report invariants;
 - bounded AI explanation validation;
 - frozen controller approvals and Xero `DRAFT` action policy;
-- US/India production release gates;
-- 62 backend tests and a successful Next.js production build.
+- US production release gates, with India retained only as deferred boundary
+  code;
+- 92 backend tests and a successful Next.js production build.
 
 Not yet complete:
 
-- durable PostgreSQL state and migrations behind the Python domain;
-- real secret-manager and provider SDK/MCP clients;
+- applying and validating the Supabase migration against a local/remote
+  project, then wiring every domain aggregate to durable repositories;
+- managed secret-manager provisioning and real provider account evidence;
 - worker DAG, leases, retries, cancellation, and SSE replay;
 - integrated API and web screens;
 - external Phase 0 capability evidence and end-to-end demo acceptance;
@@ -48,7 +54,54 @@ Not yet complete:
 6. Do not add posting, payment, delete, void, period-lock, arbitrary email, or
    unrestricted MCP capabilities.
 
-## Phase 8 — Durable persistence and workflow data model
+## Technology decisions for the next build
+
+### Supabase
+
+- Supabase Postgres is the authoritative workflow, normalized-data, audit, and
+  action-idempotency database for the US deployment.
+- Migrations live under `supabase/migrations/` and are created through the
+  Supabase CLI; do not hand-name migration files.
+- The FastAPI backend uses a server-side Postgres connection for transactional
+  work. The browser never receives a Supabase secret/service-role key.
+- Keep financial tables in private schemas (`workflow`, `raw_xero_demo`,
+  `raw_bank_demo`, `normalized`, and `audit`) rather than exposing them through
+  the Data API. If any table is exposed later, enable RLS and add explicit
+  grants/policies for the actual organization-membership model.
+- Supabase Auth is not assumed to replace the existing managed OIDC decision;
+  identity integration remains a separate choice. Supabase Storage/Realtime are
+  optional and must not bypass the FastAPI policy boundary.
+
+Supabase's current platform defaults require deliberate Data API exposure and
+RLS/grants for newly created tables, so the plan defaults to private schemas and
+server-side access. See the [Supabase changelog](https://supabase.com/changelog)
+and [Data API security guidance](https://supabase.com/docs/guides/api/securing-your-api.md).
+
+### Groq
+
+- Implement a `GroqExplanationModel` behind the existing `ExplanationModel`
+  protocol. This keeps deterministic controls independent of the model vendor.
+- Store `GROQ_API_KEY` only in the server-side secret store and configure the
+  model with `GROQ_MODEL`; never put it in a `NEXT_PUBLIC_*` variable.
+- Start with a Groq model that supports strict structured output, preferably
+  `openai/gpt-oss-20b`, and keep the model ID configurable because hosted model
+  availability changes.
+- Use bounded prompts and JSON Schema output. The application still performs
+  citation, amount, date, account, and prompt-injection validation after Groq
+  returns; model confidence never becomes an accounting control.
+- Treat the free tier as rate-limited capacity: record 429s and usage metadata,
+  retry only within the existing one-retry policy, and fail closed when limits
+  are reached. Do not add browser search, code execution, arbitrary tools, or
+  provider writes to an accounting explanation request.
+
+Groq documents OpenAI-compatible endpoints, strict structured-output support
+for selected models, and organization-level rate limits; these are operational
+constraints, not guarantees of unlimited free capacity. See the [Groq
+compatibility docs](https://console.groq.com/docs/openai), [structured outputs
+docs](https://console.groq.com/docs/structured-outputs), and [rate-limit
+docs](https://console.groq.com/docs/rate-limits).
+
+## Phase 8 — Supabase Postgres persistence and workflow data model
 
 ### Outcome
 
@@ -58,7 +111,8 @@ or allow a duplicate external action.
 
 ### Work items
 
-1. Add SQLAlchemy models and Alembic migrations for:
+1. Initialize the Supabase project and create migrations with the Supabase CLI.
+2. Add SQLAlchemy models/repositories and Supabase migrations for:
    - `raw_xero_demo`, `raw_bank_demo`, and later market raw schemas;
    - normalized record versions, source batches, snapshots, and membership;
    - evidence items, checklist versions/evaluations, reconciliation matches,
@@ -71,14 +125,18 @@ or allow a duplicate external action.
    snapshot membership, and action idempotency keys.
 3. Add append-only triggers or repository-level guards for raw records,
    normalized versions, approved packages, and action manifests.
-4. Replace in-memory `CloseService`, connection registry, Plaid cursor state,
+5. Replace in-memory `CloseService`, connection registry, Plaid cursor state,
    evidence executions, and Xero action executions with repositories.
-5. Add transaction boundaries for source-batch completion plus snapshot
+6. Add transaction boundaries for source-batch completion plus snapshot
    membership and Plaid changes plus cursor update.
+7. Add a server-only Supabase connection configuration, health check, migration
+   check, and local test project or disposable database path.
 
 ### Verification
 
-- Migration applies to a clean PostgreSQL database.
+- Supabase migrations apply to a clean project and local verification database.
+- RLS/security review confirms private schemas are not exposed through the Data
+  API; any exposed table has explicit grants and organization policies.
 - Rollback/restart does not lose state or duplicate rows.
 - Cross-organization queries return no records.
 - Concurrent workers cannot claim the same task or action.
@@ -89,24 +147,41 @@ or allow a duplicate external action.
 A persisted close run can be stopped and restarted while preserving its exact
 snapshot, package hash, approval, and external-action idempotency state.
 
-## Phase 9 — Real isolated demo provider wiring
+## Phase 9 — Real isolated US demo provider wiring and Groq
 
 ### Outcome
 
-The injected contracts are backed by the isolated demo Xero, Plaid Sandbox,
-Google Workspace, B2, and OpenAI credentials without exposing secrets.
+The injected contracts have server-only HTTP adapters for the isolated demo
+Xero, Plaid Sandbox, and Google Workspace providers, plus a Groq structured
+output adapter. Credentials and external evidence are still required before
+this phase can be accepted.
 
 ### Work items
 
-1. Create separate demo secret-store entries and callback URLs.
-2. Wire Xero OAuth and direct Demo Company reads through the bounded adapter.
-3. Wire Plaid Sandbox Link/access-token/cursor sync and webhook verification.
-4. Wire Google Drive/Gmail scoped search, draft, and allowlisted send clients.
-5. Wire B2 upload, signed retrieval, Object Lock, and content-addressed keys.
-6. Wire OpenAI structured output using the bounded AI context and schema.
-7. Add provider health checks, request/event IDs, rate-limit handling, and
+1. Create separate US demo secret-store entries and callback URLs, including
+   `GROQ_API_KEY` and Xero client-secret/refresh-token references (external
+   setup pending).
+2. Implement Xero standard OAuth Auth Code + PKCE authorization, token
+   exchange, refresh, and `/connections` tenant selection (`xero_oauth.py`
+   now provides the server-side exchange/rotation boundary; callback routing
+   and live secret-store wiring remain). Use the current granular scope profile
+   in `docs/live_integrations.md`; this includes settings, contacts, invoices,
+   payments, bank transactions, the narrowly bounded manual-journal draft path,
+   and the required reports. Never put the client secret or refresh token in
+   browser variables.
+3. Wire direct Xero Demo Company reads through the bounded HTTP adapter
+   (`XeroDemoHttpClient` and `XeroBaselineHttpClient` implemented; live account
+   evidence pending).
+4. Wire Plaid Sandbox Link/access-token/cursor sync and webhook verification
+   (`PlaidHttpSandboxClient` implemented; account evidence pending).
+5. Wire Google Drive/Gmail scoped search, draft, and allowlisted send clients
+   (read clients implemented; draft/send worker wiring pending).
+6. Wire B2 upload, signed retrieval, Object Lock, and content-addressed keys.
+7. Wire Groq structured output using the bounded AI context and schema; record
+   model ID, latency, token metadata, and 429/failure outcomes.
+8. Add provider health checks, request/event IDs, rate-limit handling, and
    stale/partial/revoked status mapping.
-8. Record provider calls and redacted outcomes in the audit ledger.
+9. Record provider calls and redacted outcomes in the audit ledger.
 
 ### Required external evidence
 
@@ -116,13 +191,14 @@ Google Workspace, B2, and OpenAI credentials without exposing secrets.
   replay, and Item-error evidence.
 - Google OAuth scope, folder/mailbox scope, and allowlisted test-send evidence.
 - B2 Object Lock and signed retrieval evidence.
-- OpenAI demo model/schema validation evidence.
+- Groq model/schema validation evidence and a free-tier rate-limit test.
 
 ### Exit criterion
 
 The fixed synthetic scenario reads current provider data and produces complete
 source/evidence batches with real provider request IDs, or blocks with the true
-provider condition.
+provider condition. Transport-injected tests prove the code boundary but are
+not sufficient for exit.
 
 ## Phase 10 — Worker DAG, webhooks, and recovery
 
@@ -131,17 +207,27 @@ provider condition.
 Close runs execute the documented workflow DAG with durable leases, visible
 progress, safe retries, cancellation, and restart recovery.
 
+The deterministic task state layer and webhook replay guard are implemented in
+`backend/app/worker.py`; durable persistence and a running worker remain open.
+
 ### Work items
 
-1. Implement `close-readiness-v1` task definitions and dependency transitions.
+1. Implement `close-readiness-v1` task definitions and dependency transitions
+   (state layer implemented in `backend/app/worker.py`; task catalog still
+   needs wiring).
 2. Add PostgreSQL task claim with `FOR UPDATE SKIP LOCKED`, 60-second leases,
-   15-second heartbeat, per-task timeout, and bounded attempts.
+   15-second heartbeat, per-task timeout, and bounded attempts (repository
+   claim and in-memory state are implemented; durable worker wiring remains).
 3. Classify retryable provider/database/network errors separately from policy,
-   accounting-control, permission, and partial-data blockers.
+   accounting-control, permission, and partial-data blockers (implemented in
+   the state layer; provider error mapping remains).
 4. Add webhook signature validation, replay protection, deduplicated receipts,
-   and event-to-task dispatch for Plaid, Gmail, and provider sync notifications.
-5. Add cancellation semantics before and during external actions.
-6. Persist audit events and implement SSE replay from the last event cursor.
+   and event-to-task dispatch for Plaid, Gmail, and provider sync notifications
+   (HMAC/replay guard implemented; provider dispatch remains).
+5. Add cancellation semantics before and during external actions (state
+   transition implemented; action gateway integration remains).
+6. Persist audit events and implement SSE replay from the last event cursor
+   (in-memory replay implemented; API/Supabase persistence remains).
 7. Add operator recovery commands for expired leases, stale sources, unknown
    Gmail/Xero outcomes, and revoked connections.
 
@@ -234,9 +320,13 @@ placeholder or local fixture is used to claim readiness.
 
 US is released independently only after signed live acceptance evidence exists.
 
-## Phase 14 — India production pilot
+## Phase 14 — India expansion (deferred)
 
-### Preconditions
+India is not part of the current delivery scope. Keep the existing India gate
+code and documentation as a future boundary, but do not provision Setu,
+India-specific credentials, or India data in this release.
+
+### Future preconditions
 
 - Phase 12 complete and US completion does not substitute for India approval.
 - Setu agreement, FIU eligibility/certified partner path, Sahamati/ReBIT
@@ -244,7 +334,7 @@ US is released independently only after signed live acceptance evidence exists.
 - Separate India production deployment, credentials, callbacks, database, and
   B2 bucket.
 
-### Work items
+### Future work items
 
 1. Register the India deployment as `production`/`live`/`IN`/`INR`.
 2. Implement consent creation, approval/rejection, session start, notification
@@ -253,10 +343,10 @@ US is released independently only after signed live acceptance evidence exists.
 4. Run India-specific security, retention, cross-border, audit, and pilot
    acceptance tests.
 
-### Exit criterion
+### Future exit criterion
 
-India is released independently only after applicable legal, provider, and live
-pilot evidence is signed off.
+India can be reconsidered only after a new scope approval and applicable legal,
+provider, and live pilot evidence are signed off.
 
 ## Phase 15 — Cross-market hardening and release governance
 
@@ -292,19 +382,18 @@ Phase 10 Worker/recovery
 Phase 11 API/web integration
       ↓
 Phase 12 Demo acceptance
-      ├──────────────→ Phase 13 US pilot
-      └──────────────→ Phase 14 India pilot (with separate compliance gates)
+      └──────────────→ Phase 13 US pilot
                               ↓
-                    Phase 15 hardening/governance
+                    Phase 15 US hardening/governance
 ```
 
-Phase 9 can begin provider account setup in parallel with Phase 8, but no
+Phase 9 can begin US demo provider account setup in parallel with Phase 8, but no
 end-to-end acceptance should be claimed until persistence and recovery are
-available. Phases 13 and 14 must remain separate releases.
+available. India remains deferred and must not receive US data or credentials.
 
 ## Definition of done
 
 The project is ready for a demo release only when Phase 12 is signed. It is
-ready for a live US or India release only when its own phase and all external
-provider/compliance gates are signed. Code completion, mocked clients, or a
-passing unit-test suite cannot substitute for those gates.
+ready for a live US release only when Phase 13 and all external provider gates
+are signed. India remains out of the active release scope. Code completion,
+mocked clients, or a passing unit-test suite cannot substitute for those gates.

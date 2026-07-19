@@ -10,14 +10,22 @@ boundary.
 - [Phase-by-phase implementation plan](implementation-plan.md) — Phases 0–7,
   dependencies, work items, tests, release gates, and explicit exclusions.
 - [Remaining work plan](remaining-work-plan.md) — persistence, real demo
-  integrations, worker/API/UI completion, and separate live-market releases.
+  integrations, worker/API/UI completion, Groq, Supabase, and the US-only
+  release path.
+- [Phase 8 Supabase runbook](phase-8-supabase-runbook.md) — migration, local
+  verification, and server-side security checks.
+- [Phase 9 US/Groq runbook](phase-9-us-groq-runbook.md) — server-only demo
+  provider adapters, structured AI output, and external evidence gates.
+- [Phase 10 worker runbook](phase-10-worker-runbook.md) — task leases, bounded
+  retries, cancellation, event replay, and webhook replay protection.
 - [Phases 3–7 operator runbook](phase-3-7-operator-runbook.md) — implemented
   safety boundaries and remaining external release evidence.
 
 ## Current position
 
-The repository has implemented foundations for Phases 0–7, with 62 backend
-tests and a successful Next.js production build. The provider and compliance
+The repository has implemented foundations for Phases 0–7 and Phase 8–10 code
+boundaries, with 92 backend tests and a successful Next.js production build.
+The provider and compliance
 gates that require external credentials, PostgreSQL/B2 infrastructure, or
 market sign-off remain explicitly open; no mocked result is treated as live
 acceptance.

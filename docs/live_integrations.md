@@ -78,6 +78,10 @@ Fivetran must never be treated as a write-back or journal-posting mechanism.
 Controller login is handled by the managed OIDC provider; Xero OAuth requests
 only organization-data scopes. New Xero applications use these granular scopes:
 
+This profile follows Xero's current [OAuth scopes
+documentation](https://developer.xero.com/documentation/guides/oauth2/scopes/)
+and the [Accounting API overview](https://developer.xero.com/documentation/api/accounting/overview).
+
 - `offline_access`
 - `accounting.settings.read`
 - `accounting.contacts.read`

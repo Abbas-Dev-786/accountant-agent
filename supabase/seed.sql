@@ -1,0 +1,2 @@
+-- No financial fixtures are seeded here. Demo data must come from the verified
+-- provider scenario, never from a local substitute.

@@ -36,7 +36,7 @@ snapshot boundary once. If either provider is incomplete, mismatched, or
 fails, no snapshot is committed and the run becomes `blocked`; retrying starts
 from the provider's last committed cursor.
 
-The current implementation uses injected clients and in-memory state so the
-provider semantics are testable without network access. Wiring those clients to
-the Phase 1 secret references and PostgreSQL raw tables is the next persistence
-slice; do not substitute local fixtures for provider capability evidence.
+The provider semantics remain testable with injected clients, while the Phase 8
+Supabase migration and server-side repository now define the durable persistence
+boundary. Wiring real provider credentials into those repositories is still a
+later phase; do not substitute local fixtures for provider capability evidence.

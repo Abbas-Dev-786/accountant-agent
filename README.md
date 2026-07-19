@@ -15,12 +15,16 @@ separately gated live expansion:
 - deterministic reconciliation, exceptions, journals, and report invariants;
 - bounded AI explanations with citation and amount validation;
 - frozen controller packages and Xero `DRAFT`-only action gateway;
-- separate US/India production release gates.
+- separate production release gates (US is active; India is deferred).
 
-Provider SDK wiring, PostgreSQL persistence, and external compliance/provider
+Provider OAuth/API wiring, PostgreSQL persistence, and external compliance/provider
 evidence remain explicitly gated. See [the documentation map](docs/README.md),
 [the technical design](docs/TDD.md), and the [phase-by-phase delivery
 plan](plan/README.md).
+
+The next implementation track uses Supabase Postgres for persistence and Groq
+for bounded agent explanations. The active product scope is the isolated US
+demo followed by a US production pilot; India is deferred.
 
 Phase 1 identity and connection primitives live in
 [`backend/app/security.py`](backend/app/security.py),
@@ -31,7 +35,7 @@ Phase 2 ingestion primitives live in
 [`backend/app/providers.py`](backend/app/providers.py),
 [`backend/app/normalization.py`](backend/app/normalization.py), and
 [`backend/app/ingestion.py`](backend/app/ingestion.py). They use injected demo
-clients for deterministic tests; live SDK wiring and PostgreSQL raw-table
+clients for deterministic tests; live OAuth/API wiring and PostgreSQL raw-table
 persistence remain explicitly gated follow-up work.
 
 ## Phase 0 capability check

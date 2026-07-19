@@ -73,6 +73,14 @@ class ExplanationModel(Protocol):
         ...
 
 
+def _model_token_count(model: ExplanationModel) -> int | None:
+    usage = getattr(model, "last_usage", {})
+    if not isinstance(usage, Mapping):
+        return None
+    value = usage.get("total_tokens")
+    return value if isinstance(value, int) else None
+
+
 def _canonical(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
 
@@ -178,7 +186,7 @@ class GroundedExplanationService:
                             input_hash,
                             "",
                             int((time.perf_counter() - started) * 1000),
-                            None,
+                            _model_token_count(self.model),
                             "rejected",
                             str(last_error),
                         )
@@ -195,7 +203,7 @@ class GroundedExplanationService:
                     input_hash,
                     output_hash,
                     int((time.perf_counter() - started) * 1000),
-                    None,
+                    _model_token_count(self.model),
                     "verified",
                     "all citations and structured fields matched the supplied facts",
                 )

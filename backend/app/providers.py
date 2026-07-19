@@ -1,8 +1,9 @@
-"""Provider source contracts and demo/sandbox ingestion adapters.
+"""Provider source contracts for isolated fixture and US production ingestion.
 
 The adapters deliberately depend on injected clients rather than SDKs or the
-network.  That keeps the worker boundary deterministic in demo deployments and
-makes pagination, cursor, and recovery behavior directly testable.
+network.  The same deterministic pagination and cursor controls are used in
+both deployments, while the expected provider environment is explicit so a
+production run can never accept fixture data.
 """
 
 from __future__ import annotations
@@ -38,19 +39,36 @@ class XeroPage:
     request_id: str = ""
 
 
-class XeroDemoClient(Protocol):
+class XeroClient(Protocol):
     def get_page(self, page: int) -> XeroPage:
         ...
 
 
-class XeroDemoAdapter:
-    def __init__(self, client: XeroDemoClient, tenant_id: str, *, max_pages: int = 100) -> None:
+# Fixture import compatibility. New production code should depend on XeroClient
+# or XeroProductionAdapter instead.
+XeroDemoClient = XeroClient
+
+
+class XeroIngestionAdapter:
+    """Read one Xero tenant into a complete immutable source batch."""
+
+    def __init__(
+        self,
+        client: XeroClient,
+        tenant_id: str,
+        *,
+        provider_environment: str,
+        max_pages: int = 100,
+    ) -> None:
         if not tenant_id:
-            raise ProviderReadError("Xero demo ingestion requires a tenant id")
+            raise ProviderReadError("Xero ingestion requires a tenant id")
+        if provider_environment not in {"demo", "production"}:
+            raise ProviderReadError("Xero ingestion environment is invalid")
         if max_pages < 1:
             raise ProviderReadError("Xero page limit must be positive")
         self.client = client
         self.tenant_id = tenant_id
+        self.provider_environment = provider_environment
         self.max_pages = max_pages
 
     def read_batch(self) -> SourceBatch:
@@ -72,8 +90,8 @@ class XeroDemoAdapter:
                 raise ProviderReadError("Xero pagination returned an unexpected page")
             if page.tenant_id != self.tenant_id:
                 raise ProviderReadError("Xero page belongs to a different tenant")
-            if page.provider_environment != "demo":
-                raise ProviderReadError("Xero demo adapter received a non-demo page")
+            if page.provider_environment != self.provider_environment:
+                raise ProviderReadError("Xero source environment does not match the close deployment")
             pages_seen.add(page.page)
             if page.request_id:
                 request_ids.append(page.request_id)
@@ -94,7 +112,7 @@ class XeroDemoAdapter:
                 return SourceBatch(
                     batch_id=str(uuid4()),
                     provider="xero",
-                    provider_environment="demo",
+                    provider_environment=self.provider_environment,
                     watermark=f"page-{page.page}|{','.join(request_ids)}",
                     completed_at=datetime.now(timezone.utc),
                     record_versions=tuple(versions),
@@ -103,6 +121,20 @@ class XeroDemoAdapter:
                 raise ProviderReadError("Xero pagination skipped or repeated a page")
             page_number = page.next_page
         raise ProviderReadError("Xero pagination exceeded the configured page limit")
+
+
+class XeroDemoAdapter(XeroIngestionAdapter):
+    """Fixture-only adapter retained for isolated test scenarios."""
+
+    def __init__(self, client: XeroClient, tenant_id: str, *, max_pages: int = 100) -> None:
+        super().__init__(client, tenant_id, provider_environment="demo", max_pages=max_pages)
+
+
+class XeroProductionAdapter(XeroIngestionAdapter):
+    """US production adapter. It only accepts records marked production."""
+
+    def __init__(self, client: XeroClient, tenant_id: str, *, max_pages: int = 100) -> None:
+        super().__init__(client, tenant_id, provider_environment="production", max_pages=max_pages)
 
 
 @dataclass(frozen=True)
@@ -117,9 +149,14 @@ class PlaidSyncPage:
     provider_environment: str = "sandbox"
 
 
-class PlaidSandboxClient(Protocol):
+class PlaidClient(Protocol):
     def sync(self, access_token: str, cursor: str | None) -> PlaidSyncPage:
         ...
+
+
+# Fixture import compatibility. New production code should depend on PlaidClient
+# or PlaidProductionAdapter instead.
+PlaidSandboxClient = PlaidClient
 
 
 @dataclass
@@ -128,22 +165,26 @@ class PlaidCursorState:
     records: dict[str, Mapping[str, object]] = field(default_factory=dict)
 
 
-class PlaidSandboxAdapter:
+class PlaidIngestionAdapter:
     def __init__(
         self,
-        client: PlaidSandboxClient,
+        client: PlaidClient,
         access_token: str,
         *,
         state: PlaidCursorState | None = None,
+        provider_environment: str,
         max_pages: int = 100,
     ) -> None:
         if not access_token:
-            raise ProviderReadError("Plaid sandbox ingestion requires an access token")
+            raise ProviderReadError("Plaid ingestion requires an access token")
+        if provider_environment not in {"sandbox", "production"}:
+            raise ProviderReadError("Plaid ingestion environment is invalid")
         if max_pages < 1:
             raise ProviderReadError("Plaid page limit must be positive")
         self.client = client
         self.access_token = access_token
         self.state = state or PlaidCursorState()
+        self.provider_environment = provider_environment
         self.max_pages = max_pages
 
     def read_batch(self) -> SourceBatch:
@@ -164,8 +205,8 @@ class PlaidSandboxAdapter:
                 raise ProviderReadError("Plaid client returned an invalid sync page")
             if page.cursor != cursor:
                 raise ProviderReadError("Plaid sync response cursor does not match the request")
-            if page.provider_environment != "sandbox":
-                raise ProviderReadError("Plaid sandbox adapter received a non-sandbox page")
+            if page.provider_environment != self.provider_environment:
+                raise ProviderReadError("Plaid source environment does not match the close deployment")
             if page.request_id and page.request_id in seen_request_ids:
                 raise ProviderReadError("Plaid sync repeated a request id")
             if page.request_id:
@@ -217,7 +258,7 @@ class PlaidSandboxAdapter:
                 return SourceBatch(
                     batch_id=str(uuid4()),
                     provider="plaid",
-                    provider_environment="sandbox",
+                    provider_environment=self.provider_environment,
                     watermark=watermark,
                     completed_at=datetime.now(timezone.utc),
                     record_versions=tuple(versions),
@@ -226,6 +267,46 @@ class PlaidSandboxAdapter:
                 raise ProviderReadError("Plaid sync cursor did not advance")
             cursor = page.next_cursor
         raise ProviderReadError("Plaid sync exceeded the configured page limit")
+
+
+class PlaidSandboxAdapter(PlaidIngestionAdapter):
+    """Fixture-only adapter retained for the separately isolated sandbox."""
+
+    def __init__(
+        self,
+        client: PlaidClient,
+        access_token: str,
+        *,
+        state: PlaidCursorState | None = None,
+        max_pages: int = 100,
+    ) -> None:
+        super().__init__(
+            client,
+            access_token,
+            state=state,
+            provider_environment="sandbox",
+            max_pages=max_pages,
+        )
+
+
+class PlaidProductionAdapter(PlaidIngestionAdapter):
+    """US production adapter. It only accepts Plaid Production responses."""
+
+    def __init__(
+        self,
+        client: PlaidClient,
+        access_token: str,
+        *,
+        state: PlaidCursorState | None = None,
+        max_pages: int = 100,
+    ) -> None:
+        super().__init__(
+            client,
+            access_token,
+            state=state,
+            provider_environment="production",
+            max_pages=max_pages,
+        )
 
 
 # Descriptive aliases keep the worker contract readable at call sites while

@@ -39,7 +39,7 @@ class ScenarioTests(unittest.TestCase):
             evidence("workspace", "demo"),
             evidence("b2", "demo"),
             evidence("oidc", "demo"),
-            evidence("openai", "demo"),
+            evidence("groq", "demo"),
         )
 
     def tearDown(self) -> None:
@@ -52,7 +52,7 @@ class ScenarioTests(unittest.TestCase):
     def test_readiness_report_requires_real_demo_evidence(self) -> None:
         report = readiness_report(self.scenario, self.baseline, self.evidence)
         self.assertTrue(report["ready"])
-        self.assertEqual(report["providers"], ["b2", "oidc", "openai", "plaid", "workspace", "xero"])
+        self.assertEqual(report["providers"], ["b2", "groq", "oidc", "plaid", "workspace", "xero"])
 
     def test_xero_baseline_mismatch_blocks_readiness(self) -> None:
         changed_baseline = XeroBaselineObservation(
@@ -66,13 +66,13 @@ class ScenarioTests(unittest.TestCase):
             readiness_report(self.scenario, self.baseline, self.evidence[:-1])
 
     def test_live_evidence_cannot_prove_demo_readiness(self) -> None:
-        invalid = (*self.evidence[:-1], evidence("openai", "production"))
+        invalid = (*self.evidence[:-1], evidence("groq", "production"))
         with self.assertRaises(ScenarioError):
             readiness_report(self.scenario, self.baseline, invalid)
 
     def test_placeholder_evidence_cannot_prove_readiness(self) -> None:
         placeholder = (*self.evidence[:-1], CapabilityEvidence(
-            "openai", "demo", True, "2026-07-18T00:00:00Z", "replace-with-ticket", ("request-1",)
+            "groq", "demo", True, "2026-07-18T00:00:00Z", "replace-with-ticket", ("request-1",)
         ))
         with self.assertRaises(ScenarioError):
             readiness_report(self.scenario, self.baseline, placeholder)

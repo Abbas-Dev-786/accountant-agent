@@ -1,5 +1,8 @@
 # Phase 2 Operator Runbook
 
+> **Fixture-only runbook:** US production is the active scope. This document is
+> retained for isolated source-contract verification only.
+
 Phase 2 proves that a close run can read the isolated demo providers and commit
 one reproducible immutable source snapshot. The adapters are worker-facing;
 the browser never receives provider tokens or writes raw provider records.

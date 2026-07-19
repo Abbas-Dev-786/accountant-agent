@@ -1,22 +1,22 @@
-# AccountingOS Demo Architecture
+# AccountingOS Test-Fixture Architecture
 
 **Version:** 1.3
-**Status:** Approved for implementation  
+**Status:** Fixture-only; not a production delivery milestone
 **Decision date:** 2026-07-18
 
-This document defines the first implementation milestone. It is authoritative
-for demo-mode boundaries and must be read with `PRD.md`, `TDD.md`, and
-`live_integrations.md`.
+This document defines the isolated synthetic fixture used for engineering and
+operator verification. `PRD.md`, `TDD.md`, and `live_integrations.md` define the
+active US production product.
 
 ## Purpose
 
-The first milestone is a truthful, repeatable US close-readiness demo. It uses
-synthetic financial records in isolated provider test environments while still
-exercising real OAuth, provider APIs, synchronization, deterministic controls,
-controller approval, Xero draft creation, read-back, and audit behavior.
+The fixture is a truthful, repeatable US close-readiness test. It uses synthetic
+financial records in isolated provider test environments while still exercising
+real OAuth, provider APIs, synchronization, deterministic controls, controller
+approval, Xero draft creation, read-back, and audit behavior.
 
-Demo mode is not production acceptance and must never be presented as a live
-customer close.
+Fixture mode is not production acceptance and must never be presented as a live
+customer close or used as a release substitute.
 
 ## Environment boundary
 
@@ -55,14 +55,14 @@ provider environment on connection, snapshot, package, and action screens.
 | Capability | Demo provider/path | Data or action boundary |
 | --- | --- | --- |
 | Accounting reads | Xero Demo Company through the real Xero API | Sample organization only |
-| Accounting ingestion | `XeroDirectDemoAdapter` | Fivetran is not used in the demo |
+| Accounting ingestion | `XeroDirectDemoAdapter` | The production source is not used in the fixture |
 | Bank data | Plaid Sandbox Transactions | Synthetic Sandbox Item and transactions |
 | Evidence | Google test Workspace | Test Drive folders and Gmail mailbox |
 | Artifacts | Demo B2 bucket | No production artifacts or URLs |
-| AI | OpenAI with synthetic, bounded evidence | No customer data or secrets |
+| AI | Groq with synthetic, bounded evidence | No customer data or secrets |
 
-India/Setu, Plaid Production, real customer Xero organizations, and production
-Fivetran ingestion are later milestones.
+US production uses live Xero, Plaid Production, Google Workspace, B2, and Groq
+through separately configured credentials. India remains deferred.
 
 ## Shared source contract
 
@@ -74,9 +74,9 @@ Provider-specific code returns a canonical `SourceBatch` containing:
 - provider request/event IDs;
 - completeness, warnings, and failure details.
 
-The demo Xero adapter and the future Fivetran adapter implement the same
-contract. Normalization, snapshots, reconciliation, reports, and workflow tasks
-do not branch on provider SDK response shapes.
+The fixture Xero adapter and the configured production source adapter implement
+the same contract. Normalization, snapshots, reconciliation, reports, and
+workflow tasks do not branch on provider SDK response shapes.
 
 ## Scenario bootstrap
 
@@ -114,7 +114,7 @@ The MVP uses logical task owners, not autonomous model sessions:
 The model cannot reconcile amounts, approve actions, select permissions, create
 arbitrary tools, or write directly to a provider.
 
-## Demo acceptance flow
+## Fixture acceptance flow
 
 1. Connect a demo organization to Plaid Sandbox, Xero Demo Company, and the
    test Workspace.

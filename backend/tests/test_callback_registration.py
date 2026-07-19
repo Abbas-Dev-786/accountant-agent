@@ -3,7 +3,16 @@ import unittest
 from fastapi.testclient import TestClient
 
 from app import main
-from app.main import app, configure_xero_oauth, connections, xero_oauth_sessions
+from app.main import (
+    app,
+    configure_auth_verifier,
+    configure_workflow_store,
+    configure_xero_oauth,
+    connections,
+    xero_oauth_sessions,
+)
+from app.supabase_auth import SupabaseUser
+from app.supabase_db import OrganizationSummary
 from app.xero_oauth import (
     FormResponse,
     TenantResponse,
@@ -59,15 +68,41 @@ def build_client():
     return XeroOAuthClient(config, FakeSecrets(), FakeFormTransport(), FakeTenantTransport())
 
 
+class FakeVerifier:
+    def authenticate(self, token):
+        return SupabaseUser("controller-1", "controller@example.test", "https://demo.supabase.co/auth/v1")
+
+
+class FakeWorkflowStore:
+    def __init__(self):
+        self.registered_connections = []
+
+    def membership_role(self, organization_id, issuer, subject):
+        return "controller" if organization_id == "demo-org" else None
+
+    def organizations_for_user(self, issuer, subject):
+        return (OrganizationSummary("demo-org", "Demo organization", "controller"),)
+
+    def connections_for_organization(self, organization_id):
+        return ()
+
+    def upsert_connection(self, **kwargs):
+        self.registered_connections.append(kwargs["connection_health"])
+
+
 class CallbackRegistrationTests(unittest.TestCase):
     def setUp(self):
         self._original_getenv = main.os.getenv
         configure_xero_oauth(build_client())
+        configure_auth_verifier(FakeVerifier())
+        configure_workflow_store(FakeWorkflowStore())
         connections._connections.clear()
 
     def tearDown(self):
         main.os.getenv = self._original_getenv
         configure_xero_oauth(None)
+        configure_auth_verifier(None)
+        configure_workflow_store(None)
         xero_oauth_sessions._sessions.clear()
         connections._connections.clear()
 
@@ -83,7 +118,10 @@ class CallbackRegistrationTests(unittest.TestCase):
 
     def _run_flow(self):
         http = TestClient(app)
-        authorize = http.get("/api/v1/organizations/demo-org/connections/xero/authorize").json()
+        authorize = http.get(
+            "/api/v1/organizations/demo-org/connections/xero/authorize",
+            headers={"Authorization": "Bearer test-token"},
+        ).json()
         return http.get(
             "/api/v1/connections/xero/callback",
             params={"state": authorize["state"], "code": "one-time-code"},

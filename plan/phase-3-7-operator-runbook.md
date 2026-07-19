@@ -18,7 +18,7 @@ and records a marker before sending. An unavailable or ambiguous Sent search
 becomes `outcome_unknown`; it never resends automatically.
 
 The injected clients in `backend/tests/test_phase3.py` must be replaced with
-the scoped Google test Workspace client only after Phase 0 OAuth and mailbox
+the scoped production Google Workspace client only after OAuth and mailbox
 evidence is attached.
 
 ## Phase 4 — Reconciliation and reports
@@ -48,9 +48,10 @@ has no post, update, delete, void, or payment operation.
 ## Phase 7 — Live market gates
 
 `ExpansionRegistry` requires separate production/live US and India resources.
-US requires Xero, Plaid Production, and Fivetran evidence. India additionally
-requires Setu agreement, FIU eligibility, supported FIP, and approved retention
-policy. Market artifacts cannot cross boundaries.
+US requires Xero production-source, Plaid Production, Google, B2, and Groq
+evidence. India is deferred and separately requires Setu agreement, FIU
+eligibility, supported FIP, and approved retention policy. Market artifacts
+cannot cross boundaries.
 
 These gates do not manufacture provider or legal evidence. A live release still
 requires the inventories, external acceptance evidence, backups, retention,

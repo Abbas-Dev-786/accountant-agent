@@ -1,12 +1,11 @@
 # Vision & Product Strategy v0.1
 
-**Status:** Long-term product strategy. `PRD.md` defines the narrower demo
-milestone and later live expansion.
+**Status:** Long-term product strategy. `PRD.md` defines the narrower active US
+production scope.
 
-**Demo integration decision:** Xero Demo Company is the initial accounting
-system and Plaid Sandbox is the initial bank source. The later live expansion
-adds Xero/Fivetran, Plaid Production, and Setu Account Aggregator. Other ERPs
-and bank providers remain future expansion.
+**Integration decision:** The active product uses Xero and Plaid Production in
+the US. Xero Demo Company and Plaid Sandbox are test fixtures only; Setu Account
+Aggregator, other ERPs, and other bank providers remain future expansion.
 
 ## Working Title
 

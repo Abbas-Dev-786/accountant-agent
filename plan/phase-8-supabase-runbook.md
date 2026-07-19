@@ -13,12 +13,35 @@ npx --yes supabase --version
 npx --yes supabase migration list --local
 ```
 
-The migration creates private `workflow`, `raw_xero_demo`, `raw_bank_demo`,
-`normalized`, and `audit` schemas, enables RLS on every table, revokes Data API
-access for `anon` and `authenticated`, and adds deployment/environment guards.
+The migrations create private `workflow`, `raw_xero`, `raw_bank_us`,
+`raw_xero_demo`, `raw_bank_demo`, `normalized`, and `audit` schemas, enable RLS
+on every table, revoke Data API access for `anon` and `authenticated`, and add
+deployment/environment guards. `raw_xero` and `raw_bank_us` hold only live US
+production records; the `*_demo` schemas are fixture-only.
 
 The FastAPI backend uses `SUPABASE_DB_URL` server-side with TLS. Never place a
 database URL, service-role key, or `GROQ_API_KEY` in a `NEXT_PUBLIC_*` variable.
+
+## Remote project rollout
+
+After you enter real values in `backend/.env` and `web/.env.local`, link and
+apply the migrations to the intended US production project:
+
+```sh
+npx supabase link --project-ref <your-project-ref>
+npx supabase db push
+```
+
+Review the migration against a disposable Supabase branch or local database
+first, then run `db push` against the approved US production project. The
+generated integrity migration adds durable request idempotency, connection
+uniqueness, and database guards that prevent cross-organization/deployment
+source and action writes.
+
+The API validates Supabase users with the Auth `/user` endpoint using the
+server-held publishable key, then checks `workflow.organization_users`. The
+browser uses the same project's URL and publishable key only for Auth; it does
+not call the Data API for financial data.
 
 ## Local verification
 
@@ -50,5 +73,5 @@ append-only source/snapshot/audit write boundaries.
 - If a future browser feature needs a Supabase Data API table, add explicit
   grants and organization-aware RLS policies; do not rely on `TO authenticated`
   alone.
-- Keep the existing FastAPI authorization boundary even if Supabase Auth or
-  Realtime is enabled later.
+- Keep the FastAPI authorization boundary while validating Supabase Auth JWTs;
+  Realtime, if enabled later, must not bypass it.

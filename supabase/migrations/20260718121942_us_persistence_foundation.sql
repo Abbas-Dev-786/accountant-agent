@@ -5,12 +5,14 @@
 create extension if not exists pgcrypto;
 
 create schema if not exists workflow;
+create schema if not exists raw_xero;
+create schema if not exists raw_bank_us;
 create schema if not exists raw_xero_demo;
 create schema if not exists raw_bank_demo;
 create schema if not exists normalized;
 create schema if not exists audit;
 
-revoke all on schema workflow, raw_xero_demo, raw_bank_demo, normalized, audit
+revoke all on schema workflow, raw_xero, raw_bank_us, raw_xero_demo, raw_bank_demo, normalized, audit
 from anon, authenticated;
 
 create table workflow.deployments (
@@ -85,7 +87,26 @@ create table workflow.close_runs (
 create table raw_xero_demo.records (
     id bigint generated always as identity primary key,
     organization_id text not null references workflow.organizations(id),
-    run_id uuid references workflow.close_runs(id),
+    run_id uuid not null references workflow.close_runs(id),
+    source_batch_id uuid not null,
+    tenant_id text not null,
+    provider_record_id text not null,
+    payload_json jsonb not null,
+    content_hash text not null,
+    observed_at timestamptz not null,
+    request_id text,
+    page_number integer not null check (page_number > 0),
+    ingested_at timestamptz not null default now(),
+    unique (source_batch_id, provider_record_id, content_hash)
+);
+
+-- Live US source records are physically separated from fixtures. They are
+-- append-only, private, and may only be reached through the server-side
+-- PostgreSQL connection.
+create table raw_xero.records (
+    id bigint generated always as identity primary key,
+    organization_id text not null references workflow.organizations(id),
+    run_id uuid not null references workflow.close_runs(id),
     source_batch_id uuid not null,
     tenant_id text not null,
     provider_record_id text not null,
@@ -101,7 +122,25 @@ create table raw_xero_demo.records (
 create table raw_bank_demo.records (
     id bigint generated always as identity primary key,
     organization_id text not null references workflow.organizations(id),
-    run_id uuid references workflow.close_runs(id),
+    run_id uuid not null references workflow.close_runs(id),
+    source_batch_id uuid not null,
+    item_id text not null,
+    account_id text not null,
+    provider_record_id text not null,
+    change_type text not null check (change_type in ('added', 'modified', 'removed')),
+    payload_json jsonb not null,
+    content_hash text not null,
+    observed_at timestamptz not null,
+    request_id text,
+    cursor text,
+    ingested_at timestamptz not null default now(),
+    unique (source_batch_id, provider_record_id, change_type, content_hash)
+);
+
+create table raw_bank_us.records (
+    id bigint generated always as identity primary key,
+    organization_id text not null references workflow.organizations(id),
+    run_id uuid not null references workflow.close_runs(id),
     source_batch_id uuid not null,
     item_id text not null,
     account_id text not null,
@@ -385,8 +424,16 @@ create trigger immutable_raw_xero_demo
 before update or delete on raw_xero_demo.records
 for each row execute function workflow.reject_immutable_change();
 
+create trigger immutable_raw_xero
+before update or delete on raw_xero.records
+for each row execute function workflow.reject_immutable_change();
+
 create trigger immutable_raw_bank_demo
 before update or delete on raw_bank_demo.records
+for each row execute function workflow.reject_immutable_change();
+
+create trigger immutable_raw_bank_us
+before update or delete on raw_bank_us.records
 for each row execute function workflow.reject_immutable_change();
 
 create trigger immutable_normalized_versions
@@ -410,6 +457,8 @@ alter table workflow.organizations enable row level security;
 alter table workflow.organization_users enable row level security;
 alter table workflow.connections enable row level security;
 alter table workflow.close_runs enable row level security;
+alter table raw_xero.records enable row level security;
+alter table raw_bank_us.records enable row level security;
 alter table raw_xero_demo.records enable row level security;
 alter table raw_bank_demo.records enable row level security;
 alter table normalized.source_batches enable row level security;
@@ -428,10 +477,10 @@ alter table audit.webhook_receipts enable row level security;
 alter table audit.ai_calls enable row level security;
 alter table audit.policy_decisions enable row level security;
 
-revoke all on all tables in schema workflow, raw_xero_demo, raw_bank_demo, normalized, audit
+revoke all on all tables in schema workflow, raw_xero, raw_bank_us, raw_xero_demo, raw_bank_demo, normalized, audit
 from anon, authenticated;
-revoke all on all sequences in schema raw_xero_demo, raw_bank_demo, audit
+revoke all on all sequences in schema raw_xero, raw_bank_us, raw_xero_demo, raw_bank_demo, audit
 from anon, authenticated;
 
-alter default privileges in schema workflow, raw_xero_demo, raw_bank_demo, normalized, audit
+alter default privileges in schema workflow, raw_xero, raw_bank_us, raw_xero_demo, raw_bank_demo, normalized, audit
 revoke all on tables from anon, authenticated;

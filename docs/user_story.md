@@ -1,70 +1,66 @@
-# AccountingOS Demo MVP Narrative
+# AccountingOS US Production Controller Narrative
 
 **Version:** 1.3
-**Status:** Approved for synthetic demo acceptance  
-**Rule:** Demo records are synthetic, but provider calls and approval/action
-paths are real. The demo never touches a live customer organization.
+**Status:** Production-first target narrative
+**Rule:** Production records and provider calls are live, while financial actions
+remain bounded to approved Xero `DRAFT` journals. Synthetic fixtures are not
+customer-facing acceptance evidence.
 
-The demo uses an isolated US deployment, a designated Xero Demo Company, Plaid
-Sandbox, and a Google test Workspace. All displayed business values come from a
-versioned synthetic scenario bootstrapped into Plaid and Workspace and verified
-against the prepared Xero baseline. The UI must show
-`DEMO — SYNTHETIC DATA` throughout the run.
+The product uses a US production deployment, the organization's connected Xero
+tenant, selected Plaid Production account(s), and configured Google Workspace
+scopes. All displayed values come from the frozen live source snapshot. The UI
+must identify the organization, source freshness, and configuration version.
 
-## Demo Preparation
+## Production Preparation
 
 Before presenting, verify rather than fabricate:
 
-- Xero Demo Company and Plaid Sandbox connections are healthy.
-- The configured provider environments are `demo`/`sandbox`; no production
-  credential, tenant, Item, callback, or artifact is reachable.
-- The versioned scenario bootstrap seeded Plaid and Workspace records, verified
-  the prepared Xero baseline, and recorded all expected provider identifiers.
-  Xero reset, when needed, was completed through the explicit operator runbook.
-- Test Drive, Gmail, B2, and OpenAI connections are healthy.
-- The manifest-defined synthetic period contains enough activity to demonstrate the
-  workflow.
+- The organization's Xero tenant and selected Plaid Production accounts are healthy.
+- The configured providers are live production resources; no test credential,
+  tenant, Item, callback, artifact, or local store is reachable.
+- The accountant-approved configuration version selects the bank accounts,
+  Xero ledger source, account mappings, tolerances, evidence scope, and approver.
+- Drive, Gmail, B2, and Groq connections are healthy.
+- The requested accounting period is open and supported by every selected source.
 - The controller is present and authorized to make the exact approvals required
   during the acceptance run. Journal proposals are never pre-approved before the
   reviewed package and proposal hashes exist.
 
-If the seeded scenario contains no missing evidence or reconciliation exception,
-do not manufacture one. Use another versioned scenario or present the successful
-no-exception path.
+If a close contains no missing evidence or reconciliation exception, do not
+manufacture one. Present the successful no-exception path.
 
 ## Scene 1: Connected Organization
 
 The controller opens the organization workspace. The connection panel shows
-the demo environment, provider environments, and configured scopes.
+the production environment, provider environments, mapping version, and configured scopes.
 
 Example shape, populated from provider status:
 
 ```text
-Organization: <Xero Demo Company>
-Mode: DEMO — SYNTHETIC DATA
+Organization: <organization name>
+Mode: PRODUCTION — LIVE DATA
 Market: United States
 Functional currency: USD
 
-Xero Demo Company     Healthy   Source: direct demo adapter
-Plaid Sandbox         Healthy   Cursor: <provider cursor>
-Google test Workspace Healthy  Scope: <configured folders>
-Gmail test mailbox    Healthy   Sender: <connected account>
-Demo B2                Healthy   Bucket: <configured value>
-OpenAI                Healthy   Approved model/policy: <configured value>
+Xero organization      Healthy   Source: <configured ingestion path>
+Plaid Production       Healthy   Cursor: <provider cursor>
+Google Workspace       Healthy   Scope: <configured folders>
+Gmail mailbox          Healthy   Sender: <connected account>
+Production B2          Healthy   Bucket: <configured value>
+Groq                  Healthy   Approved model/policy: <configured value>
 ```
 
-The controller selects the seeded rolling period and clicks `Prepare close
-package`.
+The controller selects the accounting period and clicks `Prepare close package`.
 
-## Scene 2: Demo Preflight and Synchronization
+## Scene 2: Production Preflight and Synchronization
 
 The UI displays persisted provider progress events:
 
 ```text
-Validating Xero Demo Company and permissions
-Reading Xero through the direct demo adapter
-Synchronizing Plaid Sandbox transactions and cursor
-Checking Google test Workspace and Gmail access
+Validating Xero organization and permissions
+Reading Xero through the configured production source
+Synchronizing Plaid Production transactions and cursor
+Checking Google Workspace and Gmail access
 ```
 
 The plan cannot proceed until every required provider is current and complete.
@@ -77,7 +73,7 @@ blocker and remediation instead of continuing with cached or local data.
 ## Scene 3: Source Snapshot and Readiness
 
 After synchronization, AccountingOS freezes a read-only snapshot of the
-synthetic provider records used by the run.
+live provider records used by the run.
 
 The readiness view shows actual values:
 
@@ -93,11 +89,11 @@ Every count links to source records and provider identifiers.
 
 ### When Evidence Is Missing
 
-The controller opens a seeded missing-document item. AccountingOS shows where it
+The controller opens a missing-document item. AccountingOS shows where it
 searched and why the checklist still considers the document absent.
 
 If the configured recipient and template satisfy policy, the system creates and
-sends a policy-approved request to the test mailbox. The timeline records the
+sends a policy-approved request to an allowlisted recipient. The timeline records the
 actual Gmail message/thread ID. Otherwise, the controller approves the message
 before it is sent.
 
@@ -106,15 +102,15 @@ before it is sent.
 The system says the evidence check passed and proceeds. It does not create a
 fake request for demo effect.
 
-## Scene 4: Demo Reconciliation
+## Scene 4: Production Reconciliation
 
-The reconciliation screen shows the selected Sandbox bank and Xero Demo ledger
+The reconciliation screen shows the selected production bank and Xero ledger
 accounts, source balances, transaction counts, match groups, pending items,
 excluded items, and exceptions.
 
 ```text
-Bank provider/account: <Sandbox masked account>
-Xero ledger account: <Demo Company account name/code>
+Bank provider/account: <masked selected account>
+Xero ledger account: <configured account name/code>
 Posted bank transactions: <actual count>
 Matched: <actual count>
 Exceptions: <actual count>
@@ -125,9 +121,9 @@ an accounting control.
 
 ## Scene 5: Grounded Exception
 
-When a seeded exception exists, the controller opens it and sees:
+When an exception exists, the controller opens it and sees:
 
-- Synthetic bank and Xero records with real provider identifiers.
+- Live bank and Xero records with provider identifiers.
 - Related invoice, payment, email, or document evidence.
 - AI-written cause and recommendation.
 - Exact evidence citations and uncertainties.
@@ -138,7 +134,7 @@ It does not insert an artificial mismatch.
 
 ## Scene 6: Real Close Package
 
-AccountingOS calculates the package from the frozen synthetic snapshot:
+AccountingOS calculates the package from the frozen live snapshot:
 
 - Unadjusted and pro forma adjusted trial balance.
 - Pro forma P&L and balance sheet.
@@ -167,15 +163,15 @@ The controller reviews:
 The controller approves the exact package version and journal proposal hashes.
 That approval freezes the reviewed package before any Xero write begins.
 
-## Scene 8: Demo Xero Draft Creation
+## Scene 8: Xero Draft Creation
 
 After approval, AccountingOS creates the approved manual journals in the Xero
-Demo Company with status `DRAFT`.
+connected organization with status `DRAFT`.
 
 The UI shows real provider confirmation:
 
 ```text
-Xero journal ID: <real Demo Company identifier>
+Xero journal ID: <provider identifier>
 Status: DRAFT
 Read-back verification: Passed
 Posting action: Not available
@@ -187,7 +183,7 @@ automatic retry until reconciliation proves whether a draft exists. It never
 claims success prematurely or risks a duplicate merely because the local result
 is missing.
 
-## Scene 9: Approved Demo Package
+## Scene 9: Approved Production Package
 
 After all approved actions are verified, the final screen says:
 
@@ -206,12 +202,12 @@ was locked or closed.
 The final action manifest references the frozen approved package. It does not
 replace or mutate the artifact the controller reviewed.
 
-## Live Truth Rules
+## Production Truth Rules
 
-- Show only actual demo-provider data and actual provider status.
+- Show only actual production-provider data and actual provider status.
 - Do not preload an expected missing document, transaction count, exception, or
   report result.
-- Do not use a local fallback if a demo provider is unavailable.
+- Do not use a local fallback if a production provider is unavailable.
 - Show actual external sync time separately from product processing time.
 - Show masked bank identifiers and minimum necessary personal information.
 - Clearly distinguish deterministic controls from AI narrative.
@@ -221,19 +217,19 @@ replace or mutate the artifact the controller reviewed.
 - Never describe a `DRAFT` journal as posted.
 - Never describe an approved package as a closed/locked accounting period.
 
-## Demo Failure Is a Product State
+## Production Failure Is a Product State
 
-The demo must remain truthful under provider failure:
+The production product must remain truthful under provider failure:
 
-- Xero demo adapter delayed: show the sync blocker.
+- Xero source delayed: show the sync blocker.
 - Plaid item error: show reconnect/wait guidance.
-- Scenario bootstrap partial or Xero-baseline mismatch: show the affected
-  provider record and remediation.
+- Xero source/control-total mismatch: show the affected provider record and
+  remediation.
 - Google token expired: show reconnection.
-- OpenAI unavailable: preserve deterministic work and show AI task failure.
+- Groq unavailable: preserve deterministic work and show AI task failure.
 - Xero write failed: preserve approval, reconcile possible prior creation, and
   permit retry only after the outcome is known.
 
 A well-explained provider blocker demonstrates reliability more credibly than a
-fake successful workflow. Production/live acceptance uses the separate live
-narrative and provider gates in `PRD.md` and `live_integrations.md`.
+fake successful workflow. Production acceptance uses the provider gates in
+`PRD.md` and `live_integrations.md`.

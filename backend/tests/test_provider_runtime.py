@@ -7,10 +7,12 @@ from app.provider_runtime import (
     GoogleDriveHttpClient,
     JsonResponse,
     PlaidHttpSandboxClient,
+    PlaidProductionHttpClient,
     RuntimeConfigError,
     XeroBaselineHttpClient,
     StaticSecretResolver,
     XeroDemoHttpClient,
+    XeroProductionHttpClient,
 )
 from app.providers import ProviderReadError
 
@@ -62,6 +64,17 @@ class RuntimeProviderTests(unittest.TestCase):
         client.get_page(1)
         self.assertEqual(oauth.calls, 1)
         self.assertEqual(transport.calls[0][2]["Authorization"], "Bearer oauth-access-token")
+
+    def test_production_clients_use_production_endpoints_and_tags(self):
+        xero_transport = FakeTransport([JsonResponse(200, {"Invoices": []}, {})])
+        xero = XeroProductionHttpClient("tenant-1", "secret://xero/access", resolver(), xero_transport)
+        self.assertEqual(xero.get_page(1).provider_environment, "production")
+        plaid_transport = FakeTransport(
+            [JsonResponse(200, {"added": [], "modified": [], "removed": [], "next_cursor": "cursor-1", "has_more": False}, {})]
+        )
+        plaid = PlaidProductionHttpClient("client-1", "secret://plaid/client", resolver(), plaid_transport)
+        self.assertEqual(plaid.sync("access-token", None).provider_environment, "production")
+        self.assertTrue(plaid_transport.calls[0][1].startswith("https://production.plaid.com/"))
 
     def test_xero_baseline_collects_demo_identity_and_required_account_ids(self):
         transport = FakeTransport(

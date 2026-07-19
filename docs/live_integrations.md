@@ -1,9 +1,10 @@
-# Demo and Live Integration Specification
+# US Production Integration Specification
 
 **Version:** 1.3
 **Status:** Required companion to `PRD.md` and `TDD.md`  
-**Rule:** Demo runs use isolated synthetic providers; production and live
-acceptance runs use live authenticated providers only.
+**Rule:** US production and acceptance runs use live authenticated providers
+only. An isolated synthetic stack may be used for engineering verification but
+can never satisfy a production gate.
 **Decision date:** 2026-07-18
 
 This document records what must be configured, verified, and operated for each
@@ -12,46 +13,47 @@ application team cannot solve in code.
 
 ## 1. Provider Matrix
 
-| Capability | Demo US | Production US | Production India | Write capability |
+| Capability | Production US | Test fixture | Deferred India | Write capability |
 | --- | --- | --- | --- | --- |
-| Accounting | Xero Demo Company + direct adapter | Xero + Fivetran | Xero + Fivetran | Xero draft journal through owned MCP |
-| Bank transactions | Plaid Sandbox | Plaid Transactions | Setu Account Aggregator | Read-only |
-| Evidence | Google test Workspace | Google Drive/Gmail | Google Drive/Gmail | Allowlisted Gmail requests |
-| Artifacts | Demo B2 bucket | Backblaze B2 | Backblaze B2 | Upload/download only |
-| AI | OpenAI with synthetic evidence | OpenAI | OpenAI | No provider permissions |
+| Accounting | Xero through the approved production ingestion path | Xero Demo Company + direct adapter | Xero integration TBD | Xero draft journal through owned MCP |
+| Bank transactions | Plaid Production Transactions | Plaid Sandbox | Setu Account Aggregator | Read-only |
+| Evidence | Google Drive/Gmail | Google test Workspace | Google Drive/Gmail | Allowlisted Gmail requests |
+| Artifacts | Backblaze B2 | Test B2 bucket | Backblaze B2 | Upload/download only |
+| AI | Groq | Groq with synthetic evidence | Groq | No provider permissions |
 
 The deployment environment and organization market determine the adapter. A
 connection for the wrong environment, tenant, Item, or currency is rejected
 during onboarding. Demo credentials and artifacts cannot be used by production.
 
-## 1A. Demo Stack
+## 1A. Optional Test-Fixture Stack
 
-The demo stack is a separate deployment with its own database, secret store,
+The test-fixture stack is a separate deployment with its own database, secret store,
 B2 bucket, OAuth callbacks, webhook URL, and provider credentials. It uses
 Plaid Sandbox, a Xero Demo Company through `XeroDirectDemoAdapter`, a Google
-test Workspace, a demo B2 bucket, and OpenAI with synthetic evidence only.
+test Workspace, a demo B2 bucket, and Groq with synthetic evidence only.
 
-Fivetran, Setu, Plaid Production, and real customer Xero organizations are not
-part of the demo. A versioned scenario manifest seeds or verifies coherent
-records across the demo providers. A partial seed blocks the run.
+Plaid Production and real customer Xero organizations are not part of the test
+fixture. A versioned scenario manifest seeds or verifies coherent records across
+fixture providers. A partial seed blocks the fixture run.
 
-## 2. Xero and Fivetran
+## 2. Xero Production Ingestion and Draft Actions
 
 ### Roles
 
-In the later production deployment, Fivetran is the ingestion path for Xero
-history and incremental changes. It lands provider data in a PostgreSQL
-`raw_xero` schema that the application can read but not mutate.
+The production Xero ingestion path is selected during production onboarding. It
+must land immutable source records in the private `raw_xero` schema that the
+application can read but not mutate, provide a freshness watermark, and support
+control-total verification. A source implementation is not authorized to post
+journals or otherwise modify the Xero organization.
 
-The demo direct adapter and the owned Xero MCP server are the controlled API
-paths for the Demo Company. The production MCP server is the controlled API path
-for:
+The owned production Xero policy gateway is the controlled API path for:
 
 - Tenant identity and source control totals.
 - Bounded reads needed for freshness or read-back verification.
 - Creating an approved manual journal with status `DRAFT`.
 
-Fivetran must never be treated as a write-back or journal-posting mechanism.
+No ingestion implementation may be treated as a write-back or journal-posting
+mechanism.
 
 ### Demo Xero Setup
 
@@ -81,7 +83,7 @@ Fivetran must never be treated as a write-back or journal-posting mechanism.
 
 ### Required Xero Scope Profile
 
-Controller login is handled by the managed OIDC provider; Xero OAuth requests
+Controller login is handled by Supabase Auth; Xero OAuth requests
 only organization-data scopes. New Xero applications use these granular scopes:
 
 This profile follows Xero's current [OAuth scopes
@@ -115,23 +117,23 @@ this profile.
 - Complete the OAuth authorization-code flow with state, PKCE, redirect URI, and
   tenant-selection validation. Validate issuer and nonce only if the selected
   provider flow uses OpenID Connect.
-- Create a Fivetran Xero connection using the selected tenant/organization.
-- Configure the correct PostgreSQL destination and `raw_xero` schema.
-- Enable incremental updates and Fivetran sync completion webhooks.
-- Record Fivetran connection ID, tenant ID, destination schema, connection owner,
-  sync frequency, and alert thresholds.
-- Store Xero and Fivetran credentials only in the secret manager.
+- Configure the selected Xero ingestion implementation and private `raw_xero`
+  destination.
+- Enable its verified incremental update/completion mechanism.
+- Record the source implementation, connection ID, tenant ID, destination
+  schema, connection owner, sync frequency, and alert thresholds.
+- Store Xero and ingestion credentials only in the secret manager.
 
 ### Production Runtime Checks
 
 Before a run:
 
-1. Fivetran connection setup state is connected and schema status is ready.
+1. The configured Xero source connection is healthy and its schema status is ready.
 2. The selected Xero tenant ID equals the configured tenant.
 3. The latest sync completed after the run's sync request, or the configured
    freshness policy explicitly accepts the latest completed sync.
 4. No sync warning affects a required table.
-5. Xero direct control totals agree with the normalized Fivetran data.
+5. Xero control totals agree with the normalized production source data.
 
 After an approved journal write:
 
@@ -150,7 +152,7 @@ and read-back behavior.
 ### Xero Failure Handling
 
 - OAuth expiry or revoked tenant: block new runs and request reconnection.
-- Fivetran delayed/failed sync: block until a successful sync is observed.
+- Delayed or failed Xero source sync: block until a successful sync is observed.
 - Tenant mismatch: fail closed; never process the returned tenant.
 - API rate limit: bounded retry with provider-respecting backoff.
 - Draft creation timeout: search by the exact stored narration/marker before
@@ -306,13 +308,12 @@ the policy gateway decides whether it is allowed.
 
 Required secret classes:
 
-- Managed OIDC client secret/signing configuration for controller login.
+- Supabase Auth project configuration for controller login.
 - Xero client secret and refresh tokens.
-- Fivetran API credentials.
+- Credentials for the approved Xero ingestion implementation.
 - Plaid client/access tokens.
-- Setu FIU credentials and consent/session secrets.
 - Google OAuth client secret and refresh tokens.
-- OpenAI API key.
+- Groq API key.
 - B2 credentials.
 
 Required callback protections:
@@ -327,30 +328,26 @@ Required callback protections:
 ## 8. Regional Deployment Requirements
 
 ```text
-DEMO: accounts-demo.example.com
-      Demo Postgres + raw_xero_demo/raw_bank_demo + Demo B2 + Demo secrets
-
 US: accounts-us.example.com
     US Postgres + raw_xero/raw_bank_us + US B2 + US secrets
 
-IN: accounts-in.example.com
-    IN Postgres + raw_xero/raw_bank_in + IN B2 + IN secrets
+TEST: accounts-test.example.com
+      Test Postgres + raw_xero_demo/raw_bank_demo + Test B2 + Test secrets
 ```
 
-The same application version is deployed to all stacks. Demo and production
-provider credentials, webhooks, Fivetran destinations, databases, and artifacts
-do not cross stacks. The labels `DEMO`, `US`, and `IN` identify deployment
-stacks. Production hosting,
-B2 location, OpenAI processing, retention, and cross-border transfer settings
+The same application version is deployed to both stacks. Test and production
+provider credentials, webhooks, source destinations, databases, and artifacts
+do not cross stacks. Production hosting,
+B2 location, Groq processing, retention, and cross-border transfer settings
 must be approved for the applicable market; the design does not assume every
 vendor offers an India storage region.
 
 ## 9. Operational Runbooks
 
-### Stale Xero/Fivetran Data
+### Stale Xero Source Data
 
-1. Show the Fivetran connection ID, last success, affected tables, and warning.
-2. Request or resume an incremental sync.
+1. Show the configured source connection ID, last success, affected tables, and warning.
+2. Request or resume the approved incremental sync.
 3. Wait for verified completion and rerun normalization.
 4. Create a new source snapshot; never mutate an approved snapshot.
 
@@ -386,20 +383,19 @@ vendor offers an India storage region.
 ## 10. Production Go-Live Checklist
 
 - Xero production app, tenant, scopes, and draft-journal capability verified.
-- Managed OIDC issuer, audience, callbacks, logout, session expiry, and
+- Supabase Auth issuer, audience, callbacks, logout, session expiry, and
   organization-membership authorization verified in both market stacks.
-- Fivetran Xero connector, destination permissions, incremental sync, and
-  `sync_end` event verified.
+- Approved Xero ingestion path, destination permissions, incremental sync, and
+  completion event verified.
 - US Plaid production access and pilot institution verified.
-- India Setu production/FIU/Sahamati gate passed and pilot FIP verified.
 - Google OAuth verification and sender/domain policy completed.
 - B2 buckets, lifecycle, signed URLs, deletion policy, and Object Lock retention
   for approved review packages/action manifests configured and tested.
 - Market data-processing, retention, vendor, and cross-border transfer policies
-  approved for PostgreSQL, B2, OpenAI, and provider data.
+  approved for PostgreSQL, B2, Groq, and provider data.
 - Secret store, key rotation, callback domains, and alerting configured.
 - Provider outage, token expiry, consent revocation, webhook replay, and action
   retry runbooks rehearsed.
-- One US and one India live close run passes all acceptance criteria in `PRD.md`.
+- At least one US production close run passes all acceptance criteria in `PRD.md`.
 - No test connector, fixture namespace, local artifact store, or prohibited MCP
   tool is present in either production deployment.

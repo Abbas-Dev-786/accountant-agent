@@ -8,7 +8,7 @@ the AccountingOS MVP architecture.
 
 Use these documents instead:
 
-- `demo_architecture.md` for the isolated synthetic US demo boundary.
+- `demo_architecture.md` for isolated synthetic test-fixture boundaries.
 - `PRD.md` for the approved MVP product scope and acceptance criteria.
 - `TDD.md` for the authoritative architecture, data contracts, workflow DAG,
   state transitions, security boundaries, test strategy, and implementation

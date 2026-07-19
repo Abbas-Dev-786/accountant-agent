@@ -1,26 +1,31 @@
-# AccountingOS Demo MVP and Live Product Technical Design
+# AccountingOS US Production Technical Design
 
 **Version:** 1.3
-**Status:** Approved for demo implementation; live expansion remains gated  
+**Status:** Production-first scope selected; live-provider implementation and
+external acceptance remain gated
 **Decision date:** 2026-07-18
 
-This document implements `PRD.md` and `demo_architecture.md`. Provider onboarding
-details and production release gates are defined in `live_integrations.md`.
+This document implements `PRD.md`. Provider onboarding and production release
+gates are defined in `live_integrations.md`; `demo_architecture.md` applies only
+to an isolated test fixture.
+
+> **Scope update (2026-07-19):** US production is the active product path. Any
+> later reference to a demo-first phase is historical fixture-validation context,
+> not a production delivery requirement. Production must never select fixture or
+> sandbox data.
 
 ## 1. Architecture Decisions
 
-1. Demo and production are separate deployments with immutable environment
-   configuration, credentials, databases, callbacks, and artifacts.
-2. Demo close runs use synthetic data from Plaid Sandbox, a Xero Demo Company,
-   and a Google test Workspace. Production close runs use authenticated live
-   provider data.
+1. Production uses immutable environment configuration, credentials, databases,
+   callbacks, and artifacts. Any demo fixture is a separate deployment.
+2. Production close runs use authenticated live provider data. Fixtures use only
+   isolated synthetic data and cannot satisfy production acceptance.
 3. Xero is the only MVP accounting system. QuickBooks is not implemented.
-4. `XeroDirectDemoAdapter` reads the Demo Company for the demo. The future
-   `FivetranXeroAdapter` implements the same source contract for production.
+4. The configured production Xero ingestion path implements the shared immutable
+   source contract. `XeroDirectDemoAdapter` is retained only for fixtures.
 5. Our owned Xero MCP server wraps the official Xero API for source checks and
    controller-approved `DRAFT` manual-journal creation.
-6. Plaid Sandbox is the demo bank adapter. Plaid Production and Setu Account
-   Aggregator are later live adapters.
+6. Plaid Production is the active US bank adapter. Setu is deferred with India.
 7. Google Drive and Gmail use owned OAuth-backed MCP tools against a test
    Workspace in demo mode and production Workspace in live mode.
 8. PostgreSQL is authoritative for workflow state, normalized data, snapshots,
@@ -28,11 +33,11 @@ details and production release gates are defined in `live_integrations.md`.
    authoritative for their source records.
 9. AI can explain and summarize cited evidence. It cannot reconcile amounts,
    approve actions, select new permissions, post journals, or move money.
-10. Demo and later market deployments share code but use separate databases,
+10. Production and fixture deployments share code but use separate databases,
     secrets, B2 buckets, callbacks, and provider environments.
-11. Controller authentication uses a managed OpenID Connect provider with the
-    authorization-code flow and PKCE. AccountingOS stores organization
-    membership, not local passwords; the concrete provider is selected in Phase 0.
+11. Controller authentication uses Supabase Auth as the OpenID Connect issuer.
+    AccountingOS stores organization membership, not local passwords; FastAPI
+    validates Supabase JWTs before applying membership and controller-role checks.
 
 ## 2. System Context
 
@@ -55,15 +60,15 @@ details and production release gates are defined in `live_integrations.md`.
        +---------+---------+      |      +---------+---------+
        |                   |      |      |                   |
        v                   v      v      v                   v
- Xero demo/live       Normalized data   Plaid Sandbox/Prod  Setu AA later
- adapter/Fivetran             |
+ Xero source          Normalized data   Plaid Sandbox/Prod  Setu AA deferred
+ adapter                      |
        ^                       v
  Xero source              Policy/MCP gateway
                                   |
                  +----------------+----------------+
                  |                |                |
                  v                v                v
-             Xero API       Google APIs        OpenAI API
+             Xero API       Google APIs        Groq API
                  |
                  v
           Draft journals only
@@ -73,8 +78,8 @@ Package artifacts --------------------------------------> Backblaze B2
 
 The MVP is a modular monolith with separately runnable API, worker, and webhook
 processes. MCP servers are owned modules deployed behind the policy gateway, not
-untrusted public servers. The demo deployment is a separate stack, not a runtime
-mode switch inside production.
+untrusted public servers. A fixture deployment is a separate stack, not a
+runtime mode switch inside production.
 
 ## 3. Technology Stack
 
@@ -92,9 +97,9 @@ mode switch inside production.
   timestamped migrations under `supabase/migrations/` applied with the Supabase
   CLI — not an ORM migration tool.
 - PostgreSQL 16.
-- OpenAI SDK with structured outputs.
-- Provider clients for direct Xero demo reads, future Fivetran ingestion, Plaid,
-  Setu, Google, and B2.
+- Groq structured outputs through the server-side adapter.
+- Provider clients for the approved production Xero ingestion, Plaid Production,
+  Google, B2, and fixture-only adapters.
 - MCP SDK for owned, schema-defined financial tools.
 
 ### Infrastructure
@@ -112,20 +117,20 @@ Separate schemas prevent ingestion and application code from overwriting one
 another:
 
 ```text
-raw_xero        Fivetran-owned production Xero tables; application read-only
-raw_xero_demo   Direct Xero Demo Company payloads; adapter-owned append-only
-raw_bank_us     Plaid payload landing tables
-raw_bank_demo   Plaid Sandbox payload landing tables for the isolated demo
-raw_bank_in     Setu AA payload landing tables
+raw_xero        Production Xero payload landing tables; application read-only
+raw_xero_demo   Fixture-only Xero payload landing tables
+raw_bank_us     Plaid Production payload landing tables
+raw_bank_demo   Fixture-only Plaid Sandbox payload landing tables
+raw_bank_in     Deferred Setu AA payload landing tables
 normalized      Canonical accounting, bank, document, and identity records
 workflow        Runs, tasks, dependencies, approvals, and packages
 audit           Append-only events, provider calls, AI calls, and action ledger
 ```
 
-Only Fivetran credentials may write `raw_xero`. The demo Xero adapter may write
-`raw_xero_demo`. Provider webhook/ingestion roles write their regional raw-bank
-schema. Normalization jobs read either raw source and write versioned normalized
-records through the shared `SourceBatch` contract.
+Only the approved production Xero ingestion credential may write `raw_xero`.
+Fixture credentials may write `raw_xero_demo`. Provider webhook/ingestion roles
+write their regional raw-bank schema. Normalization jobs read either raw source
+and write versioned normalized records through the shared `SourceBatch` contract.
 
 ## 5. Organization and Connection Model
 
@@ -191,25 +196,24 @@ IDs, immutable payloads or permitted copies, source watermarks, provider
 request/event IDs, completeness, warnings, and failure details. Normalization
 and snapshot code depend on this contract rather than provider SDK objects.
 
-### Xero Direct Demo Adapter
+### Fixture Xero Direct Adapter
 
 The demo reads the Xero Demo Company through `XeroDirectDemoAdapter`. It performs
 bounded paginated reads, records request IDs and source timestamps, and writes
 append-only payloads to `raw_xero_demo` before normalization. It does not call
-Fivetran and it never connects to a live customer tenant.
+the production source and it never connects to a live customer tenant.
 
-### Xero Through Fivetran
+### Production Xero Source
 
-1. Validate that the Fivetran Xero connection is `connected` and its selected
-   Xero organization matches the AccountingOS organization.
-2. Request or await an incremental sync using the supported Fivetran control
-   flow.
-3. Receive `sync_end` webhook or poll connection status until completion.
+1. Validate that the configured Xero source connection is healthy and its
+   selected Xero organization matches the AccountingOS organization.
+2. Request or await its supported incremental sync flow.
+3. Receive a verified completion event or poll connection status until completion.
 4. Record connection ID, sync ID when available, start/end timestamps,
    `succeeded_at`, schema status, warnings, and affected tables.
 5. Reject delayed, failed, incomplete, wrong-tenant, or warning states that make
    close data unreliable.
-6. Run normalization and source-total checks after Fivetran commits its changes.
+6. Run normalization and source-total checks after the source commits its changes.
 
 A historical re-sync is an administrative action, not a normal close task.
 
@@ -217,9 +221,9 @@ A historical re-sync is an administrative action, not a normal close task.
 
 The Xero MCP server performs a bounded read of tenant identity, organization
 settings, accounts, and required control totals. In production the run blocks
-when the direct tenant differs from Fivetran or material control totals do not
-agree. In demo mode it verifies the Demo Company identity and direct-source
-watermark without pretending that Fivetran was used.
+when the direct tenant differs from the configured source or material control
+totals do not agree. In fixture mode it verifies the Demo Company identity and
+direct-source watermark without pretending production sources were used.
 
 ### US Bank Through Plaid
 
@@ -312,9 +316,8 @@ ingestion source. Normalization cannot change source amounts to force a match.
 
 ## 9. Close-Readiness Workflow DAG
 
-The only MVP template is `close-readiness-v1`. It runs against the demo source
-adapters in the isolated demo deployment and against production source adapters
-only after the relevant release gates pass.
+The only MVP template is `close-readiness-v1`. It runs against configured
+production source adapters. Fixture adapters exist only for isolated testing.
 
 ```text
 T01 Validate organization configuration and connections
@@ -360,8 +363,9 @@ T01 Validate organization configuration and connections
 ```
 
 T02-T04 execute concurrently when connections permit. T05 depends on T02 because
-it compares direct Xero totals with the newly normalized source result. In demo
-mode T02 uses `XeroDirectDemoAdapter`; production later uses Fivetran. T07 and
+it compares direct Xero totals with the newly normalized source result. Fixture
+mode uses `XeroDirectDemoAdapter`; production uses its configured Xero ingestion
+path. T07 and
 T08 may run concurrently after T06. T14 is a persisted wait state, not a worker
 task holding a lease. Recording approval freezes the T13 review package before
 T15 begins. T15 never runs without approval tied to the exact source snapshot,
@@ -521,11 +525,11 @@ Bank tools are read-only and dispatch to Plaid or Setu by organization market.
 - `gmail.create_request_draft`
 - `gmail.send_approved_request`
 
-### Fivetran Control Tools
+### Xero Source Control Tools
 
-- `fivetran.connection_status`
-- `fivetran.request_sync`
-- `fivetran.sync_result`
+- `xero_source.connection_status`
+- `xero_source.request_sync`
+- `xero_source.sync_result`
 
 Tool schemas use strict enums and identifiers. Servers validate inputs, enforce
 access control and rate limits, sanitize outputs, and audit calls. The model can
@@ -731,7 +735,7 @@ Metrics:
 
 - provider onboarding success/failure
 - sync duration, freshness age, partial delivery, consent expiry
-- Fivetran warnings and source-total mismatches
+- Xero source warnings and source-total mismatches
 - webhook validation/replay failures
 - task duration, retries, lease expiry, and blocker duration
 - reconciliation match/exception rates without exposing financial values
@@ -765,12 +769,12 @@ The user timeline is built from persisted audit events, not process logs.
 - Setu sandbox for consent, partial/complete FI delivery, notification replay,
   expiry, and revocation.
 - Google test Workspace for scoped Drive/Gmail actions.
-- Fivetran non-production destination for setup, incremental sync, webhook, and
-  schema-change tests.
+- The production Xero source's non-production environment for setup,
+  incremental-sync, webhook, and schema-change tests.
 
 ### Live Acceptance
 
-- Designated US and India pilot organizations only.
+- Designated US pilot organizations only; India is deferred.
 - Production data and provider credentials.
 - Read-only smoke tests by default.
 - Explicit controller approval for the live allowlisted email and Xero draft
@@ -783,26 +787,26 @@ The user timeline is built from persisted audit events, not process logs.
 - Provider timeout with an unsearchable or ambiguous external-action result.
 - Package immutability before approval, during action failure, and after retry.
 - Duplicate/out-of-order provider webhooks.
-- Expired OAuth, revoked Plaid Item, demo scenario-bootstrap failure, and later
-  expired/partial Setu consent.
+- Expired OAuth, revoked Plaid Item, fixture scenario-bootstrap failure, and
+  deferred Setu consent behavior.
 - Prompt injection in email/document evidence.
 - Cross-organization record, evidence, tool, and SSE access attempts.
-- Provider rate limits, network timeouts, and stale Fivetran data.
+- Provider rate limits, network timeouts, and stale Xero source data.
 
 ## 21. Deployment
 
-Use a separate demo stack and separate later production stacks:
+Use a US production stack and, only when required for testing, a separate fixture
+stack:
 
 ```text
-accounts-demo.example.com -> Demo API/worker/webhooks -> Demo Postgres/B2/secrets
 accounts-us.example.com    -> US API/worker/webhooks    -> US Postgres/B2/secrets
-accounts-in.example.com    -> IN API/worker/webhooks    -> IN Postgres/B2/secrets
+accounts-test.example.com  -> Test API/worker/webhooks  -> Test Postgres/B2/secrets
 ```
 
-The demo stack has Plaid Sandbox, Xero Demo Company, test Workspace, and demo
-artifact credentials. Production stacks have their own Fivetran destinations and
-regional provider credentials. No credentials, callbacks, databases, or
-artifacts cross stacks.
+The US production stack has authenticated Xero, Plaid Production, production
+Workspace, and production artifact credentials. The fixture stack has isolated
+test providers only. No credentials, callbacks, databases, or artifacts cross
+stacks.
 The codebase and migrations are shared. Cross-region operational dashboards may
 use aggregate non-financial metrics only; financial records are not copied
 between deployments by the MVP. Physical database, B2, and model-processing
@@ -812,10 +816,20 @@ storage region.
 
 ## 22. Implementation Order
 
-### Phase 0: Demo Capability Spikes
+### Production implementation order
+
+The historical demo-first phase list below is superseded by the production work
+plan in `../plan/remaining-work-plan.md`. The active order is: provision US
+production providers and secrets; apply and verify private Supabase migrations;
+capture the organization's versioned mapping; complete durable
+reconciliation/report/action/artifact workers; then pass production acceptance.
+
+### Historical fixture phases
+
+### Phase 0: Fixture Capability Spikes
 
 - Create isolated Plaid Sandbox, Xero Demo Company, Google test Workspace, B2,
-  OpenAI, and managed OIDC credentials.
+  Groq, and Supabase Auth credentials.
 - Confirm Xero Demo Company OAuth, pagination, account codes, draft status,
   proposal markers, rate limits, and read-back behavior.
 - Confirm Plaid Sandbox Link, dynamic transaction seeding, cursor sync,
@@ -827,7 +841,7 @@ Exit: the prepared Xero baseline plus seeded Plaid/Workspace scenario can be
 verified and read coherently from all demo providers; no unverified
 demo-provider assumption remains.
 
-### Phase 1: Demo Organization and Connection Platform
+### Phase 1: Fixture Organization and Connection Platform
 
 - Demo deployment, identity, organization isolation, environment guards, secret store,
   connection records, OAuth callbacks, webhook verification, and connection UI.
@@ -835,7 +849,7 @@ demo-provider assumption remains.
 Exit: a controller can connect Xero Demo Company, Plaid Sandbox, and test
 Workspace and see verified health/scopes without starting a close.
 
-### Phase 2: Demo Ingestion and Snapshots
+### Phase 2: Fixture Ingestion and Snapshots
 
 - Direct Xero demo and Plaid ingestion, normalization, source-total
   verification, freshness barrier, immutable snapshot, and audit/SSE timeline.
@@ -888,16 +902,10 @@ for the applicable market.
 
 ## 23. Definition of Done
 
-The demo milestone is complete when:
+The US production product is complete only when:
 
-- The isolated demo stack cannot select production credentials or data.
-- One seeded US scenario passes synchronization, snapshot, reconciliation,
-  approval, Xero `DRAFT` creation, read-back, and audit verification.
-- Failure, duplicate webhook, ambiguous action, and cancellation paths are tested.
-
-The later live product is complete only when:
-
-- One US and one India pilot pass the full production acceptance flow.
+- At least one US production organization passes the full production acceptance
+  flow.
 - No production code path or configuration can select fixture/test data.
 - Every package identifies live source records and provider watermarks.
 - Stale, partial, revoked, and inconsistent sources fail visibly.

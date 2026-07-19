@@ -1,26 +1,32 @@
 # AccountingOS Remaining Work Plan
 
 **Specification baseline:** v1.3  
-**Starting point:** Phases 0–7 safety foundations are implemented and tested;
-Phase 8 persistence scaffolding, Phase 9 runtime adapters, and the Phase 10
-worker state layer are implemented but still require external/database
-evidence.
-**Purpose:** finish the isolated synthetic US demo, then gate a US production
-pilot. India is explicitly deferred until a separate scope decision.
+**Starting point:** Phases 0–7 safety foundations, Phase 8 private persistence,
+Phase 9 server-side read adapters, and the Phase 10 durable task/event layer
+are implemented and tested. External/database evidence is still required.
+**Purpose:** deliver the US production product. Synthetic scenarios are retained
+only as isolated test fixtures. India is explicitly deferred until a separate
+scope decision.
 
 This plan covers the work that remains after the provider-contract and policy
-foundations. The current code now includes transport-injected provider seams,
-Supabase migration scaffolding, and server-only Groq/Supabase boundaries. The
-next work applies the migration, provisions real US demo accounts, and replaces
-the remaining in-memory workflow with durable workers and a usable web flow.
+foundations. The current code includes transport-injected provider seams,
+Supabase migrations, server-only Groq/Supabase boundaries, Supabase Auth API
+enforcement, and a working browser onboarding/close-run flow. The next work
+applies the migration to the chosen production project, provisions the US
+production accounts, and configures the organization-specific accounting mapping
+and action/artifact integrations.
 
 ## Current baseline
 
 Already implemented:
 
-- deployment, connection, OAuth callback, and demo/live boundary primitives;
+- deployment, connection, OAuth callback, and production/fixture boundary
+  primitives;
 - multi-tenant Xero connection registration with an optional tenant allowlist,
-  and a durable Postgres-backed OAuth session store;
+  a durable Postgres-backed OAuth session store, and durable connection-health
+  records;
+- Supabase Auth magic-link browser sign-in, server-side token verification,
+  organization membership checks, and idempotent close-run creation;
 - Xero/Plaid source contracts, normalization, cursor/pagination recovery, and
   immutable snapshot rules;
 - scoped evidence and checklist evaluation;
@@ -30,21 +36,28 @@ Already implemented:
 - frozen controller approvals and Xero `DRAFT` action policy;
 - US production release gates, with India retained only as deferred boundary
   code;
-- 92 backend tests and a successful Next.js production build.
+- 135 backend tests and a successful Next.js production build.
 
 Not yet complete:
 
-- applying and validating the Supabase migration against a local/remote
-  project, then wiring every domain aggregate to durable repositories;
+- applying and validating the Supabase migrations against the selected remote
+  project;
 - managed secret-manager provisioning and real provider account evidence;
-- worker DAG, leases, retries, cancellation, and SSE replay;
-- integrated API and web screens;
-- external Phase 0 capability evidence and end-to-end demo acceptance;
-- production provider, compliance, and operational hardening.
+- replacing the current demo-default bootstrap and source adapters with the
+  production-only organization onboarding and source configuration;
+- the organization-specific selected bank accounts, ledger source, tolerances,
+  and account mappings required to turn provider records into reconciliation
+  facts safely;
+- durable reconciliation/report/action/artifact execution on the frozen
+  mapping, including B2 Object Lock and Xero draft read-back;
+- SSE streaming/replay and the detailed browser screens for source evidence,
+  reconciliation, reports, and action recovery;
+- production provider, compliance, and operational acceptance evidence.
 
 ## Delivery rules
 
-1. Preserve the demo boundary: only synthetic US/USD data may enter the demo.
+1. Preserve the production boundary: only live US/USD data may enter the active
+   deployment; any synthetic data stays in a physically separate fixture stack.
 2. Keep provider tokens out of PostgreSQL, logs, browser payloads, AI prompts,
    and artifacts; store only secret-manager references.
 3. Keep raw provider data append-only and application-owned normalized versions
@@ -66,13 +79,13 @@ Not yet complete:
   Supabase CLI; do not hand-name migration files.
 - The FastAPI backend uses a server-side Postgres connection for transactional
   work. The browser never receives a Supabase secret/service-role key.
-- Keep financial tables in private schemas (`workflow`, `raw_xero_demo`,
-  `raw_bank_demo`, `normalized`, and `audit`) rather than exposing them through
-  the Data API. If any table is exposed later, enable RLS and add explicit
-  grants/policies for the actual organization-membership model.
-- Supabase Auth is not assumed to replace the existing managed OIDC decision;
-  identity integration remains a separate choice. Supabase Storage/Realtime are
-  optional and must not bypass the FastAPI policy boundary.
+- Keep financial tables in private schemas (`workflow`, `raw_xero`,
+  `raw_bank_us`, `normalized`, and `audit`) rather than exposing them through
+  the Data API. Legacy `*_demo` schemas are fixture-only. If any table is
+  exposed later, enable RLS and add explicit grants/policies for the actual
+  organization-membership model.
+- Supabase Auth is the selected controller identity provider. Supabase
+  Storage/Realtime are optional and must not bypass the FastAPI policy boundary.
 
 Supabase's current platform defaults require deliberate Data API exposure and
 RLS/grants for newly created tables, so the plan defaults to private schemas and
@@ -115,7 +128,7 @@ or allow a duplicate external action.
 
 1. Initialize the Supabase project and create migrations with the Supabase CLI.
 2. Add SQLAlchemy models/repositories and Supabase migrations for:
-   - `raw_xero_demo`, `raw_bank_demo`, and later market raw schemas;
+   - `raw_xero`, `raw_bank_us`, and fixture-only raw schemas;
    - normalized record versions, source batches, snapshots, and membership;
    - evidence items, checklist versions/evaluations, reconciliation matches,
      exceptions, journal proposals, reports, and packages;
@@ -149,18 +162,17 @@ or allow a duplicate external action.
 A persisted close run can be stopped and restarted while preserving its exact
 snapshot, package hash, approval, and external-action idempotency state.
 
-## Phase 9 — Real isolated US demo provider wiring and Groq
+## Phase 9 — US production provider wiring and Groq
 
 ### Outcome
 
-The injected contracts have server-only HTTP adapters for the isolated demo
-Xero, Plaid Sandbox, and Google Workspace providers, plus a Groq structured
-output adapter. Credentials and external evidence are still required before
-this phase can be accepted.
+The server-only contracts connect the approved US production Xero source, Plaid
+Production, Google Workspace, B2, and Groq. Credentials, organization mapping,
+and external evidence are required before this phase can be accepted.
 
 ### Work items
 
-1. Create separate US demo secret-store entries and callback URLs, including
+1. Create US production secret-store entries and callback URLs, including
    `GROQ_API_KEY` and Xero client-secret/refresh-token references (external
    setup pending).
 2. Implement Xero standard OAuth Auth Code + PKCE authorization, token
@@ -168,9 +180,8 @@ this phase can be accepted.
    provides the server-side exchange/rotation boundary and `list_tenants`;
    the callback registers a connection for every granted tenant. Live
    secret-store wiring remains). Registration is multi-tenant by default; the
-   optional `ACCOUNTINGOS_XERO_TENANT_ALLOWLIST` pins a deployment to specific
-   tenant ids, and a demo deployment sets it to the designated Xero Demo Company
-   so a production organization can never be imported. OAuth transaction state
+   optional `ACCOUNTINGOS_XERO_TENANT_ALLOWLIST` pins an organization to its
+   approved production tenant. OAuth transaction state
    is held in the durable `workflow.oauth_sessions` store when a database is
    configured, so a restart or second worker does not drop an in-flight
    authorization. Use the current granular scope profile in
@@ -178,11 +189,11 @@ this phase can be accepted.
    payments, bank transactions, the narrowly bounded manual-journal draft path,
    and the required reports. Never put the client secret or refresh token in
    browser variables.
-3. Wire direct Xero Demo Company reads through the bounded HTTP adapter
-   (`XeroDemoHttpClient` and `XeroBaselineHttpClient` implemented; live account
-   evidence pending).
-4. Wire Plaid Sandbox Link/access-token/cursor sync and webhook verification
-   (`PlaidHttpSandboxClient` implemented; account evidence pending).
+3. Wire the approved production Xero source through the bounded source contract,
+   including tenant identity, account list, pagination, control totals, and
+   current source watermarks.
+4. Wire Plaid Production Link/access-token/cursor sync and webhook verification,
+   including selected-account completeness and pending-to-posted behavior.
 5. Wire Google Drive/Gmail scoped search, draft, and allowlisted send clients
    (read clients implemented; draft/send worker wiring pending).
 6. Wire B2 upload, signed retrieval, Object Lock, and content-addressed keys.
@@ -194,9 +205,9 @@ this phase can be accepted.
 
 ### Required external evidence
 
-- Xero Demo Company tenant, scope, pagination, control-total, marker, and
+- Xero production tenant, scope, pagination, control-total, marker, and
   `DRAFT` read-back evidence.
-- Plaid Sandbox cursor, added/modified/removed, pending-to-posted, webhook
+- Plaid Production cursor, added/modified/removed, pending-to-posted, webhook
   replay, and Item-error evidence.
 - Google OAuth scope, folder/mailbox scope, and allowlisted test-send evidence.
 - B2 Object Lock and signed retrieval evidence.
@@ -204,10 +215,10 @@ this phase can be accepted.
 
 ### Exit criterion
 
-The fixed synthetic scenario reads current provider data and produces complete
+A real US organization reads current provider data and produces complete
 source/evidence batches with real provider request IDs, or blocks with the true
-provider condition. Transport-injected tests prove the code boundary but are
-not sufficient for exit.
+provider condition. Transport-injected tests prove the code boundary but are not
+sufficient for exit.
 
 ## Phase 10 — Worker DAG, webhooks, and recovery
 
@@ -216,8 +227,9 @@ not sufficient for exit.
 Close runs execute the documented workflow DAG with durable leases, visible
 progress, safe retries, cancellation, and restart recovery.
 
-The deterministic task state layer and webhook replay guard are implemented in
-`backend/app/worker.py`; durable persistence and a running worker remain open.
+The deterministic task state layer, durable task/event persistence, and running
+worker entrypoint are implemented. Production provider/action recovery remains
+open.
 
 ### Work items
 
@@ -249,7 +261,9 @@ timeout produce deterministic state transitions without duplicate side effects.
 
 ### Outcome
 
-The controller can operate the complete demo workflow from the browser without
+direct provider writes or secret exposure.
+The controller can operate the complete US production workflow from the browser
+without direct provider writes or secret exposure.
 direct provider writes or secret exposure.
 
 ### Work items
@@ -273,20 +287,21 @@ direct provider writes or secret exposure.
 
 ### Exit criterion
 
-A controller can run the fixed demo scenario end-to-end from the browser and
-sees the same persisted state after refresh or reconnect.
+A controller can run a configured US production close end-to-end from the
+browser and sees the same persisted state after refresh or reconnect.
 
-## Phase 12 — Demo acceptance and operational readiness
+## Phase 12 — US production acceptance and operational readiness
 
 ### Outcome
 
-The isolated synthetic demo is reproducible, supportable, and honest about its
+The US production product is reproducible, supportable, and honest about its
 provider state.
 
 ### Work items
 
-1. Bootstrap and verify `demo-scenario-v1` against current provider IDs.
-2. Capture a complete close run, evidence batch, reconciliation result,
+1. Onboard and verify a real US organization, its Xero tenant, selected Plaid
+   Production account(s), Workspace scope, B2 bucket, and Groq configuration.
+2. Capture a complete production close run, evidence batch, reconciliation result,
    reports, AI explanation, frozen package, and verified Xero `DRAFT`.
 3. Run failure drills: stale/partial source, wrong tenant, duplicate webhook,
    revoked token, Gmail ambiguous send, Xero timeout, tampered read-back,
@@ -296,28 +311,28 @@ provider state.
 5. Verify backups, restore, retention/deletion, secret rotation, B2 retention,
    and audit export.
 6. Run accessibility, dependency, security, and load checks appropriate for the
-   demo deployment.
+   production deployment.
 
 ### Exit criterion
 
-The demo acceptance checklist is signed with real provider evidence; no
-placeholder or local fixture is used to claim readiness.
+The US production acceptance checklist is signed with real provider evidence;
+no placeholder, sandbox, or local fixture is used to claim readiness.
 
-## Phase 13 — US production pilot
+## Phase 13 — US production launch readiness
 
 ### Preconditions
 
 - Phase 12 complete.
 - Separate US production account, database, secret store, callbacks, and B2
   bucket.
-- Xero production, Fivetran, Plaid Production, Google, B2, and OpenAI evidence.
+- Xero production source, Plaid Production, Google, B2, and Groq evidence.
 - Pilot organization authorization and controller sign-off.
 
 ### Work items
 
 1. Register the US production deployment as `production`/`live`/`US`/`USD`.
-2. Implement Fivetran Xero sync completion, read-only raw schema, freshness
-   barrier, and direct Xero control-total verification.
+2. Complete the approved Xero source's read-only raw schema, freshness barrier,
+   and direct Xero control-total verification.
 3. Implement Plaid Production onboarding, refresh/webhook flow, consent,
    selected accounts, and transaction completion checks.
 4. Run live Drive/Gmail policy acceptance, reports, AI, approval, and Xero
@@ -384,25 +399,26 @@ can read credentials, artifacts, or financial records from another market.
 ```text
 Phase 8 Persistence
       ↓
-Phase 9 Real demo providers
+Phase 9 US production providers
       ↓
 Phase 10 Worker/recovery
       ↓
 Phase 11 API/web integration
       ↓
-Phase 12 Demo acceptance
-      └──────────────→ Phase 13 US pilot
-                              ↓
-                    Phase 15 US hardening/governance
+Phase 12 US production acceptance
+      ↓
+Phase 13 US launch readiness
+      ↓
+Phase 15 US hardening/governance
 ```
 
-Phase 9 can begin US demo provider account setup in parallel with Phase 8, but no
-end-to-end acceptance should be claimed until persistence and recovery are
-available. India remains deferred and must not receive US data or credentials.
+Phase 9 can begin US production provider account setup in parallel with Phase 8,
+but no end-to-end acceptance should be claimed until persistence and recovery
+are available. India remains deferred and must not receive US data or credentials.
 
 ## Definition of done
 
-The project is ready for a demo release only when Phase 12 is signed. It is
-ready for a live US release only when Phase 13 and all external provider gates
-are signed. India remains out of the active release scope. Code completion,
-mocked clients, or a passing unit-test suite cannot substitute for those gates.
+The project is ready for a US production release only when Phase 13 and all
+external provider gates are signed. India remains out of the active release
+scope. Code completion, mocked clients, or a passing unit-test suite cannot
+substitute for those gates.

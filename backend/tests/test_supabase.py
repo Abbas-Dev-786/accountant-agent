@@ -1,9 +1,18 @@
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
+from app.connections import ConnectionHealth, ConnectionStatus
 from app.domain import CloseService, DeploymentConfig
-from app.supabase_db import SupabaseConfigError, SupabaseDatabaseConfig, SupabaseRepository
+from app.evidence import EvidenceBatch, EvidenceItem, EvidenceScope
+from app.supabase_db import (
+    PersistedTask,
+    SupabaseConfigError,
+    SupabaseDatabaseConfig,
+    SupabaseRepository,
+    SupabaseWorkflowStore,
+)
 
 
 class FakeCursor:
@@ -47,6 +56,10 @@ class SupabaseConfigTests(unittest.TestCase):
         self.assertEqual(config.connect_timeout_seconds, 10)
         with self.assertRaises(SupabaseConfigError):
             SupabaseDatabaseConfig("postgresql://postgres:secret@db.example/postgres")
+        with self.assertRaises(SupabaseConfigError):
+            SupabaseDatabaseConfig(
+                "postgresql://postgres:replace-with-password@db.example/postgres?sslmode=require"
+            )
 
     def test_public_service_role_key_is_rejected(self):
         with self.assertRaises(SupabaseConfigError):
@@ -81,8 +94,114 @@ class SupabaseRepositoryTests(unittest.TestCase):
         sql = next(migration.glob("*_us_persistence_foundation.sql")).read_text()
         self.assertIn("create extension if not exists pgcrypto", sql.lower())
         self.assertIn("revoke all on schema workflow", sql.lower())
+        self.assertIn("create schema if not exists raw_xero", sql.lower())
+        self.assertIn("create schema if not exists raw_bank_us", sql.lower())
         self.assertIn("alter table normalized.source_snapshots enable row level security", sql.lower())
         self.assertIn("create table workflow.tasks", sql.lower())
+
+    def test_workflow_store_upserts_connection_without_token_material(self):
+        connection = FakeConnection(
+            [
+                (
+                    "connection-1",
+                    "org-1",
+                    "xero",
+                    "demo",
+                    "tenant-1",
+                    "healthy",
+                    ["offline_access"],
+                    datetime(2026, 7, 1, tzinfo=timezone.utc),
+                    datetime(2026, 7, 1, tzinfo=timezone.utc),
+                    None,
+                    None,
+                )
+            ]
+        )
+        config = SupabaseDatabaseConfig("postgresql://postgres:secret@db.example/postgres?sslmode=require")
+        health = ConnectionHealth(
+            "connection-1",
+            "org-1",
+            "xero",
+            "demo",
+            "tenant-1",
+            ConnectionStatus.HEALTHY,
+            ("offline_access",),
+        )
+        with patch("app.supabase_db.connect", return_value=connection):
+            stored = SupabaseWorkflowStore(config).upsert_connection(
+                connection_health=health,
+                credential_secret_ref="secret://xero/demo/refresh-token",
+            )
+        self.assertEqual(stored.status, "healthy")
+        query, values = connection.cursor_instance.executed[0]
+        self.assertIn("on conflict (organization_id, provider, provider_tenant_or_account_id)", query.lower())
+        self.assertNotIn("token=", repr(values).lower())
+
+    def test_integrity_migration_guards_workflow_boundaries(self):
+        migration = Path(__file__).parents[1] / ".." / "supabase" / "migrations"
+        sql = next(migration.glob("*_enforce_workflow_integrity.sql")).read_text().lower()
+        self.assertIn("close_runs_organization_request_key_unique", sql)
+        self.assertIn("connections_organization_provider_tenant_unique", sql)
+        self.assertIn("close_runs_deployment_guard", sql)
+        self.assertIn("source_batches_run_guard", sql)
+        self.assertIn("raw_xero_context_guard", sql)
+        self.assertIn("live close runs require production source batches", sql)
+
+    def test_durable_workflow_migration_keeps_events_and_packages_private(self):
+        migration = Path(__file__).parents[1] / ".." / "supabase" / "migrations"
+        sql = next(migration.glob("*_durable_workflow_events.sql")).read_text().lower()
+        self.assertIn("create table workflow.task_events", sql)
+        self.assertIn("create table workflow.review_packages", sql)
+        self.assertIn("review_packages_context_guard", sql)
+        self.assertIn("revoke all on workflow.task_events", sql)
+
+    def test_workflow_store_reads_task_dependencies(self):
+        connection = FakeConnection(
+            [
+                (
+                    "task-1",
+                    "run-1",
+                    "synchronize_sources",
+                    "pending",
+                    0,
+                    None,
+                    None,
+                    None,
+                    ["preflight"],
+                )
+            ]
+        )
+        config = SupabaseDatabaseConfig("postgresql://postgres:secret@db.example/postgres?sslmode=require")
+        with patch("app.supabase_db.connect", return_value=connection):
+            tasks = SupabaseWorkflowStore(config).tasks_for_run("run-1")
+        self.assertEqual(tasks, (PersistedTask("task-1", "run-1", "synchronize_sources", "pending", 0, None, None, None, ("preflight",)),))
+
+    def test_retry_only_requeues_tasks_whose_dependencies_succeeded(self):
+        connection = FakeConnection(
+            [
+                ("org-1",),
+                ("run-1", "org-1", "2026-07-01", "2026-07-31", "synchronizing", "demo", "synthetic", None, None),
+            ]
+        )
+        config = SupabaseDatabaseConfig("postgresql://postgres:secret@db.example/postgres?sslmode=require")
+        with patch("app.supabase_db.connect", return_value=connection):
+            SupabaseWorkflowStore(config).retry_run("run-1")
+        retry_query = connection.cursor_instance.executed[1][0].lower()
+        self.assertIn("workflow.task_dependencies", retry_query)
+        self.assertIn("prerequisite.state <> 'succeeded'", retry_query)
+
+    def test_evidence_identity_cannot_be_reused_by_another_run(self):
+        connection = FakeConnection([("org-1",), ("org-2", "run-2")])
+        config = SupabaseDatabaseConfig("postgresql://postgres:secret@db.example/postgres?sslmode=require")
+        batch = EvidenceBatch(
+            "batch-1",
+            EvidenceScope(frozenset({"folder-1"}), "mailbox@example.com", frozenset({"CLOSE"}), date(2026, 7, 1), date(2026, 7, 31)),
+            (EvidenceItem("drive:item-1:hash", "drive", "item-1", "hash", datetime(2026, 7, 1, tzinfo=timezone.utc), "document", "folder-1"),),
+            datetime(2026, 7, 1, tzinfo=timezone.utc),
+        )
+        with patch("app.supabase_db.connect", return_value=connection):
+            with self.assertRaisesRegex(SupabaseConfigError, "already bound"):
+                SupabaseWorkflowStore(config).persist_evidence_batch(run_id="run-1", batch=batch)
 
 
 if __name__ == "__main__":

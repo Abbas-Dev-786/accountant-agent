@@ -1,15 +1,16 @@
-# AccountingOS Demo MVP and Live Product Requirements
+# AccountingOS US Production Product Requirements
 
 **Version:** 1.3
-**Status:** Approved for demo implementation; live product remains gated  
-**Decision date:** 2026-07-18  
-**Primary user:** Controller  
-**Demo market:** United States  
-**Later live markets:** United States and India
+**Status:** Production-first scope selected; production implementation and
+external onboarding remain gated
+**Decision date:** 2026-07-18
+**Primary user:** Controller
+**Active market:** United States
+**Deferred market:** India
 
-This document is the product source of truth. `demo_architecture.md` controls
-demo boundaries, `TDD.md` controls implementation behavior, and
-`live_integrations.md` controls provider-specific setup and production gates.
+This document is the product source of truth. `TDD.md` controls implementation
+behavior, `live_integrations.md` controls provider-specific onboarding and
+production gates, and `demo_architecture.md` controls fixture isolation only.
 
 ## 1. Product Outcome
 
@@ -18,11 +19,11 @@ provider environment:
 
 > Prepare the selected accounting period for controller review and approval.
 
-The demo reads synthetic records from Plaid Sandbox and a Xero Demo Company,
-reconciles selected accounts, investigates exceptions, generates reports, and,
-after explicit controller approval, creates balanced **draft** manual journals
-in the Demo Company. The later live product performs the same workflow against
-authenticated production providers and real customer data.
+The product reads authenticated production records from a connected Xero
+organization, selected Plaid Production accounts, and configured Google
+Workspace scopes; reconciles selected accounts; investigates exceptions;
+generates reports; and, after explicit controller approval, creates balanced
+**draft** manual journals in that Xero organization.
 
 The MVP does not automatically post journals, move money, release payments, or
 lock an accounting period. A package may be approved while its Xero journals
@@ -30,51 +31,50 @@ remain in draft status.
 
 ## 2. Environment and Data Boundary
 
-Demo and production are separate deployments with separate databases, secrets,
-callbacks, artifacts, and provider credentials.
+Production is the active deployment class. Any optional synthetic fixture is a
+separate deployment with separate databases, secrets, callbacks, artifacts, and
+provider credentials.
 
-- Demo mode uses synthetic provider data only: Plaid Sandbox, a Xero Demo
-  Company/test organization, and a Google test Workspace.
 - Production mode uses authenticated live systems and real customer data.
 - No connector may silently fall back to local data in either mode.
 - A stale, disconnected, partially synchronized, or unauthorized source blocks
   the affected workflow and identifies the real remediation.
 - Every displayed record links to its provider, source identifier, tenant or
   account, and synchronization watermark.
-- Every run records `demo` or `production` and `synthetic` or `live`.
+- Every production run records `production` and `live`.
 - Production configuration rejects test connectors, tenants, Items, schemas,
-  callbacks, and artifacts; demo configuration rejects live credentials.
-- The UI labels demo runs `DEMO — SYNTHETIC DATA`.
+  callbacks, and artifacts.
+- Fixture runs, if enabled by engineering, are visibly labelled `DEMO —
+  SYNTHETIC DATA` and are never product acceptance evidence.
 
-See `demo_architecture.md` for the complete demo boundary.
+See `demo_architecture.md` for fixture isolation controls.
 
 ## 3. Target Customer and Milestone Shape
 
 The initial customer is a small finance team using Xero with one controller who
 owns the close.
 
-The demo milestone supports one configuration:
+The active production scope supports one configuration:
 
 | Market | Accounting system | Bank source | Currency |
 | --- | --- | --- | --- |
-| Demo US | Xero Demo Company | Plaid Sandbox Transactions | USD |
+| US Production | Xero | Plaid Production Transactions | USD |
 
-The later live product adds US Production/Plaid and India/Xero/Setu. Each
-organization has one functional currency, and a run cannot combine markets,
-currencies, or accounting periods.
+India/Xero/Setu is deferred. Each organization has one functional currency, and
+a run cannot combine markets, currencies, or accounting periods.
 
 ## 4. Required Connections
 
 Before a close run can start, the controller must connect and validate:
 
-1. Xero Demo Company through the direct Xero API adapter for demo reads and
+1. Xero through the approved production integration for reads and
    controller-approved draft-journal creation.
-2. One or more Plaid Sandbox accounts for the demo.
+2. One or more Plaid Production accounts selected by the organization.
 3. Google Drive folders containing close evidence.
 4. Gmail account used to search for evidence and send policy-approved requests.
 5. Backblaze B2 for content-addressed close-package artifacts, with Object Lock
    retention for approved packages.
-6. OpenAI for bounded exception explanations and executive summaries.
+6. Groq for bounded exception explanations and executive summaries.
 
 The product must show connection health, granted permissions, latest successful
 sync, consent expiry, and remediation steps for each connection.
@@ -103,17 +103,16 @@ used so results remain reproducible.
 
 1. The controller selects an organization and accounting period.
 2. The system verifies every required connection, consent, permission, and token.
-3. The system synchronizes the selected provider environment. Demo mode uses
-   the direct Xero adapter and Plaid Sandbox; production later uses Fivetran and
-   the applicable live bank adapter.
+3. The system synchronizes the selected production provider environment using
+   the approved Xero and Plaid Production integrations.
 4. The workflow waits for successful provider completion and records source
    watermarks. Partial or stale data blocks execution.
 5. A read-only source snapshot is created from the ingested records and provider
    identifiers. The configured provider environment remains authoritative.
 6. The system loads the versioned checklist and inventories evidence from the
-   configured test or live Workspace, Xero, and bank provider.
-7. Missing evidence is shown to the controller. Demo mode may send only to the
-   configured test mailbox; production follows the outbound-email policy.
+   configured production Workspace, Xero, and bank provider.
+7. Missing evidence is shown to the controller. Requests follow the
+   outbound-email policy.
 8. Deterministic services validate AP readiness and reconcile bank transactions
    to Xero ledger entries.
 9. Exceptions are created for unmatched, duplicated, missing, or inconsistent
@@ -136,15 +135,13 @@ used so results remain reproducible.
 
 ## 7. MVP Scope
 
-### Required for the Demo Milestone
+### Required for the US Production Release
 
-- One isolated US demo deployment with one controller per demo organization.
-- Xero Demo Company reads through `XeroDirectDemoAdapter`.
-- Plaid Sandbox Transactions with cursor synchronization and webhook replay.
-- Google test Workspace evidence search and policy-controlled test email.
-- Demo B2 artifact storage.
-- Versioned scenario bootstrap: seed Plaid Sandbox and Workspace, and verify a
-  prepared Xero Demo Company baseline through an explicit reset runbook.
+- US production deployment with tenant-isolated organizations and controllers.
+- Authenticated Xero production reads and controller-approved `DRAFT` journals.
+- Plaid Production Transactions with cursor synchronization and webhook replay.
+- Google Workspace evidence search and policy-controlled email.
+- Production B2 artifact storage with Object Lock.
 - Versioned close configuration and source snapshots.
 - Fixed, versioned close-readiness workflow with persisted task execution.
 - Deterministic document, reconciliation, journal, and reporting controls.
@@ -152,14 +149,14 @@ used so results remain reproducible.
 - Controller approval and request-changes workflow.
 - Creation of approved, balanced Xero manual journals in `DRAFT` status.
 - Append-only audit timeline for every read, decision, approval, and write.
-- Support for the USD demo organization through the US adapter contract.
+- Support for USD organizations through the US adapter contract.
 
-### Later Live Product Scope
+### Optional Test-Fixture Scope
 
-- Xero ingestion through `FivetranXeroAdapter`.
-- US Plaid Production and India Setu Account Aggregator.
-- Real customer organizations and production acceptance.
-- Market-specific retention, processing, certification, and go-live gates.
+- Isolated Xero Demo Company, Plaid Sandbox, and Google test Workspace only for
+  automated and operator verification.
+- No synthetic run, fixture tenant, or sandbox result can satisfy a production
+  release gate.
 
 ### Explicitly Deferred
 
@@ -220,9 +217,8 @@ The MCP tool registry must not contain tools for prohibited actions.
 The system must complete provider OAuth/consent, store encrypted credential
 references, validate required scopes, and show the connected tenant(s)/accounts.
 Xero authorization discovers every granted tenant and registers a connection per
-tenant; an optional tenant allowlist restricts which are registered, and the
-demo stack sets it to the designated Demo Company. Connection setup is
-incomplete until provider health tests pass.
+tenant; an optional tenant allowlist restricts which are registered. Connection
+setup is incomplete until provider health tests pass.
 
 ### FR-2: Freshness Barrier
 
@@ -251,9 +247,8 @@ new package version.
 ### FR-4: Document Collection
 
 The system must evaluate the organization's versioned close checklist against
-the configured Workspace, Xero, and bank environment. Demo missing-document
-requests use only the test mailbox; production requests comply with the
-outbound-email policy.
+the configured production Workspace, Xero, and bank environment. Missing-
+document requests comply with the outbound-email policy.
 
 ### FR-5: Reconciliation
 
@@ -340,9 +335,10 @@ called live until its gates pass.
 ### Shared
 
 - Xero production application and OAuth credentials.
-- Fivetran account, production Xero connection, and PostgreSQL destination.
+- Approved production Xero ingestion path and verified source/control-total
+  behavior.
 - Google OAuth application with the required Drive/Gmail verification and scopes.
-- OpenAI and B2 production credentials, approved data-processing/retention
+- Groq and B2 production credentials, approved data-processing/retention
   configuration, and B2 Object Lock for approved package artifacts.
 - Deployed HTTPS callback and webhook endpoints.
 
@@ -359,64 +355,36 @@ called live until its gates pass.
 - At least one consenting pilot organization whose selected bank participates as
   a supported Financial Information Provider.
 
-## 12. Demo Acceptance Criteria
+## 12. Production Acceptance Criteria
 
-The demo milestone is complete when all of the following pass using only the
-isolated demo deployment and synthetic provider records:
+The US production product is complete only when all of the following pass
+without fixtures, sandbox providers, or simulated business data:
 
-1. A versioned scenario bootstrap seeds Plaid Sandbox and the test Workspace,
-   verifies the prepared Xero Demo Company baseline, and records every provider
-   ID. Xero reset is an explicit operator runbook step, not an unverified API
-   capability.
-2. Plaid cursor synchronization applies added, modified, and removed records
-   atomically and safely handles duplicate/out-of-order webhooks.
-3. Xero Demo Company reads pass tenant, account-code, pagination, and source
-   control checks through `XeroDirectDemoAdapter`.
-4. A reproducible immutable snapshot is created with provider watermarks and
-   data class `synthetic`.
-5. Evidence, reconciliation, journal, trial-balance, accounting-equation, and
-   cash controls pass or create explicit exceptions.
-6. AI explanations cite only snapshot evidence and fail closed on invalid or
-   unsupported output.
-7. Controller approval freezes the exact package and proposal hashes.
-8. One approved Xero `DRAFT` journal is created in the Demo Company, read back,
-   and recorded in a separate action manifest.
-9. Duplicate webhook, provider timeout, ambiguous action outcome, worker
-   restart, and cancellation paths are visible and do not create duplicates.
-10. The demo stack rejects production credentials, tenants, Items, callbacks,
-    artifacts, and data.
-
-## 13. Live Acceptance Criteria
-
-The later live product is complete only when all of the following pass without
-production fixtures or simulated providers:
-
-1. A real Xero organization completes Fivetran historical and incremental sync.
-2. A fresh close run records a successful Fivetran watermark and reads the same
-   tenant through the Xero MCP server.
+1. A real Xero organization completes the approved historical and incremental
+   source synchronization.
+2. A fresh close run records a successful source watermark and verifies the same
+   tenant through the controlled Xero action path.
 3. A real US pilot connects a bank through Plaid and ingests posted transactions.
-4. A real India pilot grants AA consent and returns `COMPLETED` financial data
-   through Setu; partial account delivery is handled as a blocker.
-5. Real Drive and Gmail connections discover evidence using configured scopes.
-6. At least one policy-compliant missing-document email is sent through Gmail and
+4. Real Drive and Gmail connections discover evidence using configured scopes.
+5. At least one policy-compliant missing-document email is sent through Gmail and
    its real message ID is audited.
-7. Reconciliation results tie to the selected live bank and Xero accounts, with
+6. Reconciliation results tie to the selected live bank and Xero accounts, with
    every unmatched amount represented by an exception.
-8. AI explanations contain no uncited record or unsupported amount.
-9. Every proposed journal balances and uses valid Xero account codes.
-10. Package approval creates the approved journal in the real Xero organization
-    with status `DRAFT`, then reads it back and records its Xero ID.
-11. No endpoint or MCP tool can post the journal or move money.
-12. Reports pass trial-balance, accounting-equation, and cash-reconciliation
-    controls against the frozen live snapshot.
-13. Provider token expiry, consent revocation, stale sync, partial bank delivery,
-    rate limiting, webhook replay, and API/worker restart are tested.
-14. Retrying a task does not send a duplicate email, create a duplicate Xero
-    journal, or duplicate an artifact; an ambiguous provider outcome blocks
-    automatic retry until reconciliation resolves it.
-15. The complete audit history survives refresh and service restart.
-16. Production configuration rejects any test connector, test tenant, test data
-    namespace, or local artifact store.
+7. AI explanations contain no uncited record or unsupported amount.
+8. Every proposed journal balances and uses valid Xero account codes.
+9. Package approval creates the approved journal in the real Xero organization
+   with status `DRAFT`, then reads it back and records its Xero ID.
+10. No endpoint or MCP tool can post the journal or move money.
+11. Reports pass trial-balance, accounting-equation, and cash-reconciliation
+   controls against the frozen live snapshot.
+12. Provider token expiry, consent revocation, stale sync, partial bank delivery,
+   rate limiting, webhook replay, and API/worker restart are tested.
+13. Retrying a task does not send a duplicate email, create a duplicate Xero
+   journal, or duplicate an artifact; an ambiguous provider outcome blocks
+   automatic retry until reconciliation resolves it.
+14. The complete audit history survives refresh and service restart.
+15. Production configuration rejects any test connector, test tenant, test data
+   namespace, or local artifact store.
 
 ## 14. Success Measures
 
@@ -426,9 +394,10 @@ production fixtures or simulated providers:
 - Zero unapproved or posted Xero journals created by AccountingOS.
 - Controllers can identify source freshness, blockers, evidence, adjustments,
   and write status without examining logs.
-- One US and one India pilot complete the live acceptance flow.
+- At least one US production organization completes the production acceptance
+  flow. India requires a separate future scope approval.
 
-## 15. Test-Data Boundary
+## 13. Test-Data Boundary
 
 The synthetic-data rule applies to the isolated demo deployment; the live-data
 rule applies to production and live acceptance. Engineering still requires
@@ -437,8 +406,8 @@ controlled tests:
 - Unit tests use generated records for deterministic accounting functions.
 - Integration tests use isolated provider test organizations or sandboxes where
   available.
-- Demo smoke tests may create test Gmail messages and Xero drafts in the Demo
-  Company. Production smoke tests are read-only except for explicitly approved
+- Fixture smoke tests may create test Gmail messages and Xero drafts in an
+  isolated test organization. Production smoke tests are read-only except for explicitly approved
   Gmail and Xero draft-journal acceptance tests in designated pilot organizations.
 - Test credentials, schemas, tenants, and artifacts are physically and logically
   separated from production.

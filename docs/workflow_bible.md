@@ -3,10 +3,10 @@
 **Status:** Broad domain reference. It describes a real month-end close, not the
 approved MVP scope. For the build boundary, use `PRD.md` and `TDD.md`.
 
-**Demo source decision:** The demo workflow reads Xero through
-`XeroDirectDemoAdapter` and an owned Xero MCP server. Demo bank data comes from
-Plaid Sandbox. The later live workflow uses Fivetran/Plaid Production in the US
-and Setu Account Aggregator in India.
+**Production source decision:** The active US workflow reads the organization's
+approved production Xero source and selected Plaid Production accounts through
+owned policy boundaries. `XeroDirectDemoAdapter` and Plaid Sandbox are isolated
+test-fixture components only. India/Setu remains deferred.
 
 ## Purpose
 

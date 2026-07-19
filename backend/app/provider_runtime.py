@@ -8,7 +8,7 @@ network calls.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from hashlib import sha256
 from typing import Callable, Mapping, Protocol, Sequence
@@ -134,6 +134,19 @@ class XeroDemoHttpClient(XeroDemoClient):
         return XeroPage(page, records, next_page, self.tenant_id, "demo", _request_id(response.headers))
 
 
+class XeroProductionHttpClient(XeroDemoHttpClient):
+    """Read-only Xero Accounting API client for the US production boundary.
+
+    The request shape is deliberately identical to the fixture client, but the
+    returned page is tagged ``production``.  ``XeroProductionAdapter`` rejects
+    anything else before raw records are persisted.
+    """
+
+    def get_page(self, page: int) -> XeroPage:
+        source_page = super().get_page(page)
+        return replace(source_page, provider_environment="production")
+
+
 @dataclass
 class XeroBaselineHttpClient:
     """Read-only Demo Company identity/accounts used to prepare a baseline."""
@@ -217,6 +230,24 @@ class PlaidHttpSandboxClient(PlaidSandboxClient):
             _request_id(response.headers),
             "sandbox",
         )
+
+
+class PlaidProductionHttpClient(PlaidHttpSandboxClient):
+    """Plaid Transactions Sync client restricted to the Production endpoint."""
+
+    def __init__(
+        self,
+        client_id: str,
+        client_secret_secret_ref: str,
+        secret_resolver: SecretResolver,
+        transport: JsonTransport,
+        base_url: str = "https://production.plaid.com",
+    ) -> None:
+        super().__init__(client_id, client_secret_secret_ref, secret_resolver, transport, base_url)
+
+    def sync(self, access_token: str, cursor: str | None) -> PlaidSyncPage:
+        source_page = super().sync(access_token, cursor)
+        return replace(source_page, provider_environment="production")
 
 
 @dataclass

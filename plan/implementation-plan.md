@@ -2,6 +2,11 @@
 
 **Specification:** v1.3
 
+> **Historical fixture plan:** On 2026-07-19 the active scope changed to US
+> production. This document remains as a test-fixture and design-history record;
+> use `remaining-work-plan.md` for the active production sequence. It does not
+> authorize using fixture success as production acceptance.
+
 **Product boundary:** An isolated US synthetic-data demo first. It prepares a
 controller-reviewable close package and may create only controller-approved
 Xero manual journals in `DRAFT` status. It never posts, pays, deletes, voids,
@@ -55,7 +60,7 @@ application code relies on them.
 ### Work items
 
 1. Create isolated demo credentials for Xero, Plaid Sandbox, Google test
-   Workspace, B2, OpenAI, and managed OIDC.
+   Workspace, B2, Groq, and Supabase Auth.
 2. Register the Xero demo application with the exact granular scope profile in
    `docs/live_integrations.md`; verify tenant identity, account codes,
    pagination, manual-journal `DRAFT` behavior, narration-marker lookup, and
@@ -107,8 +112,9 @@ Phase 0 credentials, scope evidence, and callback URLs.
 1. Replace in-memory run storage with Supabase Postgres plus timestamped
    `supabase/migrations/` (Supabase CLI) for organizations, organization users,
    connections, configurations, audit events, and deployment configuration.
-2. Implement managed OIDC authorization-code + PKCE login. Map the configured
-   issuer/subject into `organization_users`; do not create local passwords.
+2. Implement Supabase Auth login and validate its JWT issuer, audience, expiry,
+   and subject before mapping the user into `organization_users`; do not create
+   local passwords.
 3. Add a server-owned deployment configuration. Persist deployment mode and data
    class on runs only; reject a browser-supplied mode, live credential, production
    tenant, Item, callback, artifact, or data class in the demo stack.
@@ -121,7 +127,7 @@ Phase 0 credentials, scope evidence, and callback URLs.
    does not drop an in-flight authorization. Store only secret-manager
    references in PostgreSQL.
 5. Build connection settings and health screens for Xero, Plaid, Drive, Gmail,
-   B2, and OpenAI. Show provider environment, scopes, latest verification,
+   B2, and Groq. Show provider environment, scopes, latest verification,
    expiry, and remediation.
 6. Implement webhook signature verification, event receipt deduplication, and
    audit events before dispatching any provider work.
@@ -297,7 +303,7 @@ accounting-control or provider-write authority.
 
 ### Dependencies
 
-Phase 4 fact set, exception records, evidence references, and OpenAI demo
+Phase 4 fact set, exception records, evidence references, and Groq demo
 credentials proven in Phase 0.
 
 ### Work items
@@ -394,7 +400,7 @@ security, retention, and compliance gates are externally satisfied.
 
 ### Dependencies
 
-All demo acceptance criteria, plus the production gates in `docs/PRD.md` and
+All historical fixture acceptance criteria, plus the production gates in `docs/PRD.md` and
 `docs/live_integrations.md`.
 
 ### Work streams

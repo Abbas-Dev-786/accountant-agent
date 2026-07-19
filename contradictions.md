@@ -1,17 +1,16 @@
 # Documentation Contradictions: Final Decision Ledger
 
-**Revalidated:** 2026-07-18  
-**Current specification:** Demo MVP and live expansion v1.3
-**Demo market:** United States  
-**Later live markets:** United States and India
+**Revalidated:** 2026-07-19
+**Current specification:** US production-first v1.3 amendment
+**Active market:** United States
+**Deferred market:** India
 
 ## Current Product Decision
 
-AccountingOS first prepares a close package from synthetic records in isolated
-provider environments. The demo uses a Xero Demo Company through a direct
-adapter, Plaid Sandbox, a Google test Workspace, demo B2, and OpenAI with
-synthetic evidence. The later live product uses Xero/Fivetran, Plaid Production
-for the US, Setu Account Aggregator for India, production Google, B2, and OpenAI.
+AccountingOS prepares production close packages from an authenticated Xero
+organization, selected Plaid Production accounts, production Google Workspace,
+B2, and Groq. An isolated Xero Demo Company, Plaid Sandbox, and test Workspace
+may be used only as test fixtures; they cannot satisfy a production release gate.
 
 Production and live acceptance runs contain no fixture, dummy, generated,
 replayed, or simulated business data. Demo runs use only explicitly labeled
@@ -26,9 +25,10 @@ lock an accounting period.
 
 ### 1. Xero Replaces QuickBooks
 
-QuickBooks is removed from the MVP. Fivetran ingests live Xero data into
-PostgreSQL. An owned Xero MCP server performs bounded verification reads and
-creates controller-approved draft journals through the Xero API.
+QuickBooks is removed from the MVP. The approved production Xero source ingests
+immutable records into PostgreSQL. An owned Xero policy gateway performs bounded
+verification reads and creates controller-approved draft journals through the
+Xero API.
 
 ### 2. Bank Integrations Are Regional
 
@@ -38,10 +38,11 @@ creates controller-approved draft journals through the Xero API.
 The two adapters normalize into one canonical bank model but preserve provider
 IDs, consent, account, timestamp, and currency provenance.
 
-### 3. Fivetran Is Ingestion, Not an Action Layer
+### 3. Xero Ingestion Is Not an Action Layer
 
-Fivetran owns the `raw_xero` ingestion schema and exposes connection/sync status.
-It does not send email, write journals, post transactions, or move money.
+The configured Xero source owns the `raw_xero` ingestion schema and exposes
+connection/sync status. It does not send email, write journals, post
+transactions, or move money.
 
 ### 4. MCP Is a Controlled Interface, Not Authorization
 
@@ -91,7 +92,7 @@ fixture-specific resolutions are superseded.
 ## Live Architecture Resolution
 
 ```text
-Live Xero -> Fivetran -> raw_xero -> normalization --+
+Live Xero -> approved source -> raw_xero -> normalization --+
                                                      |
 US Plaid or India Setu -> raw bank -> normalization -+--> immutable run snapshot
                                                      |             |
@@ -112,10 +113,10 @@ Drive/Gmail live evidence ---------------------------+             v
                                                         read-back + action manifest
 ```
 
-## Demo-First Architecture Resolution
+## Fixture Architecture Resolution
 
-The first implementation is an isolated US demo stack. It exercises real
-provider calls and action controls with synthetic records:
+The optional fixture stack exercises real provider calls and action controls
+with synthetic records:
 
 ```text
 Plaid Sandbox + Xero Demo Company + Google test Workspace
@@ -134,27 +135,27 @@ Plaid Sandbox + Xero Demo Company + Google test Workspace
 ```
 
 `XeroDirectDemoAdapter` and `PlaidSandboxAdapter` implement the same source
-contract that later production adapters use. The demo bootstrap seeds Plaid and
+contract that production adapters use. The fixture bootstrap seeds Plaid and
 the test Workspace, then verifies a prepared Xero Demo Company baseline; a Xero
 reset is an explicit operator runbook step. Demo and production have separate
-databases, secrets, callbacks, artifacts, and environment guards. Fivetran,
-Setu, Plaid Production, and real customer organizations remain later live
-milestones.
+databases, secrets, callbacks, artifacts, and environment guards. US production
+uses real customer organizations and Plaid Production; India/Setu remains
+deferred.
 
 ## External Release Gates
 
 These are not coding tasks and must not be represented as already solved:
 
 - Xero production app, scopes, tenant, and draft-journal capability verification.
-- Fivetran production Xero connector and PostgreSQL destination.
+- Approved production Xero source and PostgreSQL destination.
 - Plaid Transactions production access and supported US pilot institution.
 - Setu production agreement plus FIU/Sahamati certification or a certified FIU
   partner, and a supported India pilot FIP.
 - Google OAuth verification for the required Drive/Gmail scopes.
-- Real US and India pilot organizations and controller authorization.
+- Real US organization and controller authorization.
 
-India production onboarding is likely the longest external dependency and
-should begin during Phase 0, not after the application is built.
+India production onboarding is not in the active scope and requires a separate
+product, legal, and provider decision.
 
 ## Document Disposition
 
@@ -174,8 +175,8 @@ should begin during Phase 0, not after the application is built.
 
 The final pass resolved the remaining implementation-level conflicts:
 
-- Xero direct control-total verification now depends on completion of the fresh
-  Fivetran sync and normalization instead of racing it.
+- Xero direct control-total verification depends on completion of the configured
+  fresh source sync and normalization instead of racing it.
 - Approval freezes the exact reviewed package before Xero writes. Read-back
   results create a separate action manifest rather than mutating approved content.
 - Snapshots reference immutable normalized record versions or permitted copies,
@@ -185,9 +186,8 @@ The final pass resolved the remaining implementation-level conflicts:
   making an impossible strict exactly-once promise.
 - OAuth nonce checks are limited to OpenID Connect flows, and B2 Object Lock plus
   market-specific data-processing/retention approval are explicit release gates.
-- Controller authentication now has a fixed managed-OIDC protocol and
-  organization-membership boundary; only the provider vendor remains a Phase 0
-  selection.
+- Controller authentication uses Supabase Auth as the OIDC issuer and retains
+  the organization-membership boundary in AccountingOS.
 - Fixture-era claims about one expected exception, dynamic MVP planning, and the
   first component to build were removed from the supporting workflow document.
 
@@ -210,6 +210,6 @@ expanding product scope:
 
 ## Build Decision
 
-Implementation may begin with the demo capability spikes and demo foundation in
-TDD Phase 0 and Phase 1. The product may not be called live in a market until
-every provider gate and live acceptance criterion for that market passes.
+Implementation proceeds through US production onboarding, source/mapping
+configuration, and production acceptance. The product may not be called live
+until every US provider gate and production acceptance criterion passes.

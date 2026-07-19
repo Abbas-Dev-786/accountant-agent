@@ -34,6 +34,8 @@ class GroqTests(unittest.TestCase):
         with self.assertRaises(GroqError):
             GroqConfig.from_environment({"NEXT_PUBLIC_GROQ_API_KEY": "secret-key", "GROQ_API_KEY": "secret-key"})
         with self.assertRaises(GroqError):
+            GroqConfig.from_environment({"ACCOUNTINGOS_DEPLOYMENT_MODE": "production", "GROQ_API_KEY": "secret-key"})
+        with self.assertRaises(GroqError):
             GroqConfig.from_environment({"GROQ_API_KEY": "secret-key", "GROQ_TIMEOUT_SECONDS": "fast"})
 
     def test_structured_response_is_sent_and_usage_is_recorded(self):

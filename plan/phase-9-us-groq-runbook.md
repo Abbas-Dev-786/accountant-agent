@@ -1,7 +1,7 @@
-# Phase 9 US Demo and Groq Runbook
+# Phase 9 US Production and Groq Runbook
 
-Phase 9 supplies server-side runtime adapters for the isolated synthetic US
-demo. The adapters are deliberately transport-injected: unit tests can prove
+Phase 9 supplies server-side runtime adapters for US production. The adapters
+are deliberately transport-injected: unit tests can prove
 headers, scopes, cursors, and structured-output behavior without pretending
 that a provider account is connected.
 
@@ -11,11 +11,11 @@ Keep these values in the backend environment or a managed secret store only:
 
 ```sh
 ACCOUNTINGOS_XERO_CLIENT_ID=...
-ACCOUNTINGOS_XERO_CLIENT_SECRET_REF=secret://xero/demo/client-secret
-ACCOUNTINGOS_XERO_REFRESH_TOKEN_SECRET_REF=secret://xero/demo/refresh-token
+ACCOUNTINGOS_XERO_CLIENT_SECRET_REF=secret://xero/production/client-secret
+ACCOUNTINGOS_XERO_REFRESH_TOKEN_SECRET_REF=secret://xero/production/refresh-token
 ACCOUNTINGOS_XERO_REDIRECT_URI=http://localhost:8000/api/v1/connections/xero/callback
 ACCOUNTINGOS_XERO_SCOPES="offline_access accounting.settings.read accounting.contacts.read accounting.invoices.read accounting.payments.read accounting.banktransactions.read accounting.manualjournals accounting.reports.trialbalance.read accounting.reports.profitandloss.read accounting.reports.balancesheet.read"
-GROQ_API_KEY=...
+GROQ_API_KEY_REF=secret://groq/production/api-key
 GROQ_MODEL=openai/gpt-oss-20b
 GROQ_TIMEOUT_SECONDS=30
 SUPABASE_DB_URL=postgresql://...?sslmode=require
@@ -26,6 +26,12 @@ tokens. The browser must not receive any provider secret, database URL, or
 Groq key. `NEXT_PUBLIC_GROQ_*` variables are rejected by configuration
 validation.
 
+Production source synchronization also requires
+`ACCOUNTINGOS_XERO_TENANT_ID` and
+`ACCOUNTINGOS_PLAID_SELECTED_ACCOUNT_IDS`. The worker compares every Xero
+connection and Plaid transaction to those approved values before it writes a
+snapshot; it rejects a mismatch rather than falling back to a fixture source.
+
 For the standard Xero OAuth/Auth Code app, `backend/app/xero_oauth.py` provides
 the server-side token boundary. The backend must generate a
 one-time state and PKCE verifier, send the user to Xero authorization, exchange
@@ -34,7 +40,7 @@ rotating refresh token through the secret manager. After authorization, call
 `GET https://api.xero.com/connections` to enumerate the granted tenants. The
 callback registers a connection for every granted tenant (multi-tenant);
 `ACCOUNTINGOS_XERO_TENANT_ALLOWLIST`, when set, restricts registration to named
-tenant ids so an isolated demo can be pinned to the Xero Demo Company. Use each
+tenant ids to the organization-approved production tenant. Use each
 tenant ID with the `xero-tenant-id` header for that organization's Accounting
 API calls. The exact granular scope profile is maintained in
 `docs/live_integrations.md`; onboarding must record and compare the granted
@@ -52,15 +58,17 @@ The callback session store is durable when `SUPABASE_DB_URL` is configured:
 OAuth transaction state (PKCE verifier + state) is written to the private
 `workflow.oauth_sessions` table, so a restart or a second worker does not
 invalidate an in-flight authorization. It falls back to a process-local store
-only when no database is configured (the pure-domain demo).
-`XeroBaselineHttpClient` performs the read-only Demo Company and account-code
-(`200`, `610`) checks used to create the baseline observation.
+only when no database is configured (pure-domain tests).
+`XeroBaselineHttpClient` remains a fixture helper. Production onboarding instead
+verifies the selected tenant, accounts, scopes, source watermark, and
+accounting-mapping configuration.
 
 ## Runtime adapters
 
-- `XeroDemoHttpClient` reads a configured Demo Company resource with the tenant
-  header and explicit pagination metadata.
-- `PlaidHttpSandboxClient` sends server-side credentials to Transactions Sync
+- Production Xero source reads the approved organization with tenant isolation,
+  explicit pagination, and immutable source metadata.
+- `PlaidHttpSandboxClient` is fixture-only; production sends server-side
+  credentials to Plaid Transactions Sync
   and preserves added/modified/removed changes plus cursors.
 - `GoogleDriveHttpClient` limits searches to configured folder IDs and returns
   immutable metadata hashes.
@@ -84,16 +92,16 @@ do not count as provider capability evidence.
 
 Capture redacted request/event IDs and screenshots or provider exports for:
 
-1. Xero OAuth redirect/state/PKCE validation, approved granular scopes, Demo
-   Company tenant selection, pagination, control totals, and a read-back
+1. Xero OAuth redirect/state/PKCE validation, approved granular scopes,
+   production tenant selection, pagination, control totals, and a read-back
    showing the allowed `DRAFT` action.
-2. Plaid Sandbox cursor continuation, added/modified/removed transactions,
+2. Plaid Production cursor continuation, added/modified/removed transactions,
    pending-to-posted behavior, webhook replay, and an Item error.
 3. Google OAuth scopes, Drive folder restriction, Gmail mailbox/date/label
    restriction, and an allowlisted test draft/send.
 4. Groq model/schema acceptance, usage metadata, and a bounded 429/rate-limit
    failure that leaves the explanation blocked rather than fabricated.
 
-Do not mark Phase 9 complete until the evidence is captured with the isolated
-US demo credentials. Missing credentials or provider outages remain visible
+Do not mark Phase 9 complete until the evidence is captured with the approved
+US production credentials. Missing credentials or provider outages remain visible
 blocked states.

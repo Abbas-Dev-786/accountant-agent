@@ -1,5 +1,9 @@
 # Phase 0 Operator Runbook
 
+> **Fixture-only runbook:** US production is the active scope. This document is
+> retained for isolated test-provider verification and cannot satisfy a
+> production release gate.
+
 This runbook produces the evidence required to complete Phase 0. It is not a
 substitute for provider configuration: each item must be verified against the
 isolated demo environment with actual provider request IDs.
@@ -53,7 +57,7 @@ changes, pending-to-posted behavior, webhook replay, and an Item error.
 
 For the Google test Workspace, prove scoped Drive search, Gmail draft creation,
 and a send only to an allowlisted test recipient. For B2, prove Object Lock and
-signed-object retrieval. For OIDC and OpenAI, prove the demo-only configuration
+signed-object retrieval. For Supabase Auth and Groq, prove the demo-only configuration
 and a non-secret request.
 
 Create an evidence JSON file following

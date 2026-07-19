@@ -19,6 +19,8 @@ the remaining in-memory workflow with durable workers and a usable web flow.
 Already implemented:
 
 - deployment, connection, OAuth callback, and demo/live boundary primitives;
+- multi-tenant Xero connection registration with an optional tenant allowlist,
+  and a durable Postgres-backed OAuth session store;
 - Xero/Plaid source contracts, normalization, cursor/pagination recovery, and
   immutable snapshot rules;
 - scoped evidence and checklist evaluation;
@@ -162,10 +164,17 @@ this phase can be accepted.
    `GROQ_API_KEY` and Xero client-secret/refresh-token references (external
    setup pending).
 2. Implement Xero standard OAuth Auth Code + PKCE authorization, token
-   exchange, refresh, and `/connections` tenant selection (`xero_oauth.py`
-   now provides the server-side exchange/rotation boundary; callback routing
-   and live secret-store wiring remain). Use the current granular scope profile
-   in `docs/live_integrations.md`; this includes settings, contacts, invoices,
+   exchange, refresh, and `/connections` tenant discovery (`xero_oauth.py`
+   provides the server-side exchange/rotation boundary and `list_tenants`;
+   the callback registers a connection for every granted tenant. Live
+   secret-store wiring remains). Registration is multi-tenant by default; the
+   optional `ACCOUNTINGOS_XERO_TENANT_ALLOWLIST` pins a deployment to specific
+   tenant ids, and a demo deployment sets it to the designated Xero Demo Company
+   so a production organization can never be imported. OAuth transaction state
+   is held in the durable `workflow.oauth_sessions` store when a database is
+   configured, so a restart or second worker does not drop an in-flight
+   authorization. Use the current granular scope profile in
+   `docs/live_integrations.md`; this includes settings, contacts, invoices,
    payments, bank transactions, the narrowly bounded manual-journal draft path,
    and the required reports. Never put the client secret or refresh token in
    browser variables.

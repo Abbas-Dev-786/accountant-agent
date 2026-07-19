@@ -56,8 +56,13 @@ Fivetran must never be treated as a write-back or journal-posting mechanism.
 ### Demo Xero Setup
 
 - Register a non-production Xero app and callback for the demo stack.
-- Connect only the designated Demo Company/test organization.
-- Record the provider environment as `demo` and reject production tenants.
+- Connect only the designated Demo Company/test organization. Connection
+  registration is multi-tenant by default, so the demo stack sets
+  `ACCOUNTINGOS_XERO_TENANT_ALLOWLIST` to the Demo Company tenant id; any other
+  granted tenant is skipped and never registered.
+- Record the provider environment as `demo` and reject production tenants. The
+  registry derives the environment from the deployment mode, so a demo
+  deployment can only record `demo` connections.
 - Verify account codes, pagination, rate limits, draft status semantics,
   deterministic proposal markers, and line-by-line read-back.
 - Run the scenario bootstrap: seed Plaid and Workspace data, then verify every
@@ -66,7 +71,8 @@ Fivetran must never be treated as a write-back or journal-posting mechanism.
 
 ### Demo Runtime Checks
 
-1. The selected Xero tenant is the designated Demo Company.
+1. The registered Xero tenant(s) are within the configured allowlist; in the
+   demo stack that allowlist is the designated Demo Company alone.
 2. The scenario version and provider IDs match across Xero, Plaid, and the test
    Workspace.
 3. The direct adapter completed its bounded reads and recorded a source

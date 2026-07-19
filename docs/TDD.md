@@ -700,8 +700,12 @@ concurrency. Stale writes return HTTP 409.
   validated for signature, issuer, audience, expiry, and authorization-code/PKCE
   binding. Organization access comes from `organization_users`, never from an
   organization ID supplied by the browser.
-- OAuth state, PKCE, redirect URI, and tenant selection are validated. Issuer and
-  nonce are also validated only for provider flows that use OpenID Connect.
+- OAuth state, PKCE, and redirect URI are validated; transaction state is held
+  in the durable `workflow.oauth_sessions` store so a restart or second worker
+  does not drop an in-flight authorization. Xero authorization registers a
+  connection per granted tenant, filtered by the optional tenant allowlist.
+  Issuer and nonce are also validated only for provider flows that use OpenID
+  Connect.
 - Webhook signatures are validated before persistence; payload hashes and event
   identities prevent replay.
 - PostgreSQL row-level security or equivalent repository guards enforce

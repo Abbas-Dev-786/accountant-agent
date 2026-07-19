@@ -112,8 +112,14 @@ Phase 0 credentials, scope evidence, and callback URLs.
 3. Add a server-owned deployment configuration. Persist deployment mode and data
    class on runs only; reject a browser-supplied mode, live credential, production
    tenant, Item, callback, artifact, or data class in the demo stack.
-4. Implement OAuth callback state, PKCE, redirect-URI, and tenant-selection
-   checks. Store only secret-manager references in PostgreSQL.
+4. Implement OAuth callback state, PKCE, redirect-URI, and tenant checks.
+   Registration is multi-tenant by default (a connection per granted Xero
+   tenant); the optional `ACCOUNTINGOS_XERO_TENANT_ALLOWLIST` pins a deployment
+   to specific tenants, and the demo stack sets it to the designated Demo
+   Company so a production tenant is rejected. Hold OAuth transaction state in
+   the durable `workflow.oauth_sessions` store so a restart or second worker
+   does not drop an in-flight authorization. Store only secret-manager
+   references in PostgreSQL.
 5. Build connection settings and health screens for Xero, Plaid, Drive, Gmail,
    B2, and OpenAI. Show provider environment, scopes, latest verification,
    expiry, and remediation.

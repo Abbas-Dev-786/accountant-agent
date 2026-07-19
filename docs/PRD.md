@@ -83,7 +83,7 @@ sync, consent expiry, and remediation steps for each connection.
 
 The controller completes setup once per organization:
 
-- Select the Xero tenant.
+- Select the Xero tenant for this organization from the connected tenants.
 - Select the functional currency and accounting timezone.
 - Select bank accounts included in reconciliation.
 - Map bank accounts to Xero ledger accounts.
@@ -218,8 +218,11 @@ The MCP tool registry must not contain tools for prohibited actions.
 ### FR-1: Connection Onboarding
 
 The system must complete provider OAuth/consent, store encrypted credential
-references, validate required scopes, and show the selected tenant/accounts.
-Connection setup is incomplete until provider health tests pass.
+references, validate required scopes, and show the connected tenant(s)/accounts.
+Xero authorization discovers every granted tenant and registers a connection per
+tenant; an optional tenant allowlist restricts which are registered, and the
+demo stack sets it to the designated Demo Company. Connection setup is
+incomplete until provider health tests pass.
 
 ### FR-2: Freshness Barrier
 

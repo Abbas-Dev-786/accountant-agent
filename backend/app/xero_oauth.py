@@ -68,6 +68,37 @@ class FormResponse:
     headers: Mapping[str, str]
 
 
+@dataclass(frozen=True)
+class XeroTenant:
+    connection_id: str
+    tenant_id: str
+    tenant_type: str
+    tenant_name: str
+
+
+class TenantTransport(Protocol):
+    def get(self, url: str, headers: Mapping[str, str]) -> "TenantResponse":
+        ...
+
+
+@dataclass(frozen=True)
+class TenantResponse:
+    status_code: int
+    body: object
+
+
+class UrllibTenantTransport:
+    def get(self, url: str, headers: Mapping[str, str]) -> "TenantResponse":
+        request = Request(url, headers={**headers, "Accept": "application/json"}, method="GET")
+        try:
+            with urlopen(request, timeout=30) as response:
+                return TenantResponse(response.status, json.loads(response.read().decode("utf-8")))
+        except HTTPError as exc:
+            return TenantResponse(exc.code, {})
+        except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+            raise XeroOAuthError("Xero connections request failed") from exc
+
+
 class UrllibFormTransport:
     def post(self, url: str, headers: Mapping[str, str], form: Mapping[str, str]) -> FormResponse:
         request = Request(
@@ -146,10 +177,19 @@ class XeroToken:
 
 
 class XeroOAuthClient:
-    def __init__(self, config: XeroOAuthConfig, secrets: SecretStore, transport: FormTransport | None = None) -> None:
+    def __init__(
+        self,
+        config: XeroOAuthConfig,
+        secrets: SecretStore,
+        transport: FormTransport | None = None,
+        tenant_transport: TenantTransport | None = None,
+        connections_endpoint: str = "https://api.xero.com/connections",
+    ) -> None:
         self.config = config
         self.secrets = secrets
         self.transport = transport or UrllibFormTransport()
+        self.tenant_transport = tenant_transport or UrllibTenantTransport()
+        self.connections_endpoint = connections_endpoint
         self._cached_token: XeroToken | None = None
         self._cached_until: datetime | None = None
 
@@ -204,6 +244,39 @@ class XeroOAuthClient:
         if self._cached_token and self._cached_until and current + timedelta(seconds=refresh_skew_seconds) < self._cached_until:
             return self._cached_token.access_token
         return self.refresh().access_token
+
+    def list_tenants(self) -> tuple[XeroTenant, ...]:
+        """Discover connected tenants via ``GET https://api.xero.com/connections``.
+
+        This is the required step after token exchange to learn which
+        organization(s) the access token can reach. Read-only.
+        """
+        token = self.access_token()
+        response = self.tenant_transport.get(
+            self.connections_endpoint,
+            {"Authorization": f"Bearer {token}"},
+        )
+        if response.status_code >= 400:
+            raise XeroOAuthError(f"Xero connections endpoint returned HTTP {response.status_code}")
+        if not isinstance(response.body, list):
+            raise XeroOAuthError("Xero connections response is not a list")
+        tenants: list[XeroTenant] = []
+        for item in response.body:
+            if not isinstance(item, Mapping):
+                raise XeroOAuthError("Xero connection entry is not an object")
+            tenant_id = item.get("tenantId")
+            connection_id = item.get("id")
+            if not isinstance(tenant_id, str) or not tenant_id:
+                raise XeroOAuthError("Xero connection entry is missing tenantId")
+            tenants.append(
+                XeroTenant(
+                    str(connection_id) if isinstance(connection_id, str) else "",
+                    tenant_id,
+                    str(item.get("tenantType", "")),
+                    str(item.get("tenantName", "")),
+                )
+            )
+        return tuple(tenants)
 
     def _cache(self, token: XeroToken, *, now: datetime | None = None) -> None:
         current = now or datetime.now(timezone.utc)

@@ -8,4 +8,4 @@ Requires-Dist: pydantic<3.0,>=2.9
 Requires-Dist: psycopg[binary]<4.0,>=3.2
 Requires-Dist: uvicorn[standard]<1.0,>=0.30
 Provides-Extra: test
-Requires-Dist: httpx2<3,>=2; extra == "test"
+Requires-Dist: httpx<1.0,>=0.27; extra == "test"

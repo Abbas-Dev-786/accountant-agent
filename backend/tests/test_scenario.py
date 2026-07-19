@@ -27,6 +27,10 @@ class ScenarioTests(unittest.TestCase):
         self.baseline = XeroBaselineObservation(
             "demo-tenant", ("200", "610"), {"account-200": "id-1", "account-610": "id-2"}
         )
+        self._env_backup = {
+            key: os.environ.get(key)
+            for key in ("ACCOUNTINGOS_XERO_DEMO_TENANT_ID", "ACCOUNTINGOS_XERO_DEMO_BASELINE_FINGERPRINT")
+        }
         os.environ["ACCOUNTINGOS_XERO_DEMO_TENANT_ID"] = self.baseline.tenant_id
         os.environ["ACCOUNTINGOS_XERO_DEMO_BASELINE_FINGERPRINT"] = self.baseline.fingerprint
         self.evidence = (
@@ -37,6 +41,13 @@ class ScenarioTests(unittest.TestCase):
             evidence("oidc", "demo"),
             evidence("openai", "demo"),
         )
+
+    def tearDown(self) -> None:
+        for key, value in self._env_backup.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
     def test_readiness_report_requires_real_demo_evidence(self) -> None:
         report = readiness_report(self.scenario, self.baseline, self.evidence)

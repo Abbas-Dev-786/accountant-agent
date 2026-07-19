@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import os
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from fastapi import FastAPI, HTTPException
@@ -10,9 +13,17 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from .domain import CloseService, DeploymentConfig, JournalLine, JournalProposal, PolicyError
-from .connections import ConnectionRegistry
+from .connections import ConnectionHealth, ConnectionRegistry, ConnectionStatus
 from .security import create_oauth_transaction, validate_oauth_callback
-from .xero_oauth import InMemoryOAuthSessionStore, XeroOAuthClient, XeroOAuthError
+from .secrets_store import SecretStoreError, secret_store_from_environment
+from .xero_oauth import (
+    InMemoryOAuthSessionStore,
+    XeroOAuthClient,
+    XeroOAuthConfig,
+    XeroOAuthError,
+)
+
+logger = logging.getLogger("accountingos.api")
 
 
 def deployment_from_environment() -> DeploymentConfig:
@@ -28,7 +39,6 @@ def deployment_from_environment() -> DeploymentConfig:
 
 service = CloseService(deployment_from_environment())
 connections = ConnectionRegistry(service.deployment)
-app = FastAPI(title="AccountingOS API", version="0.1.0")
 xero_oauth_client: XeroOAuthClient | None = None
 xero_oauth_sessions = InMemoryOAuthSessionStore()
 
@@ -37,6 +47,32 @@ def configure_xero_oauth(client: XeroOAuthClient | None) -> None:
     """Inject the server-side Xero client during application bootstrap/tests."""
     global xero_oauth_client
     xero_oauth_client = client
+
+
+def _build_xero_oauth_client() -> XeroOAuthClient | None:
+    """Construct the Xero client from the environment, or None if unconfigured.
+
+    Missing/placeholder config is a normal state for the pure-domain demo, so a
+    configuration error is logged and swallowed rather than aborting startup.
+    """
+    try:
+        config = XeroOAuthConfig.from_environment()
+        secrets = secret_store_from_environment()
+    except (XeroOAuthError, SecretStoreError) as exc:
+        logger.info("Xero OAuth not configured at startup: %s", exc)
+        return None
+    return XeroOAuthClient(config, secrets)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    # Only auto-wire when nothing was injected (tests inject their own client).
+    if xero_oauth_client is None:
+        configure_xero_oauth(_build_xero_oauth_client())
+    yield
+
+
+app = FastAPI(title="AccountingOS API", version="0.1.0", lifespan=lifespan)
 
 
 class CreateRunRequest(BaseModel):
@@ -173,7 +209,46 @@ def xero_callback(
         raise HTTPException(status_code=502, detail="Xero OAuth token exchange failed") from exc
     except PolicyError as exc:
         raise HTTPException(status_code=400, detail="Xero OAuth callback validation failed") from exc
+    _register_xero_connection(organization_id)
     return {"status": "authorized", "organization_id": organization_id, "expires_in": token.expires_in}
+
+
+def _register_xero_connection(organization_id: str) -> None:
+    """Discover the connected tenant and register a connection (best-effort).
+
+    Gated on a configured demo tenant id so the pure-domain demo (which has none)
+    performs no network call. Any discovery/registration failure is logged and
+    swallowed: it must never change the OAuth callback outcome, since the tokens
+    were already exchanged and persisted.
+    """
+    if xero_oauth_client is None:
+        return
+    expected_tenant = os.getenv("ACCOUNTINGOS_XERO_DEMO_TENANT_ID", "")
+    if not expected_tenant or expected_tenant.startswith("replace-"):
+        return
+    try:
+        tenants = xero_oauth_client.list_tenants()
+        match = next((t for t in tenants if t.tenant_id == expected_tenant), None)
+        if match is None:
+            logger.warning("configured Xero demo tenant not present in connections response")
+            return
+        now = datetime.now(timezone.utc)
+        connections.register(
+            ConnectionHealth(
+                connection_id=match.connection_id or match.tenant_id,
+                organization_id=organization_id,
+                provider="xero",
+                provider_environment="demo",
+                provider_tenant_or_account_id=match.tenant_id,
+                status=ConnectionStatus.HEALTHY,
+                granted_scopes=xero_oauth_client.config.scopes,
+                last_verified_at=now,
+                last_success_at=now,
+            ),
+            credential_secret_ref=xero_oauth_client.config.refresh_token_secret_ref,
+        )
+    except (XeroOAuthError, PolicyError) as exc:
+        logger.warning("Xero connection registration skipped: %s", exc)
 
 
 @app.post("/api/v1/close-runs/{run_id}/prepare-review")

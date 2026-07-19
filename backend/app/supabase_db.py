@@ -12,10 +12,11 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from json import dumps
-from typing import Any, Iterator, Mapping, Protocol, Sequence
+from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence
 from urllib.parse import parse_qs, urlparse
 
 from .domain import CloseRun, PolicyError, SourceBatch, SourceSnapshot
+from .security import OAuthTransaction
 
 
 class SupabaseConfigError(PolicyError):
@@ -240,3 +241,118 @@ class SupabaseRepository:
                 (owner, lease_seconds, row[0]),
             )
             return {"id": row[0], "run_id": row[1], "task_key": row[2], "attempt": row[3] + 1}
+
+
+class PostgresOAuthSessionStore:
+    """Durable OAuth transaction store backed by ``workflow.oauth_sessions``.
+
+    Implements the ``OAuthSessionStore`` protocol (``put``/``consume``) so it is
+    a drop-in replacement for the in-memory store. Unlike that store it survives
+    a process restart and is shared across workers, so an authorize request on
+    one process and its callback on another still find the same transaction.
+
+    A fresh connection is opened per operation via the injected factory: the
+    authorize and callback halves happen in different requests, and each must be
+    its own committed transaction. ``consume`` deletes and returns the row in a
+    single statement so a state value can be redeemed exactly once even under
+    concurrent callbacks, and it filters expired rows so a stale state cannot be
+    replayed.
+    """
+
+    def __init__(self, connect_factory: "Callable[[], Connection]") -> None:
+        self._connect = connect_factory
+
+    def put(self, oauth_transaction: OAuthTransaction, organization_id: str) -> None:
+        if not organization_id:
+            raise SupabaseConfigError("OAuth organization ID is required")
+        connection = self._connect()
+        try:
+            with transaction(connection) as cursor:
+                cursor.execute(
+                    """
+                    insert into workflow.oauth_sessions
+                        (state, provider, organization_id, code_verifier,
+                         code_challenge, redirect_uri, oidc, nonce, expires_at)
+                    values (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    on conflict (state) do nothing
+                    """,
+                    (
+                        oauth_transaction.state,
+                        oauth_transaction.provider,
+                        organization_id,
+                        oauth_transaction.code_verifier,
+                        oauth_transaction.code_challenge,
+                        oauth_transaction.redirect_uri,
+                        oauth_transaction.oidc,
+                        oauth_transaction.nonce,
+                        oauth_transaction.expires_at,
+                    ),
+                )
+        finally:
+            self._close(connection)
+
+    def consume(self, state: str) -> tuple[OAuthTransaction, str] | None:
+        if not state:
+            return None
+        connection = self._connect()
+        try:
+            with transaction(connection) as cursor:
+                cursor.execute(
+                    """
+                    delete from workflow.oauth_sessions
+                    where state = %s and expires_at > now()
+                    returning provider, state, code_verifier, code_challenge,
+                              redirect_uri, expires_at, oidc, nonce, organization_id
+                    """,
+                    (state,),
+                )
+                row = cursor.fetchone()
+        finally:
+            self._close(connection)
+        if row is None:
+            return None
+        (
+            provider,
+            state_value,
+            code_verifier,
+            code_challenge,
+            redirect_uri,
+            expires_at,
+            oidc,
+            nonce,
+            organization_id,
+        ) = row
+        return (
+            OAuthTransaction(
+                provider,
+                state_value,
+                code_verifier,
+                code_challenge,
+                redirect_uri,
+                expires_at,
+                bool(oidc),
+                nonce,
+            ),
+            organization_id,
+        )
+
+    @staticmethod
+    def _close(connection: Connection) -> None:
+        close = getattr(connection, "close", None)
+        if close is not None:
+            close()
+
+
+def oauth_session_store_from_environment(
+    env: Mapping[str, str] | None = None,
+) -> PostgresOAuthSessionStore:
+    """Build a durable OAuth session store from ``SUPABASE_DB_URL``.
+
+    Each call to the store opens a fresh, TLS-required Postgres connection via
+    :func:`connect`, so the authorize and callback halves — which run in
+    separate requests, possibly on separate workers — each get an independent
+    committed transaction. Raises :class:`SupabaseConfigError` if the database
+    is not configured, letting the caller fall back to the in-memory store.
+    """
+    config = SupabaseDatabaseConfig.from_environment(env)
+    return PostgresOAuthSessionStore(lambda: connect(config))

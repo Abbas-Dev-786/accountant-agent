@@ -16,8 +16,10 @@ from .domain import CloseService, DeploymentConfig, JournalLine, JournalProposal
 from .connections import ConnectionHealth, ConnectionRegistry, ConnectionStatus
 from .security import create_oauth_transaction, validate_oauth_callback
 from .secrets_store import SecretStoreError, secret_store_from_environment
+from .supabase_db import SupabaseConfigError, oauth_session_store_from_environment
 from .xero_oauth import (
     InMemoryOAuthSessionStore,
+    OAuthSessionStore,
     XeroOAuthClient,
     XeroOAuthConfig,
     XeroOAuthError,
@@ -40,13 +42,34 @@ def deployment_from_environment() -> DeploymentConfig:
 service = CloseService(deployment_from_environment())
 connections = ConnectionRegistry(service.deployment)
 xero_oauth_client: XeroOAuthClient | None = None
-xero_oauth_sessions = InMemoryOAuthSessionStore()
+xero_oauth_sessions: OAuthSessionStore = InMemoryOAuthSessionStore()
 
 
 def configure_xero_oauth(client: XeroOAuthClient | None) -> None:
     """Inject the server-side Xero client during application bootstrap/tests."""
     global xero_oauth_client
     xero_oauth_client = client
+
+
+def configure_oauth_sessions(store: OAuthSessionStore) -> None:
+    """Inject the OAuth session store during application bootstrap/tests."""
+    global xero_oauth_sessions
+    xero_oauth_sessions = store
+
+
+def _build_oauth_session_store() -> OAuthSessionStore:
+    """Select the durable Postgres session store, or fall back to in-memory.
+
+    A restart or a second worker must not invalidate an in-flight authorization,
+    so when ``SUPABASE_DB_URL`` is configured the OAuth transaction state is kept
+    in the private ``workflow.oauth_sessions`` table. The in-memory store remains
+    the default for the pure-domain demo, which has no database.
+    """
+    try:
+        return oauth_session_store_from_environment()
+    except SupabaseConfigError as exc:
+        logger.info("Durable OAuth session store not configured; using in-memory: %s", exc)
+        return InMemoryOAuthSessionStore()
 
 
 def _build_xero_oauth_client() -> XeroOAuthClient | None:
@@ -69,6 +92,10 @@ async def lifespan(_: FastAPI):
     # Only auto-wire when nothing was injected (tests inject their own client).
     if xero_oauth_client is None:
         configure_xero_oauth(_build_xero_oauth_client())
+    # Promote to the durable session store when a database is configured; tests
+    # and the pure-domain demo keep the default in-memory store.
+    if os.getenv("SUPABASE_DB_URL", "").strip():
+        configure_oauth_sessions(_build_oauth_session_store())
     yield
 
 
@@ -213,42 +240,65 @@ def xero_callback(
     return {"status": "authorized", "organization_id": organization_id, "expires_in": token.expires_in}
 
 
-def _register_xero_connection(organization_id: str) -> None:
-    """Discover the connected tenant and register a connection (best-effort).
+def _xero_tenant_allowlist() -> frozenset[str]:
+    """Optional set of Xero tenant ids permitted to register.
 
-    Gated on a configured demo tenant id so the pure-domain demo (which has none)
-    performs no network call. Any discovery/registration failure is logged and
-    swallowed: it must never change the OAuth callback outcome, since the tokens
-    were already exchanged and persisted.
+    Empty (the default) means every granted tenant is registered — the
+    multi-tenant path. Operators running the isolated demo may set
+    ``ACCOUNTINGOS_XERO_TENANT_ALLOWLIST`` (comma- or whitespace-separated) to
+    pin the deployment to specific organizations, e.g. the Xero Demo Company, so
+    a real org can never be imported into a synthetic demo. ``replace-`` seeds
+    are ignored so the placeholder .env value does not silently block everything.
+    """
+    raw = os.getenv("ACCOUNTINGOS_XERO_TENANT_ALLOWLIST", "")
+    return frozenset(
+        token
+        for token in raw.replace(",", " ").split()
+        if token and not token.startswith("replace-")
+    )
+
+
+def _register_xero_connection(organization_id: str) -> None:
+    """Discover every connected tenant and register a connection per tenant.
+
+    All Xero organizations the user granted are registered (multi-tenant),
+    optionally filtered by :func:`_xero_tenant_allowlist`. The connection's
+    provider environment is derived from the deployment mode so the registry's
+    demo/production boundary still holds. Any discovery/registration failure is
+    logged and swallowed: it must never change the OAuth callback outcome, since
+    the tokens were already exchanged and persisted.
     """
     if xero_oauth_client is None:
         return
-    expected_tenant = os.getenv("ACCOUNTINGOS_XERO_DEMO_TENANT_ID", "")
-    if not expected_tenant or expected_tenant.startswith("replace-"):
-        return
+    allowlist = _xero_tenant_allowlist()
+    provider_environment = "demo" if service.deployment.mode == "demo" else "production"
     try:
         tenants = xero_oauth_client.list_tenants()
-        match = next((t for t in tenants if t.tenant_id == expected_tenant), None)
-        if match is None:
-            logger.warning("configured Xero demo tenant not present in connections response")
-            return
-        now = datetime.now(timezone.utc)
-        connections.register(
-            ConnectionHealth(
-                connection_id=match.connection_id or match.tenant_id,
-                organization_id=organization_id,
-                provider="xero",
-                provider_environment="demo",
-                provider_tenant_or_account_id=match.tenant_id,
-                status=ConnectionStatus.HEALTHY,
-                granted_scopes=xero_oauth_client.config.scopes,
-                last_verified_at=now,
-                last_success_at=now,
-            ),
-            credential_secret_ref=xero_oauth_client.config.refresh_token_secret_ref,
-        )
     except (XeroOAuthError, PolicyError) as exc:
-        logger.warning("Xero connection registration skipped: %s", exc)
+        logger.warning("Xero tenant discovery skipped: %s", exc)
+        return
+    now = datetime.now(timezone.utc)
+    for tenant in tenants:
+        if allowlist and tenant.tenant_id not in allowlist:
+            logger.info("Xero tenant %s not in allowlist; skipping registration", tenant.tenant_id)
+            continue
+        try:
+            connections.register(
+                ConnectionHealth(
+                    connection_id=tenant.connection_id or tenant.tenant_id,
+                    organization_id=organization_id,
+                    provider="xero",
+                    provider_environment=provider_environment,
+                    provider_tenant_or_account_id=tenant.tenant_id,
+                    status=ConnectionStatus.HEALTHY,
+                    granted_scopes=xero_oauth_client.config.scopes,
+                    last_verified_at=now,
+                    last_success_at=now,
+                ),
+                credential_secret_ref=xero_oauth_client.config.refresh_token_secret_ref,
+            )
+        except PolicyError as exc:
+            logger.warning("Xero connection registration skipped for tenant %s: %s", tenant.tenant_id, exc)
 
 
 @app.post("/api/v1/close-runs/{run_id}/prepare-review")

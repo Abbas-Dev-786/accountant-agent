@@ -31,12 +31,15 @@ the server-side token boundary. The backend must generate a
 one-time state and PKCE verifier, send the user to Xero authorization, exchange
 the returned code at `https://identity.xero.com/connect/token`, and persist the
 rotating refresh token through the secret manager. After authorization, call
-`GET https://api.xero.com/connections` to select the Demo Company `tenantId`.
-Use that tenant ID with the `xero-tenant-id` header for Accounting API calls.
-The exact granular scope profile is maintained in `docs/live_integrations.md`;
-onboarding must record and compare the granted scope set rather than accepting
-extra permissions. The adapter uses direct HTTPS API calls; an SDK is not
-required.
+`GET https://api.xero.com/connections` to enumerate the granted tenants. The
+callback registers a connection for every granted tenant (multi-tenant);
+`ACCOUNTINGOS_XERO_TENANT_ALLOWLIST`, when set, restricts registration to named
+tenant ids so an isolated demo can be pinned to the Xero Demo Company. Use each
+tenant ID with the `xero-tenant-id` header for that organization's Accounting
+API calls. The exact granular scope profile is maintained in
+`docs/live_integrations.md`; onboarding must record and compare the granted
+scope set rather than accepting extra permissions. The adapter uses direct
+HTTPS API calls; an SDK is not required.
 
 The FastAPI callback boundary is exposed at:
 
@@ -45,10 +48,13 @@ GET /api/v1/organizations/{organization_id}/connections/xero/authorize
 GET /api/v1/connections/xero/callback
 ```
 
-The callback session store is process-local for development. Before a
-multi-process deployment, move OAuth transaction state to the private Supabase
-workflow store. `XeroBaselineHttpClient` performs the read-only Demo Company
-and account-code (`200`, `610`) checks used to create the baseline observation.
+The callback session store is durable when `SUPABASE_DB_URL` is configured:
+OAuth transaction state (PKCE verifier + state) is written to the private
+`workflow.oauth_sessions` table, so a restart or a second worker does not
+invalidate an in-flight authorization. It falls back to a process-local store
+only when no database is configured (the pure-domain demo).
+`XeroBaselineHttpClient` performs the read-only Demo Company and account-code
+(`200`, `610`) checks used to create the baseline observation.
 
 ## Runtime adapters
 

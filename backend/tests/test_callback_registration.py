@@ -36,10 +36,15 @@ class FakeFormTransport:
 
 
 class FakeTenantTransport:
+    """Returns two granted tenants so multi-tenant registration is exercised."""
+
     def get(self, url, headers):
         return TenantResponse(
             200,
-            [{"id": "conn-1", "tenantId": "demo-tenant-123", "tenantType": "ORGANISATION", "tenantName": "Demo"}],
+            [
+                {"id": "conn-1", "tenantId": "tenant-aaa", "tenantType": "ORGANISATION", "tenantName": "Alpha"},
+                {"id": "conn-2", "tenantId": "tenant-bbb", "tenantType": "ORGANISATION", "tenantName": "Beta"},
+            ],
         )
 
 
@@ -66,11 +71,11 @@ class CallbackRegistrationTests(unittest.TestCase):
         xero_oauth_sessions._sessions.clear()
         connections._connections.clear()
 
-    def _set_demo_tenant(self, value):
+    def _set_allowlist(self, value):
         original = self._original_getenv
 
         def fake_getenv(key, default=None):
-            if key == "ACCOUNTINGOS_XERO_DEMO_TENANT_ID":
+            if key == "ACCOUNTINGOS_XERO_TENANT_ALLOWLIST":
                 return value
             return original(key, default)
 
@@ -84,21 +89,35 @@ class CallbackRegistrationTests(unittest.TestCase):
             params={"state": authorize["state"], "code": "one-time-code"},
         )
 
-    def test_registers_connection_when_demo_tenant_matches(self):
-        self._set_demo_tenant("demo-tenant-123")
+    def test_registers_every_granted_tenant_by_default(self):
+        # No allowlist configured: both granted tenants are registered.
+        callback = self._run_flow()
+        self.assertEqual(callback.status_code, 200)
+        registered = connections.for_organization("demo-org")
+        self.assertEqual({c.provider_tenant_or_account_id for c in registered}, {"tenant-aaa", "tenant-bbb"})
+        self.assertTrue(all(c.provider == "xero" for c in registered))
+
+    def test_allowlist_filters_registration_to_named_tenants(self):
+        self._set_allowlist("tenant-bbb")
         callback = self._run_flow()
         self.assertEqual(callback.status_code, 200)
         registered = connections.for_organization("demo-org")
         self.assertEqual(len(registered), 1)
-        self.assertEqual(registered[0].provider, "xero")
-        self.assertEqual(registered[0].provider_tenant_or_account_id, "demo-tenant-123")
+        self.assertEqual(registered[0].provider_tenant_or_account_id, "tenant-bbb")
 
-    def test_no_registration_when_tenant_unconfigured(self):
-        self._set_demo_tenant("replace-with-designated-demo-tenant-id")
+    def test_placeholder_allowlist_is_ignored(self):
+        # A leftover ``replace-`` placeholder must not silently block everything.
+        self._set_allowlist("replace-with-tenant-id")
         callback = self._run_flow()
         self.assertEqual(callback.status_code, 200)
-        # Callback still succeeds; registration is simply skipped.
-        self.assertEqual(connections.for_organization("demo-org"), ())
+        registered = connections.for_organization("demo-org")
+        self.assertEqual(len(registered), 2)
+
+    def test_allowlist_accepts_comma_and_whitespace_separators(self):
+        self._set_allowlist("tenant-aaa, tenant-bbb")
+        callback = self._run_flow()
+        self.assertEqual(callback.status_code, 200)
+        self.assertEqual(len(connections.for_organization("demo-org")), 2)
 
 
 if __name__ == "__main__":

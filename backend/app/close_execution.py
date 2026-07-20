@@ -157,9 +157,10 @@ def _ledger_transactions(facts: Sequence[SnapshotFact]) -> tuple[LedgerTransacti
             continue
         payload = fact.payload
         record_type = (_text(payload, "Type", "type", "record_type") or "").lower()
-        account_code = _text(payload, "AccountCode", "account_code")
+        account_code = _xero_account_code(payload)
         explicit_amount = any(name in payload for name in ("amount", "Amount", "Total", "TotalAmount"))
-        if explicit_amount and (account_code or "bank" in record_type or "payment" in record_type):
+        is_cash_record = any(name in payload for name in ("BankTransactionID", "PaymentID", "JournalID", "ManualJournalID"))
+        if explicit_amount and (account_code or is_cash_record or "bank" in record_type or "payment" in record_type):
             transaction_id = _text(payload, "BankTransactionID", "PaymentID", "JournalID", "id", "transaction_id") or fact.provider_record_id
             result.append(
                 LedgerTransaction(
@@ -173,6 +174,19 @@ def _ledger_transactions(facts: Sequence[SnapshotFact]) -> tuple[LedgerTransacti
                 )
             )
     return tuple(result)
+
+
+def _xero_account_code(payload: Mapping[str, object]) -> str | None:
+    direct = _text(payload, "AccountCode", "account_code")
+    if direct:
+        return direct
+    for key in ("BankAccount", "bank_account", "Account", "account"):
+        nested = payload.get(key)
+        if isinstance(nested, Mapping):
+            code = _text(nested, "Code", "AccountCode", "code", "account_code")
+            if code:
+                return code
+    return None
 
 
 def _entries(facts: Sequence[SnapshotFact]) -> tuple[AccountingEntry, ...]:

@@ -79,6 +79,25 @@ class EvidenceTests(unittest.TestCase):
                 GmailEvidenceClient([]),
             ).collect(scope())
 
+    def test_out_of_period_or_unlabeled_results_are_filtered_not_fatal(self):
+        in_period = datetime(2026, 7, 10, tzinfo=timezone.utc)
+        previous_period = datetime(2026, 6, 30, tzinfo=timezone.utc)
+        batch = EvidenceCollector(
+            DriveClient(
+                [
+                    DriveSearchResult("old-doc", "folder-close", "old.pdf", "application/pdf", previous_period, "hash-old"),
+                    DriveSearchResult("current-doc", "folder-close", "current.pdf", "application/pdf", in_period, "hash-current"),
+                ]
+            ),
+            GmailEvidenceClient(
+                [
+                    GmailSearchResult("unlabeled", "thread-1", "close@example.test", frozenset({"OTHER"}), in_period, "sender@example.test", "Other", "hash-other"),
+                    GmailSearchResult("current-mail", "thread-2", "close@example.test", frozenset({"LABEL_CLOSE"}), in_period, "sender@example.test", "Close", "hash-mail"),
+                ]
+            ),
+        ).collect(scope())
+        self.assertEqual({item.source_id for item in batch.items}, {"current-doc", "current-mail"})
+
 
 class GmailClient:
     def __init__(self, *, send_error=False, search_result=None):

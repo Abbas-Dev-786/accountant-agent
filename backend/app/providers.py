@@ -22,7 +22,10 @@ class ProviderReadError(PolicyError):
 
 
 def _record_id(record: Mapping[str, object]) -> str:
-    for key in ("id", "transaction_id", "journal_id", "invoice_id", "account_id"):
+    for key in (
+        "id", "transaction_id", "journal_id", "invoice_id", "account_id",
+        "BankTransactionID", "PaymentID", "ManualJournalID", "JournalID", "InvoiceID",
+    ):
         value = record.get(key)
         if value is not None and str(value):
             return str(value)

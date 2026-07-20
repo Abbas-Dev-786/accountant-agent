@@ -123,7 +123,10 @@ class EvidenceCollector:
                 raise EvidencePolicyError("Drive search returned an out-of-scope folder")
             observed = _iso(result.modified_at)
             if not scope.start_date <= observed.date() <= scope.end_date:
-                raise EvidencePolicyError("Drive search returned an out-of-range document")
+                # Configured evidence folders commonly contain prior-period
+                # support. It is not a provider-scope violation; it simply is
+                # not evidence for this close period.
+                continue
             if not result.resource_id or not result.content_hash:
                 raise EvidencePolicyError("Drive evidence requires an id and content hash")
             items.append(
@@ -143,10 +146,12 @@ class EvidenceCollector:
             if result.mailbox != scope.gmail_mailbox:
                 raise EvidencePolicyError("Gmail search returned an out-of-scope mailbox")
             if not result.labels.intersection(scope.gmail_labels):
-                raise EvidencePolicyError("Gmail search returned an out-of-scope label")
+                # Retain the fail-closed mailbox boundary while filtering a
+                # benign result from a broad/inconsistent provider search.
+                continue
             observed = _iso(result.internal_at)
             if not scope.start_date <= observed.date() <= scope.end_date:
-                raise EvidencePolicyError("Gmail search returned an out-of-range message")
+                continue
             if not result.message_id or not result.content_hash:
                 raise EvidencePolicyError("Gmail evidence requires an id and content hash")
             items.append(

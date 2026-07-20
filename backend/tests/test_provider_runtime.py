@@ -66,9 +66,18 @@ class RuntimeProviderTests(unittest.TestCase):
         self.assertEqual(transport.calls[0][2]["Authorization"], "Bearer oauth-access-token")
 
     def test_production_clients_use_production_endpoints_and_tags(self):
-        xero_transport = FakeTransport([JsonResponse(200, {"Invoices": []}, {})])
+        xero_transport = FakeTransport(
+            [
+                JsonResponse(200, {"BankTransactions": [{"BankTransactionID": "bank-1", "Total": "12.50"}]}, {}),
+                JsonResponse(200, {"Payments": [{"PaymentID": "payment-1", "Amount": "4.50"}]}, {}),
+                JsonResponse(200, {"ManualJournals": []}, {}),
+            ]
+        )
         xero = XeroProductionHttpClient("tenant-1", "secret://xero/access", resolver(), xero_transport)
-        self.assertEqual(xero.get_page(1).provider_environment, "production")
+        xero_page = xero.get_page(1)
+        self.assertEqual(xero_page.provider_environment, "production")
+        self.assertEqual({item["record_type"] for item in xero_page.records}, {"bank_transaction", "payment"})
+        self.assertTrue(all("Invoices" not in call[1] for call in xero_transport.calls))
         plaid_transport = FakeTransport(
             [JsonResponse(200, {"added": [], "modified": [], "removed": [], "next_cursor": "cursor-1", "has_more": False}, {})]
         )
@@ -136,23 +145,39 @@ class RuntimeProviderTests(unittest.TestCase):
             [
                 JsonResponse(
                     200,
-                    {"files": [{"id": "doc-1", "name": "close.pdf", "mimeType": "application/pdf", "modifiedTime": "2026-07-10T00:00:00Z", "parents": ["folder-1"], "md5Checksum": "hash-1"}]},
+                    {
+                        "files": [{"id": "doc-1", "name": "close.pdf", "mimeType": "application/pdf", "modifiedTime": "2026-07-10T00:00:00Z", "parents": ["folder-1"], "md5Checksum": "hash-1"}],
+                        "nextPageToken": "drive-page-2",
+                    },
+                    {},
+                ),
+                JsonResponse(
+                    200,
+                    {"files": [{"id": "doc-2", "name": "support.xlsx", "mimeType": "application/vnd.ms-excel", "modifiedTime": "2026-07-11T00:00:00Z", "parents": ["folder-1"], "md5Checksum": "hash-2"}]},
                     {},
                 )
             ]
         )
         drive = GoogleDriveHttpClient("secret://google/access", resolver(), drive_transport)
-        self.assertEqual(drive.search_evidence(scope)[0].resource_id, "doc-1")
+        self.assertEqual([item.resource_id for item in drive.search_evidence(scope)], ["doc-1", "doc-2"])
+        self.assertIn("pageToken=drive-page-2", drive_transport.calls[1][1])
         gmail_transport = FakeTransport(
             [
-                JsonResponse(200, {"messages": [{"id": "msg-1"}]}, {}),
-                JsonResponse(200, {"id": "msg-1", "threadId": "thread-1", "internalDate": "1783641600000", "labelIds": ["LABEL_CLOSE"], "payload": {"headers": [{"name": "From", "value": "sender@example.test"}, {"name": "Subject", "value": "Support"}]}}, {}),
+                JsonResponse(200, {"labels": [{"id": "Label_5", "name": "LABEL_CLOSE"}]}, {}),
+                JsonResponse(200, {"messages": [{"id": "msg-1"}], "nextPageToken": "gmail-page-2"}, {}),
+                JsonResponse(200, {"messages": [{"id": "msg-2"}]}, {}),
+                JsonResponse(200, {"id": "msg-1", "threadId": "thread-1", "internalDate": "1783641600000", "labelIds": ["Label_5"], "payload": {"headers": [{"name": "From", "value": "sender@example.test"}, {"name": "Subject", "value": "Support"}]}}, {}),
+                JsonResponse(200, {"id": "msg-2", "threadId": "thread-2", "internalDate": "1783728000000", "labelIds": ["Label_5"], "payload": {"headers": [{"name": "From", "value": "sender@example.test"}, {"name": "Subject", "value": "Support 2"}]}}, {}),
             ]
         )
         gmail = GmailHttpClient("secret://google/access", resolver(), gmail_transport)
         result = gmail.search_evidence(scope)
-        self.assertEqual(result[0].message_id, "msg-1")
+        self.assertEqual([item.message_id for item in result], ["msg-1", "msg-2"])
         self.assertEqual(result[0].subject, "Support")
+        self.assertEqual(result[0].labels, frozenset({"LABEL_CLOSE"}))
+        self.assertIn("labelIds=Label_5", gmail_transport.calls[1][1])
+        self.assertIn("before%3A2026-08-01", gmail_transport.calls[1][1])
+        self.assertIn("pageToken=gmail-page-2", gmail_transport.calls[2][1])
 
     def test_secret_references_cannot_be_plaintext(self):
         with self.assertRaises(RuntimeConfigError):

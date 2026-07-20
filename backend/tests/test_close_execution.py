@@ -20,7 +20,7 @@ class CloseExecutionTests(unittest.TestCase):
     def test_reconciles_frozen_normalized_records_with_stable_ids(self):
         facts = (
             SnapshotFact("plaid:t-1:v1", "plaid", "t-1", {"transaction_id": "t-1", "account_id": "account-1", "amount": "12.50", "date": "2026-07-02", "iso_currency_code": "USD", "name": "Vendor"}, "2026-07-02", "USD"),
-            SnapshotFact("xero:x-1:v1", "xero", "x-1", {"BankTransactionID": "x-1", "Amount": "12.50", "Date": "2026-07-02", "CurrencyCode": "USD", "AccountCode": "1000", "Type": "BANK"}, "2026-07-02", "USD"),
+            SnapshotFact("xero:x-1:v1", "xero", "x-1", {"BankTransactionID": "x-1", "Amount": "12.50", "Date": "2026-07-02", "CurrencyCode": "USD", "BankAccount": {"Code": "1000"}, "Type": "RECEIVE", "record_type": "bank_transaction"}, "2026-07-02", "USD"),
         )
         first = derive_close_execution(facts, configuration())
         second = derive_close_execution(facts, configuration())

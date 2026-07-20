@@ -20,6 +20,7 @@ def production_env():
         "ACCOUNTINGOS_XERO_CLIENT_ID": "xero-client",
         "ACCOUNTINGOS_XERO_CLIENT_SECRET_REF": "secret://xero/production/client-secret",
         "ACCOUNTINGOS_XERO_REDIRECT_URI": "https://api.example.test/api/v1/connections/xero/callback",
+        "ACCOUNTINGOS_XERO_TENANT_ALLOWLIST": "tenant-approved",
         "ACCOUNTINGOS_XERO_SCOPES": "offline_access accounting.settings.read accounting.invoices.read accounting.banktransactions.read accounting.manualjournals",
         "PLAID_CLIENT_ID": "plaid-client",
         "PLAID_SECRET_REF": "secret://plaid/production/client-secret",

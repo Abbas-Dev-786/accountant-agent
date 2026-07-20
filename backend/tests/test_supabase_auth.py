@@ -37,6 +37,15 @@ class SupabaseAuthTests(unittest.TestCase):
         self.assertEqual(transport.calls[0][0], "https://demo.supabase.co/auth/v1/user")
         self.assertEqual(transport.calls[0][1]["Authorization"], "Bearer access-token")
 
+    def test_reuses_a_short_lived_positive_auth_validation(self):
+        transport = FakeTransport(AuthResponse(200, {"id": "user-1", "email": "controller@example.test"}))
+        verifier = SupabaseAuthVerifier(
+            SupabaseAuthConfig("https://demo.supabase.co", "sb_publishable_key", cache_seconds=15), transport
+        )
+        verifier.authenticate("access-token")
+        verifier.authenticate("access-token")
+        self.assertEqual(len(transport.calls), 1)
+
     def test_rejects_an_invalid_token(self):
         verifier = SupabaseAuthVerifier(
             SupabaseAuthConfig("https://demo.supabase.co", "sb_publishable_key"),

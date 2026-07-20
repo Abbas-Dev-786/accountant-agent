@@ -42,6 +42,10 @@ class InMemorySecretStore:
             raise SecretStoreError("refusing to store an empty secret")
         self._values[secret_ref] = value
 
+    def delete(self, secret_ref: str) -> None:
+        _validate_reference(secret_ref)
+        self._values.pop(secret_ref, None)
+
 
 class SupabaseVaultSecretStore:
     """Store encrypted secrets in Supabase Vault using their opaque reference.
@@ -115,6 +119,21 @@ class SupabaseVaultSecretStore:
             raise
         except Exception as exc:
             raise SecretStoreError("Supabase Vault secret could not be stored") from exc
+        finally:
+            self._close_connection(connection)
+
+    def delete(self, secret_ref: str) -> None:
+        """Remove a Vault credential once no healthy connection references it."""
+        _validate_reference(secret_ref)
+        connection = self._open_connection()
+        try:
+            with transaction(connection) as cursor:
+                cursor.execute("select id from vault.secrets where name = %s for update", (secret_ref,))
+                secret_id = self._first_value(cursor.fetchone())
+                if secret_id is not None:
+                    cursor.execute("select vault.delete_secret(%s::uuid)", (str(secret_id),))
+        except Exception as exc:
+            raise SecretStoreError("Supabase Vault secret could not be removed") from exc
         finally:
             self._close_connection(connection)
 

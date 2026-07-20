@@ -127,13 +127,10 @@ class CallbackRegistrationTests(unittest.TestCase):
             params={"state": authorize["state"], "code": "one-time-code"},
         )
 
-    def test_registers_every_granted_tenant_by_default(self):
-        # No allowlist configured: both granted tenants are registered.
+    def test_production_requires_an_explicit_tenant_allowlist(self):
         callback = self._run_flow()
-        self.assertEqual(callback.status_code, 200)
-        registered = connections.for_organization("demo-org")
-        self.assertEqual({c.provider_tenant_or_account_id for c in registered}, {"tenant-aaa", "tenant-bbb"})
-        self.assertTrue(all(c.provider == "xero" for c in registered))
+        self.assertEqual(callback.status_code, 502)
+        self.assertEqual(connections.for_organization("demo-org"), ())
 
     def test_allowlist_filters_registration_to_named_tenants(self):
         self._set_allowlist("tenant-bbb")
@@ -143,13 +140,11 @@ class CallbackRegistrationTests(unittest.TestCase):
         self.assertEqual(len(registered), 1)
         self.assertEqual(registered[0].provider_tenant_or_account_id, "tenant-bbb")
 
-    def test_placeholder_allowlist_is_ignored(self):
-        # A leftover ``replace-`` placeholder must not silently block everything.
+    def test_placeholder_allowlist_fails_closed(self):
         self._set_allowlist("replace-with-tenant-id")
         callback = self._run_flow()
-        self.assertEqual(callback.status_code, 200)
-        registered = connections.for_organization("demo-org")
-        self.assertEqual(len(registered), 2)
+        self.assertEqual(callback.status_code, 502)
+        self.assertEqual(connections.for_organization("demo-org"), ())
 
     def test_allowlist_accepts_comma_and_whitespace_separators(self):
         self._set_allowlist("tenant-aaa, tenant-bbb")

@@ -13,7 +13,7 @@ from decimal import Decimal
 from typing import Annotated, Protocol
 from urllib.parse import urlencode, urlparse
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -28,6 +28,8 @@ from .connections import ConnectionHealth, ConnectionRegistry, ConnectionStatus
 from .domain import CloseService, DeploymentConfig, JournalLine, JournalProposal, PolicyError
 from .google_oauth import GoogleOAuthClient, GoogleOAuthConfig, GoogleOAuthError
 from .plaid_link import PlaidLinkClient, PlaidLinkConfig, PlaidLinkError
+from .plaid_webhooks import PlaidWebhookError, PlaidWebhookVerifier
+from .provider_runtime import UrllibJsonTransport
 from .secrets_store import SecretStoreError, secret_store_from_environment
 from .security import create_oauth_transaction, validate_oauth_callback
 from .supabase_auth import (
@@ -45,6 +47,7 @@ from .supabase_db import (
     SupabaseWorkflowStore,
     oauth_session_store_from_environment,
 )
+from .reports import build_journal_proposal
 from .xero_oauth import (
     InMemoryOAuthSessionStore,
     OAuthSessionStore,
@@ -83,10 +86,16 @@ class WorkflowStore(Protocol):
     def get_close_run(self, run_id: str) -> PersistedCloseRun | None:
         ...
 
+    def close_runs_for_organization(self, organization_id: str, **kwargs):
+        ...
+
     def connections_for_organization(self, organization_id: str):
         ...
 
     def upsert_connection(self, **kwargs):
+        ...
+
+    def disconnect_connection(self, **kwargs) -> str | None:
         ...
 
     def tasks_for_run(self, run_id: str):
@@ -120,6 +129,9 @@ class WorkflowStore(Protocol):
         ...
 
     def queue_exception_recovery_email(self, **kwargs):
+        ...
+
+    def record_webhook_receipt(self, **kwargs) -> bool:
         ...
 
 
@@ -260,12 +272,23 @@ def _web_app_url() -> str | None:
     return raw
 
 
+def _oauth_callback_error(provider: str, status_code: int, organization_id: str | None = None):
+    """Return users to the controller UI without exposing a raw API error page."""
+    web_app_url = _web_app_url()
+    if web_app_url:
+        query = {provider: "error"}
+        if organization_id:
+            query["organization_id"] = organization_id
+        return RedirectResponse(f"{web_app_url}/?{urlencode(query)}", status_code=303)
+    return JSONResponse(status_code=status_code, content={"detail": f"{provider} authorization could not be completed"})
+
+
 app = FastAPI(title="AccountingOS API", version="0.2.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins(),
     allow_credentials=False,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["Authorization", "Content-Type", "Idempotency-Key"],
 )
 
@@ -409,7 +432,7 @@ def require_organization_role(
     return role
 
 
-def serialize_persisted_run(run: PersistedCloseRun) -> dict[str, object]:
+def serialize_persisted_run(run: PersistedCloseRun, *, actions: list[dict[str, object]] | None = None) -> dict[str, object]:
     return {
         "id": run.run_id,
         "organization_id": run.organization_id,
@@ -418,7 +441,7 @@ def serialize_persisted_run(run: PersistedCloseRun) -> dict[str, object]:
         "deployment": {"mode": run.deployment_mode, "data_class": run.data_class},
         "snapshot_id": run.snapshot_id,
         "package_hash": run.package_hash,
-        "actions": [],
+        "actions": actions or [],
     }
 
 
@@ -557,7 +580,25 @@ def get_close_run(run_id: str, user: CurrentUser) -> dict[str, object]:
     if run is None:
         raise HTTPException(status_code=404, detail="close run not found")
     require_organization_role(run.organization_id, user)
-    return serialize_persisted_run(run)
+    review_data = getattr(require_store(), "review_data_for_run", None)
+    actions = []
+    if callable(review_data):
+        review = review_data(run_id)
+        actions = [dict(item) for item in review.actions]
+    return serialize_persisted_run(run, actions=actions)
+
+
+@app.get("/api/v1/organizations/{organization_id}/close-runs")
+def get_organization_close_runs(
+    organization_id: str,
+    user: CurrentUser,
+    limit: int = 50,
+) -> list[dict[str, object]]:
+    require_organization_role(organization_id, user)
+    return [
+        serialize_persisted_run(run)
+        for run in require_store().close_runs_for_organization(organization_id, limit=limit)
+    ]
 
 
 @app.get("/api/v1/close-runs/{run_id}/tasks")
@@ -597,18 +638,20 @@ async def stream_close_run_events(
     The browser sends its bearer token using fetch rather than an EventSource
     query string, so the session is never placed in a URL or event log.
     """
-    run = require_store().get_close_run(run_id)
+    store = require_store()
+    run = await asyncio.to_thread(store.get_close_run, run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="close run not found")
     require_organization_role(run.organization_id, user)
     if after < 0:
         raise HTTPException(status_code=422, detail="event cursor must be non-negative")
 
+    terminal_states = frozenset({"blocked", "failed", "cancelled", "awaiting_approval", "approved", "action_failed"})
     async def event_stream():
         cursor = after
         idle_cycles = 0
         while True:
-            batch = require_store().events_for_run(run_id, after_event_id=cursor, limit=100)
+            batch = await asyncio.to_thread(store.events_for_run, run_id, after_event_id=cursor, limit=100)
             if batch:
                 idle_cycles = 0
                 for event in batch:
@@ -617,9 +660,12 @@ async def stream_close_run_events(
                     yield f"id: {event.event_id}\nevent: close_progress\ndata: {json.dumps(payload, default=str)}\n\n"
             else:
                 idle_cycles += 1
-                if idle_cycles % 15 == 0:
+                current_run = await asyncio.to_thread(store.get_close_run, run_id)
+                if current_run is None or current_run.state in terminal_states:
+                    return
+                if idle_cycles % 8 == 0:
                     yield ": keepalive\n\n"
-                await asyncio.sleep(1)
+                await asyncio.sleep(min(10, 0.5 * (1.5 ** min(idle_cycles, 7))))
 
     return StreamingResponse(
         event_stream(), media_type="text/event-stream",
@@ -708,6 +754,76 @@ def get_connections(organization_id: str, user: CurrentUser) -> list[dict[str, o
     return [serialize_connection(connection) for connection in require_store().connections_for_organization(organization_id)]
 
 
+@app.delete("/api/v1/organizations/{organization_id}/connections/{provider}/{provider_target}")
+def disconnect_provider_connection(
+    organization_id: str,
+    provider: str,
+    provider_target: str,
+    user: CurrentUser,
+) -> dict[str, str]:
+    require_organization_role(organization_id, user, frozenset({"controller", "operator"}))
+    credential_ref = require_store().disconnect_connection(
+        organization_id=organization_id,
+        provider=provider,
+        provider_target=provider_target,
+    )
+    if credential_ref:
+        try:
+            secret_store_from_environment().delete(credential_ref)
+        except SecretStoreError:
+            # The database state already prevents further provider use. Retain
+            # no false-success claim about Vault cleanup, but do not revive the
+            # connection because cleanup can be retried safely by operators.
+            logger.warning("Disconnected %s connection for %s; Vault credential cleanup is pending", provider, organization_id)
+            return {"status": "disconnected", "credential_cleanup": "pending"}
+    return {"status": "disconnected", "credential_cleanup": "complete"}
+
+
+@app.post("/api/v1/webhooks/plaid", status_code=202)
+async def receive_plaid_webhook(
+    request: Request,
+    plaid_verification: Annotated[str | None, Header(alias="Plaid-Verification")] = None,
+) -> dict[str, bool]:
+    """Verify and durably deduplicate the configured Plaid webhook receiver."""
+    signature = (plaid_verification or "").strip()
+    if not signature:
+        raise HTTPException(status_code=400, detail="Plaid-Verification is required")
+    payload = await request.body()
+    try:
+        decoded = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Plaid webhook payload is invalid") from exc
+    if not isinstance(decoded, dict):
+        raise HTTPException(status_code=400, detail="Plaid webhook payload is invalid")
+    event_id = decoded.get("request_id")
+    if not isinstance(event_id, str) or not event_id:
+        raise HTTPException(status_code=400, detail="Plaid webhook request_id is required")
+    try:
+        config = PlaidLinkConfig.from_environment()
+        secrets = secret_store_from_environment()
+        await asyncio.to_thread(
+            PlaidWebhookVerifier(
+                client_id=config.client_id,
+                client_secret_ref=config.client_secret_ref,
+                secret_resolver=secrets,
+                transport=UrllibJsonTransport(),
+            ).verify,
+            signature,
+            payload,
+        )
+        accepted = require_store().record_webhook_receipt(
+            provider="plaid",
+            provider_event_id=event_id,
+            signature_verified=True,
+            payload_hash=sha256(payload).hexdigest(),
+            payload=decoded,
+        )
+    except (PlaidLinkError, PlaidWebhookError, SecretStoreError, PolicyError) as exc:
+        logger.warning("Rejected Plaid webhook: %s", exc)
+        raise HTTPException(status_code=401, detail="Plaid webhook verification failed") from exc
+    return {"accepted": accepted}
+
+
 @app.get("/api/v1/organizations/{organization_id}/close-mapping")
 def get_close_mapping(organization_id: str, user: CurrentUser) -> dict[str, object] | None:
     require_organization_role(organization_id, user)
@@ -770,7 +886,13 @@ def exchange_plaid_public_token(
                 ),
                 credential_secret_ref=access_ref,
             )
-            registered.append(require_store().upsert_connection(connection_health=health, credential_secret_ref=access_ref))
+            registered.append(
+                require_store().upsert_connection(
+                    connection_health=health,
+                    credential_secret_ref=access_ref,
+                    metadata={"plaid_item_id": linked.item_id},
+                )
+            )
     except (PlaidLinkError, SecretStoreError, PolicyError) as exc:
         logger.warning("Plaid Link exchange failed for organization %s: %s", organization_id, exc)
         raise HTTPException(status_code=502, detail="Plaid account connection could not be completed") from exc
@@ -816,38 +938,43 @@ def xero_callback(
     error: str | None = None,
 ) -> dict[str, object]:
     if xero_oauth_client is None:
-        raise HTTPException(status_code=503, detail="Xero OAuth is not configured")
+        return _oauth_callback_error("xero", 503)
     if not state:
-        raise HTTPException(status_code=400, detail="Xero OAuth state is required")
+        return _oauth_callback_error("xero", 400)
     session = xero_oauth_sessions.consume(state)
     if session is None:
-        raise HTTPException(status_code=400, detail="Xero OAuth state is invalid or already used")
+        return _oauth_callback_error("xero", 400)
     transaction, organization_id = session
     if error:
-        raise HTTPException(status_code=400, detail="Xero authorization was declined")
+        return _oauth_callback_error("xero", 400, organization_id)
     if not code:
-        raise HTTPException(status_code=400, detail="Xero OAuth authorization code is required")
+        return _oauth_callback_error("xero", 400, organization_id)
     try:
         validate_oauth_callback(transaction, state, xero_oauth_client.config.redirect_uri)
-        refresh_ref = _connection_secret_ref("xero", organization_id, "oauth", "refresh-token")
+        # The state is a single-use opaque nonce.  Binding the Vault reference
+        # to it prevents a later authorization from replacing credentials that
+        # existing tenant connections still use.
+        refresh_ref = _connection_secret_ref("xero", organization_id, state, "refresh-token")
         token = xero_oauth_client.exchange_code(
             code,
             transaction.code_verifier,
             refresh_token_secret_ref=refresh_ref,
         )
     except XeroOAuthError as exc:
-        raise HTTPException(status_code=502, detail="Xero OAuth token exchange failed") from exc
+        logger.warning("Xero OAuth token exchange failed for organization %s: %s", organization_id, exc)
+        return _oauth_callback_error("xero", 502, organization_id)
     except PolicyError as exc:
-        raise HTTPException(status_code=400, detail="Xero OAuth callback validation failed") from exc
+        logger.warning("Xero OAuth callback validation failed for organization %s: %s", organization_id, exc)
+        return _oauth_callback_error("xero", 400, organization_id)
     if token.scope is not None and frozenset(token.scope.split()) != frozenset(xero_oauth_client.config.scopes):
-        raise HTTPException(status_code=502, detail="Xero granted scopes do not match the approved scope profile")
+        return _oauth_callback_error("xero", 502, organization_id)
     try:
         registered_tenants = _register_xero_connection(organization_id, refresh_ref)
     except (XeroOAuthError, PolicyError) as exc:
         logger.warning("Xero tenant registration failed after OAuth: %s", exc)
-        raise HTTPException(status_code=502, detail="Xero authorization could not be linked to an approved tenant") from exc
+        return _oauth_callback_error("xero", 502, organization_id)
     if registered_tenants == 0:
-        raise HTTPException(status_code=502, detail="Xero did not grant an approved tenant")
+        return _oauth_callback_error("xero", 502, organization_id)
     payload = {
         "status": "authorized",
         "organization_id": organization_id,
@@ -869,19 +996,19 @@ def google_callback(
     error: str | None = None,
 ) -> dict[str, object]:
     if google_oauth_client is None:
-        raise HTTPException(status_code=503, detail="Google OAuth is not configured")
+        return _oauth_callback_error("google", 503)
     if not state:
-        raise HTTPException(status_code=400, detail="Google OAuth state is required")
+        return _oauth_callback_error("google", 400)
     session = xero_oauth_sessions.consume(state)
     if session is None:
-        raise HTTPException(status_code=400, detail="Google OAuth state is invalid or already used")
+        return _oauth_callback_error("google", 400)
     transaction, organization_id = session
     if transaction.provider != "drive":
-        raise HTTPException(status_code=400, detail="Google OAuth state is invalid")
+        return _oauth_callback_error("google", 400, organization_id)
     if error:
-        raise HTTPException(status_code=400, detail="Google authorization was declined")
+        return _oauth_callback_error("google", 400, organization_id)
     if not code:
-        raise HTTPException(status_code=400, detail="Google OAuth authorization code is required")
+        return _oauth_callback_error("google", 400, organization_id)
     try:
         validate_oauth_callback(transaction, state, google_oauth_client.config.redirect_uri)
         token = google_oauth_client.exchange_code(code, transaction)
@@ -916,7 +1043,7 @@ def google_callback(
             require_store().upsert_connection(connection_health=health, credential_secret_ref=refresh_ref)
     except (GoogleOAuthError, SecretStoreError, PolicyError) as exc:
         logger.warning("Google OAuth callback failed for organization %s: %s", organization_id, exc)
-        raise HTTPException(status_code=502, detail="Google authorization could not be connected") from exc
+        return _oauth_callback_error("google", 502, organization_id)
     payload = {"status": "authorized", "organization_id": organization_id}
     web_app_url = _web_app_url()
     if web_app_url:
@@ -941,6 +1068,10 @@ def _register_xero_connection(organization_id: str, refresh_token_secret_ref: st
         raise XeroOAuthError("Xero connection registration requires a tenant refresh-token reference")
     allowlist = _xero_tenant_allowlist()
     provider_environment = "demo" if service.deployment.mode == "demo" else "production"
+    if provider_environment == "production" and not allowlist:
+        raise XeroOAuthError(
+            "ACCOUNTINGOS_XERO_TENANT_ALLOWLIST must name an approved tenant before production authorization"
+        )
     tenants = xero_oauth_client.list_tenants()
     now = datetime.now(timezone.utc)
     registered = 0
@@ -981,15 +1112,24 @@ def prepare_review(run_id: str, proposals: list[ProposalRequest], user: CurrentU
     if run is None:
         raise HTTPException(status_code=404, detail="close run not found")
     require_organization_role(run.organization_id, user, frozenset({"controller", "operator"}))
+    review = require_store().review_data_for_run(run_id)
+    if review.mapping is None:
+        raise HTTPException(status_code=409, detail="the close run has no frozen approved mapping")
+    permitted_codes = frozenset(
+        str(item) for item in review.mapping.configuration.get("permitted_journal_account_codes", [])
+    )
+    if not permitted_codes:
+        raise HTTPException(status_code=409, detail="the close mapping has no permitted journal account codes")
     domain_proposals = tuple(
-        JournalProposal(
+        build_journal_proposal(
             item.proposal_id,
             item.journal_date,
             item.narration,
-            tuple(
+            (
                 JournalLine(line.account_code, line.debit, line.credit, tuple(line.evidence_ids))
                 for line in item.lines
             ),
+            permitted_codes,
         )
         for item in proposals
     )

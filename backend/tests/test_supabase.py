@@ -60,6 +60,13 @@ class SupabaseConfigTests(unittest.TestCase):
             SupabaseDatabaseConfig(
                 "postgresql://postgres:replace-with-password@db.example/postgres?sslmode=require"
             )
+        with self.assertRaises(SupabaseConfigError):
+            SupabaseDatabaseConfig.from_environment(
+                {
+                    "SUPABASE_DB_URL": "postgresql://postgres:secret@db.example/postgres?sslmode=require",
+                    "SUPABASE_DB_POOL_MAX": "many",
+                }
+            )
 
     def test_public_service_role_key_is_rejected(self):
         with self.assertRaises(SupabaseConfigError):
@@ -208,7 +215,7 @@ class SupabaseRepositoryTests(unittest.TestCase):
     def test_retry_only_requeues_tasks_whose_dependencies_succeeded(self):
         connection = FakeConnection(
             [
-                ("org-1",),
+                ("org-1", "blocked"),
                 ("run-1", "org-1", "2026-07-01", "2026-07-31", "synchronizing", "demo", "synthetic", None, None),
             ]
         )
@@ -218,6 +225,24 @@ class SupabaseRepositoryTests(unittest.TestCase):
         retry_query = connection.cursor_instance.executed[1][0].lower()
         self.assertIn("workflow.task_dependencies", retry_query)
         self.assertIn("prerequisite.state <> 'succeeded'", retry_query)
+        self.assertIn("organization_id, state", connection.cursor_instance.executed[0][0].lower())
+
+    def test_retry_refuses_approved_or_cancelled_runs(self):
+        connection = FakeConnection([("org-1", "approved")])
+        config = SupabaseDatabaseConfig("postgresql://postgres:secret@db.example/postgres?sslmode=require")
+        with patch("app.supabase_db.connect", return_value=connection):
+            with self.assertRaisesRegex(SupabaseConfigError, "only blocked or failed"):
+                SupabaseWorkflowStore(config).retry_run("run-1")
+        self.assertEqual(len(connection.cursor_instance.executed), 1)
+
+    def test_durable_claim_reclaims_an_expired_running_lease(self):
+        config = SupabaseDatabaseConfig("postgresql://postgres:secret@db.example/postgres?sslmode=require")
+        connection = FakeConnection([None])
+        with patch("app.supabase_db.connect", return_value=connection):
+            self.assertIsNone(SupabaseWorkflowStore(config).claim_next_task("worker-1"))
+        query = connection.cursor_instance.executed[0][0].lower()
+        self.assertIn("t.state = 'running' and t.lease_expires_at < now()", query)
+        self.assertIn("for update skip locked", query)
 
     def test_evidence_identity_cannot_be_reused_by_another_run(self):
         connection = FakeConnection([("org-1",), ("org-2", "run-2")])

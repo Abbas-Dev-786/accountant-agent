@@ -138,6 +138,12 @@ def _validate_application_configs(env: Mapping[str, str]) -> None:
         errors.append("GROQ_API_KEY_REF must be a Supabase Vault reference")
     if any(key.startswith("NEXT_PUBLIC_") and "GROQ" in key for key in env):
         errors.append("Groq credentials cannot be public client variables")
+    tenant_allowlist = [
+        value for value in env.get("ACCOUNTINGOS_XERO_TENANT_ALLOWLIST", "").replace(",", " ").split()
+        if value and not _is_placeholder(value)
+    ]
+    if not tenant_allowlist:
+        errors.append("ACCOUNTINGOS_XERO_TENANT_ALLOWLIST must name at least one approved Xero tenant")
     if errors:
         raise ValueError("; ".join(errors))
 

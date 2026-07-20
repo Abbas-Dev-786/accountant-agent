@@ -8,6 +8,8 @@ idempotency rules close to the database while the domain objects remain pure.
 from __future__ import annotations
 
 import os
+import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -32,6 +34,8 @@ class SupabaseConfigError(PolicyError):
 class SupabaseDatabaseConfig:
     database_url: str
     connect_timeout_seconds: int = 10
+    pool_max_size: int = 10
+    pool_wait_seconds: int = 15
 
     def __post_init__(self) -> None:
         parsed = urlparse(self.database_url)
@@ -41,6 +45,8 @@ class SupabaseDatabaseConfig:
             raise SupabaseConfigError("SUPABASE_DB_URL must not use a placeholder value")
         if self.connect_timeout_seconds < 1:
             raise SupabaseConfigError("Supabase connection timeout must be positive")
+        if not 1 <= self.pool_max_size <= 100 or self.pool_wait_seconds < 1:
+            raise SupabaseConfigError("Supabase connection-pool configuration is invalid")
         query = parse_qs(parsed.query)
         sslmode = query.get("sslmode", [""])[0]
         if sslmode not in {"require", "verify-ca", "verify-full"}:
@@ -54,7 +60,15 @@ class SupabaseDatabaseConfig:
             raise SupabaseConfigError("SUPABASE_DB_URL is required by the backend")
         if any(key.startswith("NEXT_PUBLIC_") for key in values if "SERVICE_ROLE" in key):
             raise SupabaseConfigError("Supabase service-role credentials cannot be public")
-        return cls(database_url, int(values.get("SUPABASE_DB_CONNECT_TIMEOUT", "10")))
+        try:
+            return cls(
+                database_url,
+                int(values.get("SUPABASE_DB_CONNECT_TIMEOUT", "10")),
+                int(values.get("SUPABASE_DB_POOL_MAX", "10")),
+                int(values.get("SUPABASE_DB_POOL_WAIT_SECONDS", "15")),
+            )
+        except ValueError as exc:
+            raise SupabaseConfigError("Supabase connection configuration must use integer timeouts and pool sizes") from exc
 
 
 @dataclass(frozen=True)
@@ -174,13 +188,97 @@ class Connection(Protocol):
         ...
 
 
-def connect(config: SupabaseDatabaseConfig):
-    """Open a TLS Postgres connection; import psycopg only when used."""
+def _open_connection(config: SupabaseDatabaseConfig):
+    """Open one TLS Postgres connection; only the pool calls this function."""
     try:
         import psycopg
     except ImportError as exc:  # pragma: no cover - exercised in deployment
         raise SupabaseConfigError("install psycopg[binary] to connect to Supabase") from exc
     return psycopg.connect(config.database_url, connect_timeout=config.connect_timeout_seconds)
+
+
+class _PooledConnection:
+    """A short-lived borrow that returns the physical connection to its pool."""
+
+    def __init__(self, pool: "_ConnectionPool", connection: object) -> None:
+        self._pool = pool
+        self._connection = connection
+        self._released = False
+
+    def cursor(self):
+        return self._connection.cursor()
+
+    def commit(self) -> None:
+        self._connection.commit()
+
+    def rollback(self) -> None:
+        self._connection.rollback()
+
+    def close(self) -> None:
+        if not self._released:
+            self._released = True
+            self._pool.release(self._connection)
+
+    def __getattr__(self, name: str):
+        return getattr(self._connection, name)
+
+
+class _ConnectionPool:
+    def __init__(self, config: SupabaseDatabaseConfig) -> None:
+        self.config = config
+        self._idle: list[object] = []
+        self._created = 0
+        self._condition = threading.Condition()
+
+    @staticmethod
+    def _is_usable(connection: object) -> bool:
+        return not bool(getattr(connection, "closed", False))
+
+    def acquire(self) -> _PooledConnection:
+        deadline = time.monotonic() + self.config.pool_wait_seconds
+        with self._condition:
+            while True:
+                while self._idle:
+                    connection = self._idle.pop()
+                    if self._is_usable(connection):
+                        return _PooledConnection(self, connection)
+                    self._created -= 1
+                if self._created < self.config.pool_max_size:
+                    self._created += 1
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise SupabaseConfigError("Supabase connection pool is exhausted")
+                self._condition.wait(remaining)
+        try:
+            return _PooledConnection(self, _open_connection(self.config))
+        except Exception:
+            with self._condition:
+                self._created -= 1
+                self._condition.notify()
+            raise
+
+    def release(self, connection: object) -> None:
+        with self._condition:
+            if self._is_usable(connection):
+                self._idle.append(connection)
+            else:
+                self._created -= 1
+            self._condition.notify()
+
+
+_connection_pools: dict[SupabaseDatabaseConfig, _ConnectionPool] = {}
+_connection_pools_lock = threading.Lock()
+
+
+def connect(config: SupabaseDatabaseConfig):
+    """Borrow a TLS connection from the process-local bounded pool."""
+    with _connection_pools_lock:
+        pool = _connection_pools.get(config)
+        if pool is None:
+            pool = _ConnectionPool(config)
+            _connection_pools[config] = pool
+    return pool.acquire()
 
 
 @contextmanager
@@ -348,7 +446,7 @@ class SupabaseRepository:
 class SupabaseWorkflowStore:
     """Durable API-facing workflow store for private Supabase schemas.
 
-    Every public method opens a short-lived server-side TLS connection. Browser
+    Every public method borrows a bounded server-side TLS connection. Browser
     clients never receive these credentials and organization authorization is
     checked against ``workflow.organization_users`` before any read/write.
     """
@@ -1052,6 +1150,30 @@ class SupabaseWorkflowStore:
         finally:
             self._close(connection)
 
+    def plaid_item_id_for_accounts(self, organization_id: str, account_ids: Sequence[str]) -> str | None:
+        if not account_ids:
+            return None
+        connection = connect(self.config)
+        try:
+            with transaction(connection) as cursor:
+                cursor.execute(
+                    """
+                    select provider_tenant_or_account_id, metadata_json ->> 'plaid_item_id'
+                    from workflow.connections
+                    where organization_id = %s and provider = 'plaid'
+                      and provider_environment = 'production' and status = 'healthy'
+                      and provider_tenant_or_account_id = any(%s)
+                    """,
+                    (organization_id, list(account_ids)),
+                )
+                rows = cursor.fetchall()
+            found = {str(row[0]): str(row[1]) for row in rows if row[1] is not None and str(row[1])}
+            if set(found) != set(account_ids) or len(set(found.values())) != 1:
+                return None
+            return next(iter(found.values()))
+        finally:
+            self._close(connection)
+
     def tasks_for_run(self, run_id: str) -> tuple[PersistedTask, ...]:
         connection = connect(self.config)
         try:
@@ -1104,6 +1226,74 @@ class SupabaseWorkflowStore:
         finally:
             self._close(connection)
 
+    def close_runs_for_organization(
+        self,
+        organization_id: str,
+        *,
+        limit: int = 50,
+    ) -> tuple[PersistedCloseRun, ...]:
+        if not 1 <= limit <= 200:
+            raise SupabaseConfigError("close-run list limit is invalid")
+        connection = connect(self.config)
+        try:
+            with transaction(connection) as cursor:
+                cursor.execute(
+                    """
+                    select id::text, organization_id, period_start::text, period_end::text,
+                           state, deployment_mode, data_class, snapshot_id::text, package_hash
+                    from workflow.close_runs
+                    where organization_id = %s
+                    order by updated_at desc, id desc
+                    limit %s
+                    """,
+                    (organization_id, limit),
+                )
+                rows = cursor.fetchall()
+            return tuple(self._run_from_row(row) for row in rows)
+        finally:
+            self._close(connection)
+
+    def record_webhook_receipt(
+        self,
+        *,
+        provider: str,
+        provider_event_id: str,
+        signature_verified: bool,
+        payload_hash: str,
+        payload: Mapping[str, object],
+    ) -> bool:
+        if provider != "plaid" or not provider_event_id or not payload_hash:
+            raise SupabaseConfigError("webhook receipt identity is invalid")
+        connection = connect(self.config)
+        try:
+            with transaction(connection) as cursor:
+                cursor.execute(
+                    """
+                    insert into audit.webhook_receipts
+                        (provider, provider_event_id, signature_verified, payload_hash, payload_json)
+                    values (%s, %s, %s, %s, %s::jsonb)
+                    on conflict (provider, provider_event_id) do nothing
+                    returning payload_hash
+                    """,
+                    (provider, provider_event_id, signature_verified, payload_hash, dumps(payload)),
+                )
+                inserted = cursor.fetchone()
+                if inserted is not None:
+                    return True
+                cursor.execute(
+                    """
+                    select payload_hash from audit.webhook_receipts
+                    where provider = %s and provider_event_id = %s
+                    """,
+                    (provider, provider_event_id),
+                )
+                existing = cursor.fetchone()
+                if existing is None or str(existing[0]) != payload_hash:
+                    raise SupabaseConfigError("webhook event id was reused with a different payload")
+                return False
+        finally:
+            self._close(connection)
+
     def claim_next_task(self, worker_id: str, *, lease_seconds: int = 60) -> PersistedTask | None:
         if not worker_id or not 1 <= lease_seconds <= 900:
             raise SupabaseConfigError("worker id and lease duration are invalid")
@@ -1117,8 +1307,11 @@ class SupabaseWorkflowStore:
                            r.organization_id
                     from workflow.tasks t
                     join workflow.close_runs r on r.id = t.run_id
-                    where t.state = 'ready'
-                      and (t.lease_expires_at is null or t.lease_expires_at < now())
+                    where (
+                        (t.state = 'ready' and (t.lease_expires_at is null or t.lease_expires_at < now()))
+                        or (t.state = 'running' and t.lease_expires_at < now())
+                    )
+                      and r.state <> 'cancelled'
                     order by t.created_at, t.id
                     for update skip locked
                     limit 1
@@ -1165,12 +1358,14 @@ class SupabaseWorkflowStore:
         try:
             with transaction(connection) as cursor:
                 cursor.execute(
-                    "select organization_id from workflow.close_runs where id = %s::uuid for update",
+                    "select organization_id, state from workflow.close_runs where id = %s::uuid for update",
                     (run_id,),
                 )
                 row = cursor.fetchone()
                 if row is None:
                     raise SupabaseConfigError("close run does not exist")
+                if str(row[1]) not in {"blocked", "failed"}:
+                    raise SupabaseConfigError("only blocked or failed close runs may be retried")
                 cursor.execute(
                     """
                     update workflow.tasks candidate
@@ -1436,18 +1631,19 @@ class SupabaseWorkflowStore:
                 cursor.execute(
                     """
                     select a.id::text, r.organization_id, rp.package_hash, p.id, p.proposal_hash, p.journal_date::text,
-                           p.narration,
+                           p.narration, m.configuration_json,
                            coalesce(json_agg(json_build_object(
                                'account_code', l.account_code, 'debit', l.debit,
                                'credit', l.credit, 'evidence_ids', l.evidence_ids
                            ) order by l.line_number) filter (where l.proposal_id is not null), '[]'::json)
                     from workflow.close_runs r
+                    join workflow.close_mappings m on m.id = r.mapping_id
                     join workflow.review_packages rp on rp.run_id = r.id
                     join workflow.approvals a on a.run_id = r.id and a.package_hash = rp.package_hash
                     join workflow.journal_proposals p on p.review_package_id = rp.id and p.status = 'approved'
                     left join workflow.journal_proposal_lines l on l.proposal_id = p.id
                     where r.id = %s::uuid and a.decision = 'approved'
-                    group by a.id, r.organization_id, rp.package_hash, p.id, p.proposal_hash, p.journal_date, p.narration
+                    group by a.id, r.organization_id, rp.package_hash, p.id, p.proposal_hash, p.journal_date, p.narration, m.configuration_json
                     order by p.created_at, p.id
                     """,
                     (run_id,),
@@ -1456,7 +1652,7 @@ class SupabaseWorkflowStore:
             return tuple({
                 "approval_id": str(row[0]), "organization_id": str(row[1]), "package_hash": str(row[2]),
                 "proposal_id": str(row[3]), "proposal_hash": str(row[4]), "journal_date": str(row[5]), "narration": str(row[6]),
-                "lines": list(row[7] or []),
+                "configuration": dict(row[7]) if isinstance(row[7], Mapping) else {}, "lines": list(row[8] or []),
             } for row in rows)
         finally:
             self._close(connection)
@@ -1674,7 +1870,7 @@ class SupabaseWorkflowStore:
             with transaction(connection) as cursor:
                 cursor.execute(
                     """
-                    select a.id::text, a.marker, a.request_hash, e.id, e.control_code, e.remediation,
+                    select a.id::text, a.run_id::text, a.marker, a.request_hash, e.id, e.control_code, e.remediation,
                            request.recipient, m.configuration_json
                     from workflow.action_executions a
                     join workflow.close_runs r on r.id = a.run_id
@@ -1689,10 +1885,42 @@ class SupabaseWorkflowStore:
                 )
                 rows = cursor.fetchall()
             return tuple({
-                "action_id": str(row[0]), "marker": str(row[1]), "request_hash": str(row[2]),
-                "exception_id": str(row[3]), "control_code": str(row[4]), "remediation": str(row[5]),
-                "recipient": str(row[6]), "configuration": row[7] if isinstance(row[7], Mapping) else {},
+                "action_id": str(row[0]), "run_id": str(row[1]), "marker": str(row[2]), "request_hash": str(row[3]),
+                "exception_id": str(row[4]), "control_code": str(row[5]), "remediation": str(row[6]),
+                "recipient": str(row[7]), "configuration": row[8] if isinstance(row[8], Mapping) else {},
             } for row in rows)
+        finally:
+            self._close(connection)
+
+    def recovery_email_counts(
+        self,
+        *,
+        run_id: str,
+        recipient: str,
+        excluding_action_id: str,
+    ) -> tuple[int, int]:
+        """Return prior recovery-email actions for the run and recipient.
+
+        The action being evaluated is excluded so a retry/recovery of the same
+        idempotent request remains possible while a second request is blocked.
+        """
+        connection = connect(self.config)
+        try:
+            with transaction(connection) as cursor:
+                cursor.execute(
+                    """
+                    select count(*) filter (where a.id <> %s::uuid),
+                           count(*) filter (where a.id <> %s::uuid and lower(request.recipient) = lower(%s))
+                    from workflow.action_executions a
+                    join workflow.recovery_email_requests request on request.action_id = a.id
+                    where a.run_id = %s::uuid
+                      and a.provider = 'gmail' and a.operation = 'send_approved_request'
+                      and a.status <> 'failed'
+                    """,
+                    (excluding_action_id, excluding_action_id, recipient, run_id),
+                )
+                row = cursor.fetchone()
+            return (int(row[0]), int(row[1])) if row is not None else (0, 0)
         finally:
             self._close(connection)
 
@@ -2009,6 +2237,51 @@ class SupabaseWorkflowStore:
         finally:
             self._close(connection)
 
+    def disconnect_connection(
+        self,
+        *,
+        organization_id: str,
+        provider: str,
+        provider_target: str,
+    ) -> str | None:
+        if provider not in {"xero", "plaid", "drive", "gmail"}:
+            raise SupabaseConfigError("provider is invalid")
+        connection = connect(self.config)
+        try:
+            with transaction(connection) as cursor:
+                cursor.execute(
+                    """
+                    select credential_secret_ref
+                    from workflow.connections
+                    where organization_id = %s and provider = %s and provider_tenant_or_account_id = %s
+                    for update
+                    """,
+                    (organization_id, provider, provider_target),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    raise SupabaseConfigError("provider connection does not exist")
+                credential_ref = str(row[0])
+                cursor.execute(
+                    """
+                    update workflow.connections
+                    set status = 'disconnected', metadata_json = metadata_json || '{"remediation":"Disconnected by controller"}'::jsonb
+                    where organization_id = %s and provider = %s and provider_tenant_or_account_id = %s
+                    """,
+                    (organization_id, provider, provider_target),
+                )
+                cursor.execute(
+                    """
+                    select count(*) from workflow.connections
+                    where credential_secret_ref = %s and status = 'healthy'
+                    """,
+                    (credential_ref,),
+                )
+                still_used = int(cursor.fetchone()[0]) > 0
+            return None if still_used else credential_ref
+        finally:
+            self._close(connection)
+
     @staticmethod
     def _ensure_default_tasks(cursor: Cursor, run_id: str, organization_id: str) -> None:
         task_ids: dict[str, str] = {}
@@ -2218,6 +2491,7 @@ class SupabaseWorkflowStore:
         *,
         connection_health: ConnectionHealth,
         credential_secret_ref: str,
+        metadata: Mapping[str, object] | None = None,
     ) -> PersistedConnection:
         """Persist a verified provider connection without storing token material.
 
@@ -2266,11 +2540,10 @@ class SupabaseWorkflowStore:
                         connection_health.last_verified_at,
                         connection_health.last_success_at,
                         connection_health.consent_expires_at,
-                        dumps(
-                            {"remediation": connection_health.remediation}
-                            if connection_health.remediation
-                            else {}
-                        ),
+                        dumps({
+                            **dict(metadata or {}),
+                            **({"remediation": connection_health.remediation} if connection_health.remediation else {}),
+                        }),
                     ),
                 )
                 row = cursor.fetchone()

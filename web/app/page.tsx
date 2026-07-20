@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import type { Session } from "@supabase/supabase-js";
 
 import { supabaseBrowserClient, supabaseBrowserIsConfigured } from "../lib/supabase";
@@ -196,6 +196,7 @@ export default function Home() {
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
   const [organizationId, setOrganizationId] = useState("");
   const [connections, setConnections] = useState<Connection[]>([]);
+  const [runs, setRuns] = useState<CloseRun[]>([]);
   const [run, setRun] = useState<CloseRun | null>(null);
   const [tasks, setTasks] = useState<CloseTask[]>([]);
   const [events, setEvents] = useState<CloseEvent[]>([]);
@@ -211,6 +212,7 @@ export default function Home() {
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const eventCursorRef = useRef(0);
 
   const selectedOrganization = useMemo(
     () => workspace?.organizations.find((organization) => organization.id === organizationId) || null,
@@ -269,7 +271,11 @@ export default function Home() {
       nextWorkspace.organizations[0]?.id ||
       "";
     setOrganizationId(nextOrganizationId);
-    await Promise.all([loadConnections(nextSession.access_token, nextOrganizationId), loadMapping(nextSession.access_token, nextOrganizationId)]);
+    await Promise.all([
+      loadConnections(nextSession.access_token, nextOrganizationId),
+      loadMapping(nextSession.access_token, nextOrganizationId),
+      loadRuns(nextSession.access_token, nextOrganizationId),
+    ]);
   }
 
   async function loadRunDetails(token: string, runId: string) {
@@ -280,9 +286,29 @@ export default function Home() {
       api<ReviewData>(`/api/v1/close-runs/${encodeURIComponent(runId)}/review`, token),
     ]);
     setRun(nextRun);
+    setRuns((current) => [nextRun, ...current.filter((item) => item.id !== nextRun.id)]);
     setTasks(nextTasks);
     setEvents(nextEvents);
+    eventCursorRef.current = nextEvents.length ? nextEvents[nextEvents.length - 1].id : 0;
     setReview(nextReview);
+  }
+
+  async function loadRuns(token: string, nextOrganizationId: string, preferredRunId?: string) {
+    if (!nextOrganizationId) {
+      setRuns([]); setRun(null); setTasks([]); setEvents([]); setReview(null);
+      eventCursorRef.current = 0;
+      return;
+    }
+    const nextRuns = await api<CloseRun[]>(
+      `/api/v1/organizations/${encodeURIComponent(nextOrganizationId)}/close-runs`, token,
+    );
+    setRuns(nextRuns);
+    const target = nextRuns.find((item) => item.id === preferredRunId) || nextRuns[0];
+    if (target) await loadRunDetails(token, target.id);
+    else {
+      setRun(null); setTasks([]); setEvents([]); setReview(null);
+      eventCursorRef.current = 0;
+    }
   }
 
   useEffect(() => {
@@ -305,6 +331,7 @@ export default function Home() {
       if (!nextSession) {
         setWorkspace(null);
         setConnections([]);
+        setRuns([]);
         setRun(null);
         setTasks([]);
         setEvents([]);
@@ -327,9 +354,11 @@ export default function Home() {
 
   useEffect(() => {
     if (!session || !organizationId) return;
-    setRun(null);
-    setReview(null);
-    void Promise.all([loadConnections(session.access_token, organizationId), loadMapping(session.access_token, organizationId)]).catch((loadError: unknown) => {
+    void Promise.all([
+      loadConnections(session.access_token, organizationId),
+      loadMapping(session.access_token, organizationId),
+      loadRuns(session.access_token, organizationId),
+    ]).catch((loadError: unknown) => {
       setError(loadError instanceof Error ? loadError.message : "Could not load connections");
     });
   }, [organizationId, session]);
@@ -340,39 +369,52 @@ export default function Home() {
     const accessToken = session.access_token;
     const controller = new AbortController();
     let active = true;
+    let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+    let reconnectAttempt = 0;
+    const refreshDetails = () => {
+      if (refreshTimer) return;
+      refreshTimer = setTimeout(() => {
+        refreshTimer = undefined;
+        void loadRunDetails(accessToken, runId).catch(() => undefined);
+      }, 300);
+    };
     async function followProgress() {
-      try {
-        const after = events.length ? events[events.length - 1].id : 0;
-        const response = await fetch(`${apiBaseUrl}/api/v1/close-runs/${encodeURIComponent(runId)}/events/stream?after=${after}`, {
-          headers: { Authorization: `Bearer ${accessToken}` }, signal: controller.signal, cache: "no-store",
-        });
-        if (!response.ok || !response.body) throw new Error(`Live progress unavailable (${response.status})`);
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = "";
-        while (active) {
-          const chunk = await reader.read();
-          if (chunk.done) break;
-          buffer += decoder.decode(chunk.value, { stream: true });
-          const frames = buffer.split("\n\n");
-          buffer = frames.pop() || "";
-          for (const frame of frames) {
-            const data = frame.split("\n").find((line) => line.startsWith("data: "))?.slice(6);
-            if (!data) continue;
-            const event = JSON.parse(data) as CloseEvent;
-            setEvents((current) => current.some((item) => item.id === event.id) ? current : [...current, event]);
-            void loadRunDetails(accessToken, runId).catch(() => undefined);
+      while (active) {
+        try {
+          const response = await fetch(`${apiBaseUrl}/api/v1/close-runs/${encodeURIComponent(runId)}/events/stream?after=${eventCursorRef.current}`, {
+            headers: { Authorization: `Bearer ${accessToken}` }, signal: controller.signal, cache: "no-store",
+          });
+          if (!response.ok || !response.body) throw new Error(`Live progress unavailable (${response.status})`);
+          reconnectAttempt = 0;
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = "";
+          while (active) {
+            const chunk = await reader.read();
+            if (chunk.done) return;
+            buffer += decoder.decode(chunk.value, { stream: true });
+            const frames = buffer.split("\n\n");
+            buffer = frames.pop() || "";
+            for (const frame of frames) {
+              const data = frame.split("\n").find((line) => line.startsWith("data: "))?.slice(6);
+              if (!data) continue;
+              const event = JSON.parse(data) as CloseEvent;
+              eventCursorRef.current = Math.max(eventCursorRef.current, event.id);
+              setEvents((current) => current.some((item) => item.id === event.id) ? current : [...current, event]);
+              refreshDetails();
+            }
           }
-        }
-      } catch (streamError) {
-        if (active && !(streamError instanceof DOMException && streamError.name === "AbortError")) {
+        } catch (streamError) {
+          if (!active || (streamError instanceof DOMException && streamError.name === "AbortError")) return;
+          reconnectAttempt += 1;
           setError(streamError instanceof Error ? streamError.message : "Live progress stream disconnected");
+          await new Promise((resolve) => setTimeout(resolve, Math.min(10_000, 500 * (2 ** Math.min(reconnectAttempt, 5)))));
         }
       }
     }
     void followProgress();
-    return () => { active = false; controller.abort(); };
-    // Events are replayed with their durable cursor; reconnect only when the run changes.
+    return () => { active = false; controller.abort(); if (refreshTimer) clearTimeout(refreshTimer); };
+    // The durable cursor is retained in a ref; reconnect only when the selected run changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [run?.id, session?.access_token]);
 
@@ -429,6 +471,7 @@ export default function Home() {
         }),
       });
       await loadRunDetails(session.access_token, nextRun.id);
+      await loadRuns(session.access_token, selectedOrganization.id, nextRun.id);
       setMessage("Close run created. It will wait safely until verified provider data is available.");
     } catch (runError) {
       setError(runError instanceof Error ? runError.message : "Could not create close run");
@@ -711,6 +754,11 @@ export default function Home() {
           <label>Period start<input type="date" value={period.start} onChange={(event) => setPeriod({ ...period, start: event.target.value })} /></label>
           <label>Period end<input type="date" value={period.end} onChange={(event) => setPeriod({ ...period, end: event.target.value })} /></label>
           <button onClick={createRun} disabled={busy || !mapping || period.end < period.start}>{busy ? "Working…" : "Prepare close package"}</button>
+          {runs.length > 0 && <label>Existing close
+            <select value={run?.id || ""} onChange={(event) => { if (event.target.value && session) void loadRunDetails(session.access_token, event.target.value); }}>
+              {runs.map((item) => <option key={item.id} value={item.id}>{item.period.start} to {item.period.end} · {readableStatus(item.status)}</option>)}
+            </select>
+          </label>}
         </div>}
       </header>
 

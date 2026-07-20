@@ -1,5 +1,6 @@
 import unittest
 from urllib.parse import parse_qs, urlsplit
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -64,7 +65,12 @@ class FakeWorkflowStore:
 
 
 class XeroOAuthApiTests(unittest.TestCase):
+    def setUp(self):
+        self.allowlist = patch.dict("os.environ", {"ACCOUNTINGOS_XERO_TENANT_ALLOWLIST": "tenant-1"})
+        self.allowlist.start()
+
     def tearDown(self):
+        self.allowlist.stop()
         configure_xero_oauth(None)
         configure_auth_verifier(None)
         configure_workflow_store(None)

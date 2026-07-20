@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, replace
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from hashlib import sha256
 from typing import Mapping, Protocol
@@ -19,6 +19,7 @@ from .actions import XeroDraftRequest
 from .ai import ExplanationContext, GroundedExplanationService, GroundedFact
 from .b2 import B2Config, B2Error, B2ObjectLockClient
 from .close_mapping import PersistedCloseMapping
+from .connections import ConnectionHealth, ConnectionStatus
 from .close_execution import CloseExecutionError, derive_close_execution
 from .domain import CloseRun, CloseService, DeploymentConfig, RunState
 from .evidence import EmailPolicy, EmailRequest, EmailTemplate, EvidenceCollector, EvidencePolicyError, EvidenceScope
@@ -372,8 +373,13 @@ class ProductionSourceSyncExecutor:
                 if None in plaid_access_refs or len(plaid_access_refs) != 1:
                     raise TaskBlocked("selected Plaid accounts must belong to one healthy production Item")
                 plaid_access_ref = next(iter(plaid_access_refs))
+                item_lookup = getattr(self.store, "plaid_item_id_for_accounts", None)
+                plaid_item_id = item_lookup(run.organization_id, tuple(selected_accounts)) if callable(item_lookup) else None
+                if not plaid_item_id:
+                    raise TaskBlocked("selected Plaid accounts are missing their production Item identity")
             else:
                 plaid_access_ref = self.env.get("PLAID_ACCESS_TOKEN_REF", "").strip()
+                plaid_item_id = self.env.get("PLAID_ITEM_ID", "").strip()
             domain_run = CloseRun(
                 task.run_id,
                 run.organization_id,
@@ -402,7 +408,7 @@ class ProductionSourceSyncExecutor:
                 snapshot=snapshot,
                 provider_identities={
                     "xero": expected_tenant,
-                    "plaid": sorted(selected_accounts)[0] if mapping is not None else self.env.get("PLAID_ITEM_ID", "").strip(),
+                    "plaid": plaid_item_id,
                 },
             )
         except TaskBlocked:
@@ -530,18 +536,19 @@ class DurableReconciliationExecutor:
             configuration = _mapping_configuration(mapping)
             execution = derive_close_execution(self.store.snapshot_facts_for_run(task.run_id), configuration)
             self.store.persist_close_execution(run_id=task.run_id, execution=execution)
-            self._explain_open_exceptions(task.run_id, configuration)
+            self._explain_open_exceptions(run, configuration)
             # The generated proposals are deterministic facts tied to the same
             # frozen snapshot. create_review_package is idempotent only when
             # its package hash is identical, which protects retry safety.
             self.store.create_review_package(run_id=task.run_id, proposals=execution.proposals)
-            self._archive_close_package(task.run_id)
+            self._archive_close_package(task.run_id, run.organization_id)
         except TaskBlocked:
             raise
         except (CloseExecutionError, ValueError) as exc:
             raise TaskBlocked("persisted source records cannot be safely reconciled; inspect the source contract") from exc
 
-    def _explain_open_exceptions(self, run_id: str, configuration: Mapping[str, object]) -> None:
+    def _explain_open_exceptions(self, run, configuration: Mapping[str, object]) -> None:
+        run_id = run.run_id
         exceptions = self.store.unexplained_exceptions_for_run(run_id)
         if not exceptions:
             return
@@ -583,6 +590,12 @@ class DurableReconciliationExecutor:
                     input_hash=audit.input_hash, output_hash=audit.output_hash, validation_status=audit.validation,
                     latency_ms=audit.latency_ms, input_tokens=audit.token_count, output_tokens=audit.token_count,
                 )
+                self._mark_server_connection(
+                    organization_id=run.organization_id,
+                    provider="groq",
+                    provider_target="grounded-explanations",
+                    credential_ref=self.env.get("GROQ_API_KEY_REF", ""),
+                )
             except Exception as exc:
                 audit = service.audit_records[-1] if service.audit_records else None
                 self.store.record_exception_explanation(
@@ -595,16 +608,49 @@ class DurableReconciliationExecutor:
                 )
                 raise TaskBlocked("grounded Groq explanation could not be verified; inspect the exception and worker logs") from exc
 
-    def _archive_close_package(self, run_id: str) -> None:
+    def _archive_close_package(self, run_id: str, organization_id: str) -> None:
         try:
-            client = B2ObjectLockClient(B2Config.from_environment(self.env), env=self.env)
+            config = B2Config.from_environment(self.env)
+            client = B2ObjectLockClient(config, env=self.env)
             artifact = client.upload_close_package(run_id=run_id, package=self.store.close_artifact_payload(run_id))
             self.store.record_close_artifact(
                 run_id=run_id, object_key=artifact.object_key, content_hash=artifact.content_hash,
                 retain_until=artifact.retain_until, provider_file_id=artifact.file_id,
             )
+            self._mark_server_connection(
+                organization_id=organization_id,
+                provider="b2",
+                provider_target="compliance-close-archive",
+                credential_ref=config.key_id_ref,
+            )
         except B2Error as exc:
             raise TaskBlocked("B2 immutable close-package storage is not configured or did not confirm Object Lock") from exc
+
+    def _mark_server_connection(
+        self,
+        *,
+        organization_id: str,
+        provider: str,
+        provider_target: str,
+        credential_ref: str,
+    ) -> None:
+        upsert = getattr(self.store, "upsert_connection", None)
+        if not callable(upsert) or not credential_ref.startswith("secret://"):
+            return
+        now = datetime.now(timezone.utc)
+        upsert(
+            connection_health=ConnectionHealth(
+                connection_id=f"{provider}:{organization_id}:{provider_target}",
+                organization_id=organization_id,
+                provider=provider,
+                provider_environment="production",
+                provider_tenant_or_account_id=provider_target,
+                status=ConnectionStatus.HEALTHY,
+                last_verified_at=now,
+                last_success_at=now,
+            ),
+            credential_secret_ref=credential_ref,
+        )
 
 
 class XeroDraftActionExecutor:
@@ -620,11 +666,14 @@ class XeroDraftActionExecutor:
         run = self.store.get_close_run(task.run_id)
         if run is None:
             raise TaskBlocked("approved close run is unavailable")
-        mapping = self.store.active_close_mapping(run.organization_id)
-        if mapping is None:
-            raise TaskBlocked("approved close mapping is unavailable")
         try:
-            configuration = _mapping_configuration(mapping)
+            proposals = self.store.approved_xero_proposals_for_run(task.run_id)
+            if not proposals:
+                return
+            configuration = proposals[0].get("configuration")
+            if not isinstance(configuration, Mapping):
+                raise TaskBlocked("approved close mapping is unavailable")
+            configuration = _validate_mapping_configuration(configuration)
             tenant_id = str(configuration["xero_tenant_id"])
             secrets = secret_store_from_environment(self.env)
             config = XeroOAuthConfig.from_environment(self.env)
@@ -633,21 +682,34 @@ class XeroDraftActionExecutor:
                 raise TaskBlocked("approved Xero tenant credentials are unavailable")
             oauth = XeroOAuthClient(replace(config, refresh_token_secret_ref=refresh_ref), secrets)
             client = XeroDraftHttpClient(tenant_id, refresh_ref, secrets, UrllibJsonTransport(), oauth)
-            proposals = self.store.approved_xero_proposals_for_run(task.run_id)
             for proposal in proposals:
-                self._execute_proposal(task.run_id, proposal, client)
+                if proposal.get("configuration") != configuration:
+                    raise TaskBlocked("approved journal proposals do not share one frozen close mapping")
+                self._execute_proposal(task.run_id, proposal, client, configuration)
         except TaskBlocked:
             raise
         except (XeroOAuthError, SecretStoreError, ValueError) as exc:
             raise TaskBlocked("Xero DRAFT journal action configuration is invalid") from exc
 
-    def _execute_proposal(self, run_id: str, proposal: Mapping[str, object], client: XeroDraftHttpClient) -> None:
+    def _execute_proposal(
+        self,
+        run_id: str,
+        proposal: Mapping[str, object],
+        client: XeroDraftHttpClient,
+        configuration: Mapping[str, object],
+    ) -> None:
+        raw_lines = proposal.get("lines", [])
+        if not isinstance(raw_lines, list) or any(not isinstance(item, Mapping) for item in raw_lines):
+            raise TaskBlocked("approved journal proposal has invalid lines")
         lines = tuple(
             (str(item["account_code"]), str(item["debit"]), str(item["credit"]), tuple(str(value) for value in item.get("evidence_ids", [])))
-            for item in proposal.get("lines", []) if isinstance(item, Mapping)
+            for item in raw_lines
         )
         if not lines:
             raise TaskBlocked("approved journal proposal has no balanced lines")
+        permitted_codes = frozenset(str(item) for item in configuration.get("permitted_journal_account_codes", []))
+        if not permitted_codes or any(account_code not in permitted_codes for account_code, _, _, _ in lines):
+            raise TaskBlocked("approved journal proposal contains an account code outside the frozen mapping")
         intent_hash = sha256(f"{proposal['proposal_hash']}|{proposal['journal_date']}|{lines}".encode()).hexdigest()
         marker = f"AOSMJv1/{run_id[:8]}/{str(proposal['proposal_hash'])[:16]}/{intent_hash[:12]}"
         narration = f"{marker} | {proposal['narration']}"
@@ -736,7 +798,19 @@ class GmailRecoveryActionExecutor:
             (str(action["exception_id"]),),
         )
         try:
-            EmailPolicy(recipients, frozenset(), frozenset({"exception-recovery-v1"})).authorize(request, run_count=0, recipient_count=0)
+            count_lookup = getattr(self.store, "recovery_email_counts", None)
+            if not callable(count_lookup):
+                raise TaskBlocked("durable recovery-email rate-limit accounting is unavailable")
+            run_count, recipient_count = count_lookup(
+                run_id=str(action["run_id"]),
+                recipient=request.recipient,
+                excluding_action_id=str(action["action_id"]),
+            )
+            EmailPolicy(recipients, frozenset(), frozenset({"exception-recovery-v1"})).authorize(
+                request,
+                run_count=run_count,
+                recipient_count=recipient_count,
+            )
             sent = client.search_sent_by_marker(str(action["marker"]))
             if sent is None:
                 self.store.update_action_execution(action_id=str(action["action_id"]), status="outcome_unknown")
@@ -766,7 +840,10 @@ class GmailRecoveryActionExecutor:
 
 
 def _mapping_configuration(mapping: PersistedCloseMapping) -> Mapping[str, object]:
-    configuration = mapping.configuration
+    return _validate_mapping_configuration(mapping.configuration)
+
+
+def _validate_mapping_configuration(configuration: object) -> Mapping[str, object]:
     if not isinstance(configuration, Mapping):
         raise TaskBlocked("persisted close mapping is invalid")
     tenant_id = configuration.get("xero_tenant_id")

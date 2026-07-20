@@ -84,6 +84,13 @@ cd backend
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
+On Windows PowerShell, use the equivalent virtual-environment path:
+
+```powershell
+cd backend
+.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
 First copy the environment templates and replace the `replace-with...` values:
 
 ```sh
@@ -120,12 +127,24 @@ set -a; source .env; set +a
 .venv/bin/python -m uvicorn app.main:app --reload
 ```
 
+```powershell
+cd backend
+Get-Content .env | ForEach-Object { if ($_ -match '^([^#=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process') } }
+.venv\Scripts\python.exe -m uvicorn app.main:app --reload
+```
+
 Run the durable worker in a second terminal after applying the migrations:
 
 ```sh
 cd backend
 set -a; source .env; set +a
 .venv/bin/python -m app.worker_main
+```
+
+```powershell
+cd backend
+Get-Content .env | ForEach-Object { if ($_ -match '^([^#=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process') } }
+.venv\Scripts\python.exe -m app.worker_main
 ```
 
 Before a production controller connects providers, run the read-only preflight.

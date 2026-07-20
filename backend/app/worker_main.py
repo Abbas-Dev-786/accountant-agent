@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import socket
 import time
@@ -21,6 +22,9 @@ from .durable_worker import (
     XeroDraftActionExecutor,
 )
 from .supabase_db import SupabaseDatabaseConfig, SupabaseWorkflowStore
+
+
+logger = logging.getLogger("accountingos.worker")
 
 
 def deployment_from_environment() -> DeploymentConfig:
@@ -73,7 +77,17 @@ def main() -> int:
         parser.error("--poll-seconds must be positive")
     worker = build_worker(args.worker_id)
     while True:
-        result = worker.process_once()
+        try:
+            result = worker.process_once()
+        except Exception:
+            # A transient database failure must not kill the process and strand
+            # later tasks. Leases are reclaimable, and the next iteration will
+            # retry the claim/finish operation safely.
+            logger.exception("Worker iteration failed; retrying after the poll interval")
+            if args.once:
+                return 1
+            time.sleep(args.poll_seconds)
+            continue
         print(result.status if result.task_key is None else f"{result.status}: {result.task_key}")
         if args.once:
             return 0

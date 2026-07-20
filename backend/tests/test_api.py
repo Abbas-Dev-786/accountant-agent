@@ -1,5 +1,6 @@
 import unittest
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from uuid import uuid4
 from unittest.mock import patch
 
@@ -55,6 +56,9 @@ class FakeWorkflowStore:
     def get_close_run(self, run_id):
         return self.runs.get(run_id)
 
+    def close_runs_for_organization(self, organization_id, *, limit=50):
+        return tuple(run for run in self.runs.values() if run.organization_id == organization_id)[:limit]
+
     def connections_for_organization(self, organization_id):
         return ()
 
@@ -82,6 +86,20 @@ class FakeWorkflowStore:
 
     def cancel_run(self, run_id):
         return self.runs[run_id]
+
+    def review_data_for_run(self, run_id):
+        return SimpleNamespace(
+            mapping=SimpleNamespace(configuration={"permitted_journal_account_codes": ["200"]}),
+            actions=(),
+        )
+
+    def create_review_package(self, **kwargs):
+        self.review_proposals = kwargs["proposals"]
+        return SimpleNamespace(package_hash="package-hash", status="review_frozen")
+
+    def record_webhook_receipt(self, **kwargs):
+        self.webhook_receipts = getattr(self, "webhook_receipts", []) + [kwargs]
+        return len(self.webhook_receipts) == 1
 
 
 class ApiTests(unittest.TestCase):
@@ -125,6 +143,16 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), [])
 
+    def test_close_runs_can_be_listed_after_a_page_reload(self) -> None:
+        created = self.client.post(
+            "/api/v1/close-runs",
+            json={"organization_id": "us-org", "period_start": "2026-07-01", "period_end": "2026-07-31"},
+            headers={**self._headers(), "Idempotency-Key": "listed-july"},
+        ).json()
+        listed = self.client.get("/api/v1/organizations/us-org/close-runs", headers=self._headers())
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual([run["id"] for run in listed.json()], [created["id"]])
+
     def test_workflow_calls_require_a_bearer_token(self) -> None:
         response = self.client.get("/api/v1/me")
         self.assertEqual(response.status_code, 401)
@@ -153,6 +181,46 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(tasks.json()[1]["dependencies"], ["preflight"])
         self.assertEqual(events.status_code, 200)
         self.assertEqual(events.json()[0]["type"], "run_created")
+
+    def test_prepare_review_rejects_unpermitted_journal_account_codes(self) -> None:
+        created = self.client.post(
+            "/api/v1/close-runs",
+            json={"organization_id": "us-org", "period_start": "2026-07-01", "period_end": "2026-07-31"},
+            headers={**self._headers(), "Idempotency-Key": "prepare-review-july"},
+        ).json()
+        response = self.client.post(
+            f"/api/v1/close-runs/{created['id']}/prepare-review",
+            json=[{
+                "proposal_id": "proposal-1", "journal_date": "2026-07-31", "narration": "Unapproved account",
+                "lines": [
+                    {"account_code": "999", "debit": "1", "credit": "0", "evidence_ids": ["evidence-1"]},
+                    {"account_code": "999", "debit": "0", "credit": "1", "evidence_ids": ["evidence-1"]},
+                ],
+            }],
+            headers=self._headers(),
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("invalid account code", response.json()["detail"])
+
+    def test_plaid_webhook_is_verified_and_deduplicated(self) -> None:
+        body = b'{"request_id":"evt-1","webhook_type":"TRANSACTIONS","webhook_code":"SYNC_UPDATES_AVAILABLE"}'
+        with patch("app.main.PlaidLinkConfig.from_environment"), patch(
+            "app.main.secret_store_from_environment"
+        ), patch("app.main.PlaidWebhookVerifier.verify"):
+            first = self.client.post(
+                "/api/v1/webhooks/plaid",
+                content=body,
+                headers={"Plaid-Verification": "verified.jwt.signature"},
+            )
+            duplicate = self.client.post(
+                "/api/v1/webhooks/plaid",
+                content=body,
+                headers={"Plaid-Verification": "verified.jwt.signature"},
+            )
+        self.assertEqual(first.status_code, 202)
+        self.assertEqual(first.json(), {"accepted": True})
+        self.assertEqual(duplicate.status_code, 202)
+        self.assertEqual(duplicate.json(), {"accepted": False})
 
     def test_bootstrap_is_limited_to_the_configured_controller_and_one_us_organization(self) -> None:
         self.store.organizations = ()

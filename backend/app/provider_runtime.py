@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from hashlib import sha256
 from typing import Callable, Mapping, Protocol, Sequence
@@ -145,9 +146,71 @@ class XeroProductionHttpClient(XeroDemoHttpClient):
     anything else before raw records are persisted.
     """
 
+    # Reconciliation needs settled cash activity, not invoices.  Keep these
+    # resource contracts explicit so a new Xero scope cannot accidentally be
+    # requested without its corresponding source read.
+    cash_resource_specs: tuple[tuple[str, str, str], ...] = (
+        ("/api.xro/2.0/BankTransactions", "BankTransactions", "bank_transaction"),
+        ("/api.xro/2.0/Payments", "Payments", "payment"),
+        ("/api.xro/2.0/ManualJournals", "ManualJournals", "manual_journal"),
+    )
+
     def get_page(self, page: int) -> XeroPage:
-        source_page = super().get_page(page)
-        return replace(source_page, provider_environment="production")
+        if page < 1:
+            raise ProviderReadError("Xero page must be positive")
+        token = self.oauth_client.access_token() if self.oauth_client else self.secret_resolver.resolve(self.access_token_secret_ref)
+        records: list[Mapping[str, object]] = []
+        request_ids: list[str] = []
+        has_more = False
+        for resource_path, records_key, record_type in self.cash_resource_specs:
+            url = urljoin(self.base_url.rstrip("/") + "/", resource_path.lstrip("/"))
+            response = self.transport.request(
+                "GET",
+                f"{url}?{urlencode({'page': page})}",
+                {"Authorization": f"Bearer {token}", "Xero-tenant-id": self.tenant_id},
+            )
+            if response.status_code >= 400:
+                raise ProviderReadError(f"Xero production request failed with HTTP {response.status_code}")
+            source_records = _records(response.body, records_key)
+            request_id = _request_id(response.headers)
+            if request_id:
+                request_ids.append(request_id)
+            raw_next = response.body.get("next_page")
+            if raw_next is None:
+                has_more = has_more or len(source_records) >= self.page_size
+            else:
+                try:
+                    next_page = int(raw_next)
+                except (TypeError, ValueError) as exc:
+                    raise ProviderReadError("Xero production next_page is invalid") from exc
+                if next_page != page + 1:
+                    raise ProviderReadError("Xero production pagination skipped or repeated a page")
+                has_more = True
+            for record in source_records:
+                # Endpoint-specific prefixes make a collision between opaque
+                # Xero IDs impossible at the source-snapshot boundary while
+                # preserving the provider's native identifiers for projection.
+                decorated = dict(record)
+                native_id = _xero_record_id(decorated)
+                decorated.setdefault("id", f"{record_type}:{native_id}")
+                decorated.setdefault("record_type", record_type)
+                records.append(decorated)
+        return XeroPage(
+            page,
+            tuple(records),
+            page + 1 if has_more else None,
+            self.tenant_id,
+            "production",
+            ",".join(request_ids),
+        )
+
+
+def _xero_record_id(record: Mapping[str, object]) -> str:
+    for name in ("BankTransactionID", "PaymentID", "ManualJournalID", "JournalID", "InvoiceID", "id"):
+        value = record.get(name)
+        if value is not None and str(value):
+            return str(value)
+    raise ProviderReadError("Xero production record is missing a stable id")
 
 
 @dataclass
@@ -201,7 +264,8 @@ class XeroDraftHttpClient:
     def create_draft_manual_journal(self, request: XeroDraftRequest) -> XeroDraftRecord:
         lines = []
         for account_code, debit, credit, _ in request.lines:
-            lines.append({"AccountCode": account_code, "LineAmount": debit if Decimal(debit) > 0 else f"-{credit}"})
+            amount = Decimal(debit) if Decimal(debit) > 0 else -Decimal(credit)
+            lines.append({"AccountCode": account_code, "LineAmount": float(amount)})
         body = self._request(
             "POST", "/api.xro/2.0/ManualJournals",
             {"ManualJournals": [{"Narration": request.narration, "Date": request.journal_date,
@@ -335,29 +399,48 @@ class GoogleDriveHttpClient(DriveEvidenceClient):
     secret_resolver: SecretResolver
     transport: JsonTransport
     base_url: str = "https://www.googleapis.com/drive/v3/"
+    max_pages: int = 100
 
     def search_evidence(self, scope: EvidenceScope) -> Sequence[DriveSearchResult]:
         token = self.secret_resolver.resolve(self.access_token_secret_ref)
-        folder_query = " or ".join(f"'{folder_id}' in parents" for folder_id in sorted(scope.drive_folder_ids))
+        folder_query = " or ".join(f"'{_drive_folder_id(folder_id)}' in parents" for folder_id in sorted(scope.drive_folder_ids))
         query = f"({folder_query}) and trashed = false"
-        url = urljoin(self.base_url, "files") + "?" + urlencode(
-            {"q": query, "fields": "files(id,name,mimeType,modifiedTime,parents,md5Checksum)"}
-        )
-        response = self.transport.request("GET", url, {"Authorization": f"Bearer {token}"})
-        if response.status_code >= 400:
-            raise ProviderReadError(f"Google Drive request failed with HTTP {response.status_code}")
-        files = _records(response.body, "files")
         results: list[DriveSearchResult] = []
-        for item in files:
-            resource_id = item.get("id")
-            parents = item.get("parents", [])
-            modified = item.get("modifiedTime")
-            if not isinstance(resource_id, str) or not isinstance(parents, list) or not parents or not isinstance(modified, str):
-                raise ProviderReadError("Google Drive result is missing scoped metadata")
-            parsed = datetime.fromisoformat(modified.replace("Z", "+00:00"))
-            metadata_hash = item.get("md5Checksum") or sha256(json.dumps(item, sort_keys=True, default=str).encode()).hexdigest()
-            results.append(DriveSearchResult(resource_id, str(parents[0]), str(item.get("name", "")), str(item.get("mimeType", "")), parsed, str(metadata_hash)))
-        return results
+        page_token: str | None = None
+        for _ in range(self.max_pages):
+            parameters: dict[str, str] = {
+                "q": query,
+                "fields": "nextPageToken,files(id,name,mimeType,modifiedTime,parents,md5Checksum)",
+            }
+            if page_token:
+                parameters["pageToken"] = page_token
+            url = urljoin(self.base_url, "files") + "?" + urlencode(parameters)
+            response = self.transport.request("GET", url, {"Authorization": f"Bearer {token}"})
+            if response.status_code >= 400:
+                raise ProviderReadError(f"Google Drive request failed with HTTP {response.status_code}")
+            for item in _records(response.body, "files"):
+                resource_id = item.get("id")
+                parents = item.get("parents", [])
+                modified = item.get("modifiedTime")
+                if not isinstance(resource_id, str) or not isinstance(parents, list) or not parents or not isinstance(modified, str):
+                    raise ProviderReadError("Google Drive result is missing scoped metadata")
+                parsed = datetime.fromisoformat(modified.replace("Z", "+00:00"))
+                metadata_hash = item.get("md5Checksum") or sha256(json.dumps(item, sort_keys=True, default=str).encode()).hexdigest()
+                results.append(DriveSearchResult(resource_id, str(parents[0]), str(item.get("name", "")), str(item.get("mimeType", "")), parsed, str(metadata_hash)))
+            page_token = response.body.get("nextPageToken")
+            if page_token is None:
+                return results
+            if not isinstance(page_token, str) or not page_token:
+                raise ProviderReadError("Google Drive nextPageToken is invalid")
+        raise ProviderReadError("Google Drive pagination exceeded the configured page limit")
+
+
+def _drive_folder_id(value: str) -> str:
+    # Drive IDs are opaque URL-safe tokens.  Rejecting quotes prevents a
+    # configured value from changing the scoped Drive query.
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,300}", value):
+        raise ProviderReadError("Google Drive folder id is invalid")
+    return value
 
 
 @dataclass
@@ -366,20 +449,44 @@ class GmailHttpClient(GmailEvidenceClient):
     secret_resolver: SecretResolver
     transport: JsonTransport
     base_url: str = "https://gmail.googleapis.com/gmail/v1/users/"
+    max_pages: int = 100
 
     def search_evidence(self, scope: EvidenceScope) -> Sequence[GmailSearchResult]:
         token = self.secret_resolver.resolve(self.access_token_secret_ref)
-        query = f"after:{scope.start_date.isoformat()} before:{scope.end_date.isoformat()}"
-        list_url = urljoin(self.base_url, f"{scope.gmail_mailbox}/messages") + "?" + urlencode({"q": query})
-        response = self.transport.request("GET", list_url, {"Authorization": f"Bearer {token}"})
-        if response.status_code >= 400:
-            raise ProviderReadError(f"Gmail search failed with HTTP {response.status_code}")
-        messages = _records(response.body, "messages")
+        label_names = self._label_names(token)
+        configured_label_ids = [label_names.get(label) for label in scope.gmail_labels]
+        if any(label_id is None for label_id in configured_label_ids):
+            raise ProviderReadError("configured Gmail evidence label does not exist")
+        # Gmail's `before` date is exclusive. Include all of period-end by
+        # querying the following calendar day.
+        end_exclusive = scope.end_date + timedelta(days=1)
+        query = f"after:{scope.start_date.isoformat()} before:{end_exclusive.isoformat()}"
+        message_ids: set[str] = set()
+        for label_id in configured_label_ids:
+            page_token: str | None = None
+            for _ in range(self.max_pages):
+                parameters = {"q": query, "labelIds": str(label_id)}
+                if page_token:
+                    parameters["pageToken"] = page_token
+                list_url = urljoin(self.base_url, f"{scope.gmail_mailbox}/messages") + "?" + urlencode(parameters)
+                response = self.transport.request("GET", list_url, {"Authorization": f"Bearer {token}"})
+                if response.status_code >= 400:
+                    raise ProviderReadError(f"Gmail search failed with HTTP {response.status_code}")
+                for item in _records(response.body, "messages"):
+                    message_id = item.get("id")
+                    if not isinstance(message_id, str) or not message_id:
+                        raise ProviderReadError("Gmail result is missing a message id")
+                    message_ids.add(message_id)
+                page_token = response.body.get("nextPageToken")
+                if page_token is None:
+                    break
+                if not isinstance(page_token, str) or not page_token:
+                    raise ProviderReadError("Gmail nextPageToken is invalid")
+            else:
+                raise ProviderReadError("Gmail pagination exceeded the configured page limit")
         results: list[GmailSearchResult] = []
-        for item in messages:
-            message_id = item.get("id")
-            if not isinstance(message_id, str):
-                raise ProviderReadError("Gmail result is missing a message id")
+        id_to_name = {label_id: name for name, label_id in label_names.items()}
+        for message_id in sorted(message_ids):
             get_url = urljoin(self.base_url, f"{scope.gmail_mailbox}/messages/{message_id}") + "?" + urlencode({"format": "metadata"})
             detail = self.transport.request("GET", get_url, {"Authorization": f"Bearer {token}"})
             if detail.status_code >= 400:
@@ -400,12 +507,15 @@ class GmailHttpClient(GmailEvidenceClient):
                 if isinstance(header, Mapping)
             }
             observed = datetime.fromtimestamp(int(internal_ms) / 1000, timezone.utc)
+            raw_labels = payload.get("labelIds", [])
+            if not isinstance(raw_labels, list) or any(not isinstance(item, str) for item in raw_labels):
+                raise ProviderReadError("Gmail message labels are invalid")
             results.append(
                 GmailSearchResult(
                     message_id,
                     str(payload.get("threadId", "")),
                     scope.gmail_mailbox,
-                    frozenset(payload.get("labelIds", [])),
+                    frozenset(id_to_name[label_id] for label_id in raw_labels if label_id in id_to_name),
                     observed,
                     headers.get("from", ""),
                     headers.get("subject", ""),
@@ -413,6 +523,18 @@ class GmailHttpClient(GmailEvidenceClient):
                 )
             )
         return results
+
+    def _label_names(self, token: str) -> Mapping[str, str]:
+        response = self.transport.request("GET", urljoin(self.base_url, "me/labels"), {"Authorization": f"Bearer {token}"})
+        if response.status_code >= 400:
+            raise ProviderReadError(f"Gmail label lookup failed with HTTP {response.status_code}")
+        labels: dict[str, str] = {}
+        for item in _records(response.body, "labels"):
+            label_id, name = item.get("id"), item.get("name")
+            if not isinstance(label_id, str) or not label_id or not isinstance(name, str) or not name:
+                raise ProviderReadError("Gmail label metadata is invalid")
+            labels[name] = label_id
+        return labels
 
     def _token(self) -> str:
         return self.secret_resolver.resolve(self.access_token_secret_ref)

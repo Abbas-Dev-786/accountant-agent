@@ -1,20 +1,48 @@
-import json
-import os
 import unittest
-from tempfile import TemporaryDirectory
 
 from app.secrets_store import (
-    EnvFileSecretStore,
     InMemorySecretStore,
     SecretStoreError,
-    _ref_to_env_key,
+    SupabaseVaultSecretStore,
     secret_store_from_environment,
 )
+from app.supabase_db import SupabaseDatabaseConfig
 
 
-class RefMappingTests(unittest.TestCase):
-    def test_ref_maps_to_env_key(self):
-        self.assertEqual(_ref_to_env_key("secret://xero/demo/client-secret"), "SECRET_XERO_DEMO_CLIENT_SECRET")
+class FakeCursor:
+    def __init__(self, rows=()):
+        self.rows = list(rows)
+        self.executed = []
+        self.closed = False
+
+    def execute(self, query, params=None):
+        self.executed.append((query, params))
+
+    def fetchone(self):
+        return self.rows.pop(0) if self.rows else None
+
+    def close(self):
+        self.closed = True
+
+
+class FakeConnection:
+    def __init__(self, rows=()):
+        self.cursor_instance = FakeCursor(rows)
+        self.commits = 0
+        self.rollbacks = 0
+        self.closed = False
+
+    def cursor(self):
+        return self.cursor_instance
+
+    def commit(self):
+        self.commits += 1
+
+    def rollback(self):
+        self.rollbacks += 1
+
+    def close(self):
+        self.closed = True
 
 
 class InMemorySecretStoreTests(unittest.TestCase):
@@ -37,53 +65,48 @@ class InMemorySecretStoreTests(unittest.TestCase):
             store.store("secret://a", "")
 
 
-class EnvFileSecretStoreTests(unittest.TestCase):
-    def test_resolves_bootstrap_from_env(self):
-        with TemporaryDirectory() as tmp:
-            store = EnvFileSecretStore(
-                os.path.join(tmp, "store.json"),
-                {"SECRET_XERO_DEMO_CLIENT_SECRET": "boot-secret"},
-            )
-            self.assertEqual(store.resolve("secret://xero/demo/client-secret"), "boot-secret")
+class SupabaseVaultSecretStoreTests(unittest.TestCase):
+    def setUp(self):
+        self.config = SupabaseDatabaseConfig("postgresql://postgres:secret@db.example/postgres?sslmode=require")
 
-    def test_rejects_placeholder_env_value(self):
-        with TemporaryDirectory() as tmp:
-            store = EnvFileSecretStore(
-                os.path.join(tmp, "store.json"),
-                {"SECRET_XERO_DEMO_REFRESH_TOKEN": "replace-with-real"},
-            )
-            with self.assertRaises(SecretStoreError):
-                store.resolve("secret://xero/demo/refresh-token")
+    def test_resolves_decrypted_secret_and_closes_connection(self):
+        connection = FakeConnection([("rotated-token",)])
+        store = SupabaseVaultSecretStore(self.config, connection_factory=lambda _: connection)
+        self.assertEqual(store.resolve("secret://xero/production/connection-a/refresh-token"), "rotated-token")
+        query, values = connection.cursor_instance.executed[0]
+        self.assertIn("vault.decrypted_secrets", query.lower())
+        self.assertEqual(values, ("secret://xero/production/connection-a/refresh-token",))
+        self.assertEqual(connection.commits, 1)
+        self.assertTrue(connection.closed)
 
-    def test_stored_value_overrides_env_and_persists(self):
-        with TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "store.json")
-            env = {"SECRET_XERO_DEMO_REFRESH_TOKEN": "seed-token"}
-            store = EnvFileSecretStore(path, env)
-            store.store("secret://xero/demo/refresh-token", "rotated-token")
-            self.assertEqual(store.resolve("secret://xero/demo/refresh-token"), "rotated-token")
-            # A fresh instance (simulating restart) reads the rotated token from disk.
-            reloaded = EnvFileSecretStore(path, env)
-            self.assertEqual(reloaded.resolve("secret://xero/demo/refresh-token"), "rotated-token")
+    def test_store_creates_or_rotates_without_plaintext_workflow_records(self):
+        created = FakeConnection([None])
+        store = SupabaseVaultSecretStore(self.config, connection_factory=lambda _: created)
+        store.store("secret://xero/production/connection-a/refresh-token", "new-token")
+        queries = "\n".join(query for query, _ in created.cursor_instance.executed).lower()
+        self.assertIn("vault.secrets", queries)
+        self.assertIn("vault.create_secret", queries)
+        self.assertNotIn("workflow.", queries)
 
-    def test_missing_reference_raises(self):
-        with TemporaryDirectory() as tmp:
-            store = EnvFileSecretStore(os.path.join(tmp, "store.json"), {})
-            with self.assertRaises(SecretStoreError):
-                store.resolve("secret://xero/demo/unknown")
+        rotated = FakeConnection([("11111111-1111-1111-1111-111111111111",)])
+        SupabaseVaultSecretStore(self.config, connection_factory=lambda _: rotated).store(
+            "secret://xero/production/connection-a/refresh-token", "newer-token"
+        )
+        self.assertIn("vault.update_secret", rotated.cursor_instance.executed[-1][0].lower())
+        self.assertTrue(rotated.closed)
 
-    def test_malformed_persistence_file_raises(self):
-        with TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "store.json")
-            with open(path, "w", encoding="utf-8") as handle:
-                handle.write("not json")
-            with self.assertRaises(SecretStoreError):
-                EnvFileSecretStore(path, {})
+    def test_missing_secret_and_invalid_reference_fail_closed(self):
+        store = SupabaseVaultSecretStore(self.config, connection_factory=lambda _: FakeConnection([None]))
+        with self.assertRaises(SecretStoreError):
+            store.resolve("secret://xero/production/missing")
+        with self.assertRaises(SecretStoreError):
+            store.store("plaintext-token", "value")
 
-    def test_from_environment_uses_default_relative_path(self):
-        store = secret_store_from_environment({"ACCOUNTINGOS_SECRET_STORE_PATH": ""})
-        # Empty override falls back to the documented default.
-        self.assertTrue(str(store._path).endswith("store.json"))
+    def test_environment_factory_requires_the_private_database_connection(self):
+        with self.assertRaisesRegex(SecretStoreError, "SUPABASE_DB_URL"):
+            secret_store_from_environment({})
+        store = secret_store_from_environment({"SUPABASE_DB_URL": self.config.database_url})
+        self.assertIsInstance(store, SupabaseVaultSecretStore)
 
 
 if __name__ == "__main__":

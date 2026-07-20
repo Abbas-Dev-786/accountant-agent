@@ -93,6 +93,19 @@ class XeroOAuthTests(unittest.TestCase):
         with self.assertRaises(XeroOAuthError):
             XeroOAuthConfig("id", "secret://client", "secret://refresh", "https://example.test/callback", ("accounting.settings.read",))
 
+    def test_production_connection_can_supply_its_refresh_reference_after_oauth(self):
+        configured = XeroOAuthConfig.from_environment(
+            {
+                "ACCOUNTINGOS_XERO_CLIENT_ID": "client-id",
+                "ACCOUNTINGOS_XERO_CLIENT_SECRET_REF": "secret://xero/production/client-secret",
+                "ACCOUNTINGOS_XERO_REDIRECT_URI": "https://api.example.test/api/v1/connections/xero/callback",
+                "ACCOUNTINGOS_XERO_SCOPES": "offline_access accounting.settings.read",
+            }
+        )
+        self.assertEqual(configured.refresh_token_secret_ref, "")
+        with self.assertRaisesRegex(XeroOAuthError, "connected tenant credential"):
+            XeroOAuthClient(configured, FakeSecrets(), FakeTransport(FormResponse(200, {}, {}))).refresh()
+
 
 if __name__ == "__main__":
     unittest.main()

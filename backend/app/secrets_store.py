@@ -1,37 +1,26 @@
-"""Concrete secret stores for the ``secret://`` reference contract.
+"""Secret stores for opaque ``secret://`` references.
 
-The OAuth client and provider adapters never take raw credentials; they take
-``secret://`` references and resolve them through a :class:`SecretStore`. This
-module provides two implementations:
-
-* :class:`EnvFileSecretStore` — the default for the isolated demo. Bootstrap
-  secrets (client secret, seed refresh token) are read from environment
-  variables; rotated refresh tokens are written durably to a JSON file outside
-  the repo so a process restart does not brick the Xero connection.
-* :class:`InMemorySecretStore` — deterministic store for tests.
-
-A managed backend (Supabase Vault, cloud secret manager) can implement the same
-``resolve``/``store`` contract and be swapped in without touching call sites.
+Production credentials are encrypted in Supabase Vault. The workflow database
+stores only the opaque reference; provider adapters receive the decrypted value
+only in the server-side API or worker process. ``InMemorySecretStore`` remains
+for deterministic unit tests.
 """
 
 from __future__ import annotations
 
-import json
 import os
-import tempfile
-from pathlib import Path
-from typing import Mapping
+from typing import Callable, Mapping
+
+from .supabase_db import SupabaseConfigError, SupabaseDatabaseConfig, connect, transaction
 
 
 class SecretStoreError(RuntimeError):
     """Raised when a secret cannot be resolved or persisted."""
 
 
-def _ref_to_env_key(secret_ref: str) -> str:
-    """Map ``secret://xero/demo/client-secret`` -> ``SECRET_XERO_DEMO_CLIENT_SECRET``."""
-    body = secret_ref[len("secret://") :]
-    normalized = body.replace("/", "_").replace("-", "_").upper()
-    return f"SECRET_{normalized}"
+def _validate_reference(secret_ref: str) -> None:
+    if not secret_ref.startswith("secret://") or len(secret_ref) > 1024:
+        raise SecretStoreError("secret references must be a bounded secret:// value")
 
 
 class InMemorySecretStore:
@@ -41,105 +30,112 @@ class InMemorySecretStore:
         self._values: dict[str, str] = dict(initial or {})
 
     def resolve(self, secret_ref: str) -> str:
-        if not secret_ref.startswith("secret://"):
-            raise SecretStoreError("secret references must start with secret://")
+        _validate_reference(secret_ref)
         value = self._values.get(secret_ref, "")
         if not value:
             raise SecretStoreError("secret reference is unavailable")
         return value
 
     def store(self, secret_ref: str, value: str) -> None:
-        if not secret_ref.startswith("secret://"):
-            raise SecretStoreError("secret references must start with secret://")
+        _validate_reference(secret_ref)
         if not value:
             raise SecretStoreError("refusing to store an empty secret")
         self._values[secret_ref] = value
 
 
-class EnvFileSecretStore:
-    """Env-seeded store that persists rotated secrets to a JSON file.
+class SupabaseVaultSecretStore:
+    """Store encrypted secrets in Supabase Vault using their opaque reference.
 
-    Resolution order for a reference:
-
-    1. A previously persisted (rotated) value in ``persistence_path``.
-    2. The environment variable ``SECRET_<REF>`` (see :func:`_ref_to_env_key`).
-
-    Writes go only to the persistence file, which must live outside any synced
-    or version-controlled directory. Bootstrap env values are never mutated.
+    A Vault secret's name is the same ``secret://`` reference kept in
+    ``workflow.connections``. This keeps the database reference durable and
+    useful without copying provider token material into workflow tables.
     """
 
     def __init__(
         self,
-        persistence_path: str | os.PathLike[str],
-        env: Mapping[str, str] | None = None,
+        config: SupabaseDatabaseConfig,
+        connection_factory: Callable[[SupabaseDatabaseConfig], object] | None = None,
     ) -> None:
-        self._path = Path(persistence_path)
-        self._env = os.environ if env is None else env
-        self._persisted: dict[str, str] = self._load()
+        self.config = config
+        self._connection_factory = connection_factory or connect
 
-    def _load(self) -> dict[str, str]:
-        if not self._path.exists():
-            return {}
-        try:
-            data = json.loads(self._path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as exc:
-            raise SecretStoreError("persisted secret store is unreadable") from exc
-        if not isinstance(data, dict) or any(not isinstance(v, str) for v in data.values()):
-            raise SecretStoreError("persisted secret store is malformed")
-        return {str(k): v for k, v in data.items()}
+    @staticmethod
+    def _first_value(row: object) -> object | None:
+        if row is None:
+            return None
+        if isinstance(row, Mapping):
+            return next(iter(row.values()), None)
+        if isinstance(row, (tuple, list)):
+            return row[0] if row else None
+        return row
 
     def resolve(self, secret_ref: str) -> str:
-        if not secret_ref.startswith("secret://"):
-            raise SecretStoreError("secret references must start with secret://")
-        if secret_ref in self._persisted:
-            return self._persisted[secret_ref]
-        value = self._env.get(_ref_to_env_key(secret_ref), "")
-        if not value or value.startswith("replace-"):
-            raise SecretStoreError(f"secret reference {secret_ref} is unavailable")
+        _validate_reference(secret_ref)
+        connection = self._open_connection()
+        try:
+            with transaction(connection) as cursor:
+                cursor.execute(
+                    "select decrypted_secret from vault.decrypted_secrets where name = %s",
+                    (secret_ref,),
+                )
+                value = self._first_value(cursor.fetchone())
+        except SecretStoreError:
+            raise
+        except Exception as exc:
+            raise SecretStoreError("Supabase Vault secret is unavailable") from exc
+        finally:
+            self._close_connection(connection)
+        if not isinstance(value, str) or not value:
+            raise SecretStoreError("Supabase Vault secret is unavailable")
         return value
 
     def store(self, secret_ref: str, value: str) -> None:
-        if not secret_ref.startswith("secret://"):
-            raise SecretStoreError("secret references must start with secret://")
+        _validate_reference(secret_ref)
         if not value:
             raise SecretStoreError("refusing to store an empty secret")
-        updated = dict(self._persisted)
-        updated[secret_ref] = value
-        self._atomic_write(updated)
-        self._persisted = updated
-
-    def _atomic_write(self, data: Mapping[str, str]) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        serialized = json.dumps(data, sort_keys=True, indent=2)
+        connection = self._open_connection()
         try:
-            handle = tempfile.NamedTemporaryFile(
-                "w",
-                encoding="utf-8",
-                dir=str(self._path.parent),
-                prefix=self._path.name,
-                suffix=".tmp",
-                delete=False,
-            )
-            with handle as tmp:
-                tmp.write(serialized)
-                tmp.flush()
-                os.fsync(tmp.fileno())
-            os.replace(handle.name, self._path)
-            try:
-                os.chmod(self._path, 0o600)
-            except OSError:
-                pass  # Best-effort on filesystems without POSIX permissions.
-        except OSError as exc:
-            raise SecretStoreError("could not persist rotated secret") from exc
+            with transaction(connection) as cursor:
+                # Serialize competing OAuth refresh rotations for one opaque
+                # reference. A collision can only cause harmless contention.
+                cursor.execute("select pg_advisory_xact_lock(hashtextextended(%s, 0))", (secret_ref,))
+                cursor.execute("select id from vault.secrets where name = %s for update", (secret_ref,))
+                secret_id = self._first_value(cursor.fetchone())
+                if secret_id is None:
+                    cursor.execute(
+                        "select vault.create_secret(%s, %s, %s)",
+                        (value, secret_ref, "AccountingOS server-managed provider credential"),
+                    )
+                else:
+                    cursor.execute(
+                        "select vault.update_secret(%s::uuid, %s, null, null)",
+                        (str(secret_id), value),
+                    )
+        except SecretStoreError:
+            raise
+        except Exception as exc:
+            raise SecretStoreError("Supabase Vault secret could not be stored") from exc
+        finally:
+            self._close_connection(connection)
+
+    def _open_connection(self):
+        try:
+            return self._connection_factory(self.config)
+        except Exception as exc:
+            raise SecretStoreError("Supabase Vault connection is unavailable") from exc
+
+    @staticmethod
+    def _close_connection(connection: object) -> None:
+        close = getattr(connection, "close", None)
+        if callable(close):
+            close()
 
 
-def secret_store_from_environment(env: Mapping[str, str] | None = None) -> EnvFileSecretStore:
-    """Build the default demo secret store.
-
-    ``ACCOUNTINGOS_SECRET_STORE_PATH`` selects the persistence file; it defaults
-    to ``.secrets/store.json`` under the current working directory. Point it at a
-    path outside any synced/versioned folder in real deployments.
-    """
+def secret_store_from_environment(env: Mapping[str, str] | None = None) -> SupabaseVaultSecretStore:
+    """Build the production-only Vault-backed secret store."""
     values = os.environ if env is None else env
-    path = values.get("ACCOUNTINGOS_SECRET_STORE_PATH", "").strip() or ".secrets/store.json"
-    return EnvFileSecretStore(path, values)
+    try:
+        config = SupabaseDatabaseConfig.from_environment(values)
+    except SupabaseConfigError as exc:
+        raise SecretStoreError("production secrets require SUPABASE_DB_URL and Supabase Vault") from exc
+    return SupabaseVaultSecretStore(config)

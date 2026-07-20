@@ -937,6 +937,8 @@ def _xero_tenant_allowlist() -> frozenset[str]:
 def _register_xero_connection(organization_id: str, refresh_token_secret_ref: str | None = None) -> int:
     if xero_oauth_client is None:
         raise XeroOAuthError("Xero OAuth is not configured")
+    if not refresh_token_secret_ref or not refresh_token_secret_ref.startswith("secret://"):
+        raise XeroOAuthError("Xero connection registration requires a tenant refresh-token reference")
     allowlist = _xero_tenant_allowlist()
     provider_environment = "demo" if service.deployment.mode == "demo" else "production"
     tenants = xero_oauth_client.list_tenants()
@@ -960,12 +962,12 @@ def _register_xero_connection(organization_id: str, refresh_token_secret_ref: st
                     last_success_at=now,
                     remediation=None,
                 ),
-                credential_secret_ref=refresh_token_secret_ref or xero_oauth_client.config.refresh_token_secret_ref,
+                credential_secret_ref=refresh_token_secret_ref,
             )
             if workflow_store is not None:
                 workflow_store.upsert_connection(
                     connection_health=connection_health,
-                    credential_secret_ref=refresh_token_secret_ref or xero_oauth_client.config.refresh_token_secret_ref,
+                    credential_secret_ref=refresh_token_secret_ref,
                 )
             registered += 1
         except PolicyError as exc:

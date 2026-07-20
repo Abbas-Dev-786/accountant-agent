@@ -138,7 +138,7 @@ class XeroOAuthConfig:
             raise XeroOAuthError("Xero client ID must be configured")
         if not self.client_secret_ref.startswith("secret://"):
             raise XeroOAuthError("Xero client secret must be a secret:// reference")
-        if not self.refresh_token_secret_ref.startswith("secret://"):
+        if self.refresh_token_secret_ref and not self.refresh_token_secret_ref.startswith("secret://"):
             raise XeroOAuthError("Xero refresh token must be a secret:// reference")
         redirect = urlsplit(self.redirect_uri)
         if redirect.scheme not in {"http", "https"} or not redirect.netloc:
@@ -159,7 +159,7 @@ class XeroOAuthConfig:
         return cls(
             values.get("ACCOUNTINGOS_XERO_CLIENT_ID", ""),
             values.get("ACCOUNTINGOS_XERO_CLIENT_SECRET_REF", ""),
-            values.get("ACCOUNTINGOS_XERO_REFRESH_TOKEN_SECRET_REF", ""),
+            values.get("ACCOUNTINGOS_XERO_REFRESH_TOKEN_SECRET_REF", "").strip(),
             values.get("ACCOUNTINGOS_XERO_REDIRECT_URI", ""),
             scopes,
             values.get("ACCOUNTINGOS_XERO_TOKEN_ENDPOINT", "https://identity.xero.com/connect/token"),
@@ -232,6 +232,8 @@ class XeroOAuthClient:
         return token
 
     def refresh(self) -> XeroToken:
+        if not self.config.refresh_token_secret_ref:
+            raise XeroOAuthError("Xero refresh requires a connected tenant credential")
         refresh_token = self.secrets.resolve(self.config.refresh_token_secret_ref)
         if not refresh_token or refresh_token.startswith("replace-"):
             raise XeroOAuthError("Xero refresh token is unavailable")
@@ -290,8 +292,11 @@ class XeroOAuthClient:
         self._cached_until = current + timedelta(seconds=token.expires_in)
 
     def _store_refresh_token(self, refresh_token: str, secret_ref: str | None = None) -> None:
+        target_ref = secret_ref or self.config.refresh_token_secret_ref
+        if not target_ref:
+            raise XeroOAuthError("Xero refresh token has no connected tenant credential reference")
         try:
-            self.secrets.store(secret_ref or self.config.refresh_token_secret_ref, refresh_token)
+            self.secrets.store(target_ref, refresh_token)
         except Exception as exc:
             raise XeroOAuthError("Xero refresh token could not be persisted") from exc
 

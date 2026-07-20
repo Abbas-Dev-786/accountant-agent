@@ -93,6 +93,11 @@ cp web/.env.local.example web/.env.local
 
 The API requires the server-only `SUPABASE_DB_URL`, `SUPABASE_URL`,
 `SUPABASE_PUBLISHABLE_KEY`, and `ACCOUNTINGOS_BOOTSTRAP_CONTROLLER_EMAIL`.
+Before starting the API or worker, provision every `secret://` reference from
+`backend/.env.example` in Supabase Vault using that exact reference as the
+Vault secret name. Provider onboarding then creates and rotates its connection
+credentials in Vault; `workflow.connections` stores references only, never
+token material.
 The browser needs only `NEXT_PUBLIC_SUPABASE_URL`,
 `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`, and `NEXT_PUBLIC_API_BASE_URL`.
 Provider and artifact values in `backend/.env` remain server-only. Keep the

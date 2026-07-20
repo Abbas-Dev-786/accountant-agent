@@ -50,6 +50,22 @@ class NormalizationTests(unittest.TestCase):
         self.assertEqual(first.content_hash, second.content_hash)
         self.assertEqual(first.payload_json, '{"amount":42,"status":"pending"}')
 
+    def test_xero_payment_wire_date_and_nested_currency_are_normalized(self):
+        record = normalize_provider_record(
+            "xero",
+            "payment-1",
+            {
+                "PaymentID": "payment-1",
+                "Date": "/Date(1782950400000+0000)/",
+                "BankAmount": "50.00",
+                "CurrencyRate": "1.02",
+                "Invoice": {"CurrencyCode": "USD"},
+            },
+            fallback_observed_at=datetime(2026, 7, 2, tzinfo=timezone.utc),
+        )
+        self.assertEqual(record.accounting_date, "2026-07-02")
+        self.assertEqual(record.currency, "USD")
+
 
 class XeroAdapterTests(unittest.TestCase):
     def test_demo_pagination_is_ordered_and_immutable(self):

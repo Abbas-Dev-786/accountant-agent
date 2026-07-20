@@ -189,7 +189,8 @@ class SupabaseRepositoryTests(unittest.TestCase):
         self.assertIn("create extension if not exists supabase_vault with schema vault", extension_sql)
         self.assertIn("revoke all on schema vault from public, anon, authenticated", sql)
         self.assertIn("revoke all on all tables in schema vault from public, anon, authenticated", sql)
-        self.assertIn("revoke all on all functions in schema vault from public, anon, authenticated", sql)
+        self.assertNotIn("revoke all on all functions in schema vault", sql)
+        self.assertIn("revoking usage on the vault schema", sql)
 
     def test_workflow_store_reads_task_dependencies(self):
         connection = FakeConnection(
@@ -225,6 +226,7 @@ class SupabaseRepositoryTests(unittest.TestCase):
         retry_query = connection.cursor_instance.executed[1][0].lower()
         self.assertIn("workflow.task_dependencies", retry_query)
         self.assertIn("prerequisite.state <> 'succeeded'", retry_query)
+        self.assertIn("attempt = 0", retry_query)
         self.assertIn("organization_id, state", connection.cursor_instance.executed[0][0].lower())
 
     def test_retry_refuses_approved_or_cancelled_runs(self):
@@ -237,12 +239,47 @@ class SupabaseRepositoryTests(unittest.TestCase):
 
     def test_durable_claim_reclaims_an_expired_running_lease(self):
         config = SupabaseDatabaseConfig("postgresql://postgres:secret@db.example/postgres?sslmode=require")
-        connection = FakeConnection([None])
+        connection = FakeConnection()
         with patch("app.supabase_db.connect", return_value=connection):
             self.assertIsNone(SupabaseWorkflowStore(config).claim_next_task("worker-1"))
-        query = connection.cursor_instance.executed[0][0].lower()
+        query = connection.cursor_instance.executed[1][0].lower()
         self.assertIn("t.state = 'running' and t.lease_expires_at < now()", query)
+        self.assertIn("t.attempt < t.max_attempts", query)
         self.assertIn("for update skip locked", query)
+
+    def test_durable_claim_terminalizes_expired_lease_after_max_attempts(self):
+        config = SupabaseDatabaseConfig("postgresql://postgres:secret@db.example/postgres?sslmode=require")
+        connection = FakeConnection()
+        connection.cursor_instance.fetchall = lambda: [("task-1", "run-1", "reconcile", 3, "org-1")]
+        with patch("app.supabase_db.connect", return_value=connection):
+            self.assertIsNone(SupabaseWorkflowStore(config).claim_next_task("worker-1"))
+        exhaustion_query = connection.cursor_instance.executed[0][0].lower()
+        self.assertIn("task.attempt >= task.max_attempts", exhaustion_query)
+        self.assertIn("worker lease expired after maximum attempts", exhaustion_query)
+        self.assertIn("state not in ('approved', 'cancelled')", connection.cursor_instance.executed[1][0].lower())
+        self.assertIn("task_attempts_exhausted", connection.cursor_instance.executed[2][1])
+
+    def test_action_failure_and_blocked_task_do_not_reopen_approved_close(self):
+        config = SupabaseDatabaseConfig("postgresql://postgres:secret@db.example/postgres?sslmode=require")
+        action_connection = FakeConnection([("org-1", "run-1", "approval-1", "hash", None)])
+        task_connection = FakeConnection([("run-1", "send_recovery_request"), ("org-1",)])
+        with patch("app.supabase_db.connect", return_value=action_connection):
+            SupabaseWorkflowStore(config).update_action_execution(action_id="action-1", status="failed")
+        with patch("app.supabase_db.connect", return_value=task_connection):
+            SupabaseWorkflowStore(config).block_task(
+                PersistedTask("task-1", "run-1", "send_recovery_request", "running", 1, "worker-1", None, None),
+                "worker-1",
+                "Gmail send outcome is unknown",
+            )
+        self.assertIn("state not in ('approved', 'cancelled')", action_connection.cursor_instance.executed[1][0].lower())
+        self.assertIn("state not in ('approved', 'cancelled')", task_connection.cursor_instance.executed[3][0].lower())
+
+    def test_state_guard_migration_adds_persisted_task_attempt_budget(self):
+        migration = Path(__file__).parents[1] / ".." / "supabase" / "migrations" / "20260720213000_close_run_state_and_webhook_guards.sql"
+        sql = migration.read_text().lower()
+        self.assertIn("add column if not exists max_attempts", sql)
+        self.assertIn("tasks_max_attempts_range", sql)
+        self.assertIn("terminal close runs cannot change state", sql)
 
     def test_evidence_identity_cannot_be_reused_by_another_run(self):
         connection = FakeConnection([("org-1",), ("org-2", "run-2")])

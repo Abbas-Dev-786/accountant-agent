@@ -16,7 +16,8 @@ from hashlib import sha256
 from json import dumps
 from typing import Mapping, Sequence
 
-from .domain import JournalLine, JournalProposal
+from .domain import JournalLine, JournalProposal, PolicyError
+from .normalization import provider_accounting_date, provider_currency
 from .reconciliation import (
     BankTransaction,
     LedgerTransaction,
@@ -73,13 +74,13 @@ def _date(payload: Mapping[str, object], fallback: str | None) -> date:
     if not value:
         raise CloseExecutionError("record has no accounting date")
     try:
-        return date.fromisoformat(value[:10])
-    except ValueError as exc:
+        return date.fromisoformat(provider_accounting_date(value))
+    except (ValueError, PolicyError) as exc:
         raise CloseExecutionError("record has an invalid accounting date") from exc
 
 
 def _currency(payload: Mapping[str, object], fallback: str | None) -> str:
-    value = _text(payload, "currency", "iso_currency_code", "CurrencyCode") or fallback
+    value = provider_currency(payload) or fallback
     if not value or len(value) != 3:
         raise CloseExecutionError("record has no ISO currency")
     return value.upper()
@@ -152,21 +153,29 @@ def _ledger_transactions(facts: Sequence[SnapshotFact]) -> tuple[LedgerTransacti
     amount and account before it can match a Plaid transaction.
     """
     result: list[LedgerTransaction] = []
+    accounts_by_code, accounts_by_id = _xero_account_metadata(facts)
     for fact in facts:
         if fact.provider != "xero":
             continue
         payload = fact.payload
         record_type = (_text(payload, "Type", "type", "record_type") or "").lower()
-        account_code = _xero_account_code(payload)
-        explicit_amount = any(name in payload for name in ("amount", "Amount", "Total", "TotalAmount"))
+        account_code = _xero_account_code(payload, accounts_by_id)
+        explicit_amount = any(name in payload for name in ("amount", "Amount", "BankAmount", "Total", "TotalAmount"))
         is_cash_record = any(name in payload for name in ("BankTransactionID", "PaymentID", "JournalID", "ManualJournalID"))
         if explicit_amount and (account_code or is_cash_record or "bank" in record_type or "payment" in record_type):
+            amount = _xero_cash_amount(payload)
+            if amount is None:
+                # An unknown Xero transaction direction cannot be safely
+                # matched. Leave it out so reconciliation produces an
+                # explicit exception instead of inventing a sign.
+                continue
             transaction_id = _text(payload, "BankTransactionID", "PaymentID", "JournalID", "id", "transaction_id") or fact.provider_record_id
+            account = accounts_by_code.get(account_code or "", {})
             result.append(
                 LedgerTransaction(
                     transaction_id=f"xero:{transaction_id}",
-                    amount=_amount(payload, "amount", "Amount", "Total", "TotalAmount"),
-                    currency=_currency(payload, fact.currency),
+                    amount=amount,
+                    currency=_currency(payload, provider_currency(account) or fact.currency),
                     accounting_date=_date(payload, fact.accounting_date),
                     source_evidence_ids=(_evidence_id(fact),),
                     account_code=account_code or "unmapped",
@@ -176,7 +185,53 @@ def _ledger_transactions(facts: Sequence[SnapshotFact]) -> tuple[LedgerTransacti
     return tuple(result)
 
 
-def _xero_account_code(payload: Mapping[str, object]) -> str | None:
+def _xero_cash_amount(payload: Mapping[str, object]) -> Decimal | None:
+    """Map Xero's unsigned cash amounts to Plaid's signed cash convention.
+
+    Plaid represents an outflow as positive; Xero provides an absolute amount
+    plus a transaction/payment direction. Payments use BankAmount because it
+    is denominated in the bank account currency that must reconcile to Plaid.
+    """
+    amount = abs(_amount(payload, "bank_amount", "BankAmount", "amount", "Amount", "Total", "TotalAmount"))
+    transaction_type = (_text(payload, "Type", "type") or "").upper()
+    if transaction_type.startswith("SPEND"):
+        return amount
+    if transaction_type.startswith("RECEIVE"):
+        return -amount
+    payment_type = (_text(payload, "PaymentType", "payment_type") or "").upper()
+    if payment_type in {"ACCPAYPAYMENT", "ARCREDITPAYMENT", "AROVERPAYMENTPAYMENT", "ARPREPAYMENTPAYMENT"}:
+        return amount
+    if payment_type in {"ACCRECPAYMENT", "APCREDITPAYMENT", "APOVERPAYMENTPAYMENT", "APPREPAYMENTPAYMENT"}:
+        return -amount
+    return None
+
+
+def _xero_account_metadata(
+    facts: Sequence[SnapshotFact],
+) -> tuple[Mapping[str, Mapping[str, object]], Mapping[str, Mapping[str, object]]]:
+    """Index source-snapshotted Xero Accounts by stable id and account code."""
+    by_code: dict[str, Mapping[str, object]] = {}
+    by_id: dict[str, Mapping[str, object]] = {}
+    for fact in facts:
+        if fact.provider != "xero" or not isinstance(fact.payload, Mapping):
+            continue
+        payload = fact.payload
+        record_type = (_text(payload, "record_type") or "").lower()
+        account_id = _text(payload, "AccountID", "account_id")
+        code = _text(payload, "Code", "AccountCode", "code", "account_code")
+        if record_type != "account" and not account_id:
+            continue
+        if account_id:
+            by_id[account_id] = payload
+        if code:
+            by_code[code] = payload
+    return by_code, by_id
+
+
+def _xero_account_code(
+    payload: Mapping[str, object],
+    accounts_by_id: Mapping[str, Mapping[str, object]] | None = None,
+) -> str | None:
     direct = _text(payload, "AccountCode", "account_code")
     if direct:
         return direct
@@ -186,11 +241,19 @@ def _xero_account_code(payload: Mapping[str, object]) -> str | None:
             code = _text(nested, "Code", "AccountCode", "code", "account_code")
             if code:
                 return code
+            account_id = _text(nested, "AccountID", "account_id", "id")
+            account = (accounts_by_id or {}).get(account_id or "")
+            if account:
+                code = _text(account, "Code", "AccountCode", "code", "account_code")
+                if code:
+                    return code
     return None
 
 
-def _entries(facts: Sequence[SnapshotFact]) -> tuple[AccountingEntry, ...]:
+def _entries(facts: Sequence[SnapshotFact]) -> tuple[tuple[AccountingEntry, ...], tuple[str, ...]]:
     result: list[AccountingEntry] = []
+    unsupported_facts: list[str] = []
+    accounts_by_code, _ = _xero_account_metadata(facts)
     category_by_type = {
         "asset": "asset", "bank": "asset", "currentasset": "asset", "liability": "liability",
         "currentliability": "liability", "equity": "equity", "revenue": "income", "income": "income",
@@ -207,11 +270,21 @@ def _entries(facts: Sequence[SnapshotFact]) -> tuple[AccountingEntry, ...]:
                 raise CloseExecutionError("Xero journal contains an invalid line")
             amount = _amount(line, "LineAmount", "line_amount", "amount")
             code = _text(line, "AccountCode", "account_code")
-            account_name = _text(line, "AccountName", "account_name") or code
-            account_type = (_text(line, "AccountType", "account_type") or "").replace(" ", "").lower()
+            account = accounts_by_code.get(code or "", {})
+            account_name = _text(line, "AccountName", "account_name") or _text(account, "Name", "name") or code
+            account_type = (
+                _text(line, "AccountType", "account_type") or _text(account, "Type", "AccountType", "type", "account_type") or ""
+            ).replace(" ", "").lower()
             category = category_by_type.get(account_type)
-            if not code or not account_name or category is None:
+            if not code or not account_name:
                 raise CloseExecutionError("Xero journal line has no supported account metadata")
+            if category is None:
+                # ManualJournal responses omit AccountType. Do not fabricate a
+                # financial-statement classification or abort cash controls;
+                # the report is marked unavailable below until account metadata
+                # is enriched from an authoritative source.
+                unsupported_facts.append(fact.version_id)
+                continue
             result.append(
                 AccountingEntry(
                     entry_id=f"{fact.version_id}:{index}",
@@ -224,7 +297,7 @@ def _entries(facts: Sequence[SnapshotFact]) -> tuple[AccountingEntry, ...]:
                     evidence_ids=(_evidence_id(fact),),
                 )
             )
-    return tuple(result)
+    return tuple(result), tuple(dict.fromkeys(unsupported_facts))
 
 
 def _report_payload(
@@ -232,10 +305,20 @@ def _report_payload(
     banks: Sequence[BankTransaction],
     ledgers: Sequence[LedgerTransaction],
     mapping: Mapping[str, Mapping[str, object]],
+    unsupported_journal_facts: Sequence[str] = (),
 ) -> tuple[Mapping[str, object], str]:
     bank_total = sum((item.amount for item in banks), Decimal("0"))
     cash_codes = {str(item["xero_account_code"]) for item in mapping.values()}
     ledger_cash_total = sum((item.amount for item in ledgers if item.account_code in cash_codes), Decimal("0"))
+    if unsupported_journal_facts:
+        return (
+            {
+                "status": "unavailable",
+                "reason": "frozen snapshot has Xero journal lines without account-type metadata",
+                "cash": {"bank_total": str(bank_total), "ledger_cash_total": str(ledger_cash_total)},
+            },
+            "unavailable",
+        )
     if not entries:
         return ({"status": "unavailable", "reason": "frozen snapshot has no supported Xero journal-line facts", "cash": {"bank_total": str(bank_total), "ledger_cash_total": str(ledger_cash_total)}}, "unavailable")
     try:
@@ -350,8 +433,8 @@ def derive_close_execution(
         ),
         raw_reconciliation.statuses,
     )
-    entries = _entries(facts)
-    report, report_status = _report_payload(entries, banks, ledgers, mapping)
+    entries, unsupported_journal_facts = _entries(facts)
+    report, report_status = _report_payload(entries, banks, ledgers, mapping, unsupported_journal_facts)
     input_hash = sha256(_canonical([{"id": item.version_id, "provider": item.provider, "payload": item.payload} for item in facts]).encode()).hexdigest()
     report_hash = sha256(_canonical(report).encode()).hexdigest()
     bank_by_id = {item.transaction_id: item for item in banks}

@@ -71,12 +71,13 @@ class RuntimeProviderTests(unittest.TestCase):
                 JsonResponse(200, {"BankTransactions": [{"BankTransactionID": "bank-1", "Total": "12.50"}]}, {}),
                 JsonResponse(200, {"Payments": [{"PaymentID": "payment-1", "Amount": "4.50"}]}, {}),
                 JsonResponse(200, {"ManualJournals": []}, {}),
+                JsonResponse(200, {"Accounts": [{"AccountID": "account-1", "Code": "1000", "CurrencyCode": "USD"}]}, {}),
             ]
         )
         xero = XeroProductionHttpClient("tenant-1", "secret://xero/access", resolver(), xero_transport)
         xero_page = xero.get_page(1)
         self.assertEqual(xero_page.provider_environment, "production")
-        self.assertEqual({item["record_type"] for item in xero_page.records}, {"bank_transaction", "payment"})
+        self.assertEqual({item["record_type"] for item in xero_page.records}, {"bank_transaction", "payment", "account"})
         self.assertTrue(all("Invoices" not in call[1] for call in xero_transport.calls))
         plaid_transport = FakeTransport(
             [JsonResponse(200, {"added": [], "modified": [], "removed": [], "next_cursor": "cursor-1", "has_more": False}, {})]

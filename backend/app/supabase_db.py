@@ -1300,6 +1300,43 @@ class SupabaseWorkflowStore:
         connection = connect(self.config)
         try:
             with transaction(connection) as cursor:
+                # A worker that dies after claiming a task cannot report a
+                # normal failure.  Reclaim its expired lease, but only while
+                # the task remains below its persisted retry budget.  Once
+                # exhausted, make the task terminal and surface a visible
+                # close-run blocker (without mutating an approved/cancelled
+                # close that may merely be sending post-approval email).
+                cursor.execute(
+                    """
+                    update workflow.tasks task
+                    set state = 'failed', lease_owner = null, lease_expires_at = null,
+                        last_error = 'worker lease expired after maximum attempts', updated_at = now()
+                    from workflow.close_runs run
+                    where task.run_id = run.id
+                      and task.state = 'running'
+                      and task.lease_expires_at < now()
+                      and task.attempt >= task.max_attempts
+                    returning task.id::text, task.run_id::text, task.task_key,
+                              task.attempt, run.organization_id
+                    """
+                )
+                for exhausted_task in cursor.fetchall():
+                    task_id, run_id, task_key, attempt, organization_id = exhausted_task
+                    cursor.execute(
+                        """
+                        update workflow.close_runs set state = 'blocked', updated_at = now()
+                        where id = %s::uuid and state not in ('approved', 'cancelled')
+                        """,
+                        (run_id,),
+                    )
+                    self._record_task_event(
+                        cursor,
+                        organization_id=str(organization_id),
+                        run_id=str(run_id),
+                        task_id=str(task_id),
+                        event_type="task_attempts_exhausted",
+                        payload={"task_key": str(task_key), "attempt": int(attempt)},
+                    )
                 cursor.execute(
                     """
                     select t.id::text, t.run_id::text, t.task_key, t.state, t.attempt,
@@ -1311,6 +1348,7 @@ class SupabaseWorkflowStore:
                         (t.state = 'ready' and (t.lease_expires_at is null or t.lease_expires_at < now()))
                         or (t.state = 'running' and t.lease_expires_at < now())
                     )
+                      and t.attempt < t.max_attempts
                       and r.state <> 'cancelled'
                     order by t.created_at, t.id
                     for update skip locked
@@ -1369,7 +1407,7 @@ class SupabaseWorkflowStore:
                 cursor.execute(
                     """
                     update workflow.tasks candidate
-                    set state = 'ready', last_error = null, lease_owner = null,
+                    set state = 'ready', attempt = 0, last_error = null, lease_owner = null,
                         lease_expires_at = null, updated_at = now()
                     where candidate.run_id = %s::uuid and candidate.state in ('blocked', 'failed')
                       and not exists (
@@ -1737,7 +1775,13 @@ class SupabaseWorkflowStore:
                          str(object_id) if object_id is not None else None, status),
                     )
                 if status in {"failed", "outcome_unknown"}:
-                    cursor.execute("update workflow.close_runs set state = 'action_failed', updated_at = now() where id = %s::uuid", (run_id,))
+                    cursor.execute(
+                        """
+                        update workflow.close_runs set state = 'action_failed', updated_at = now()
+                        where id = %s::uuid and state not in ('approved', 'cancelled')
+                        """,
+                        (run_id,),
+                    )
                 elif proposal_id and status in {"succeeded", "reconciled"}:
                     cursor.execute(
                         """
@@ -1748,7 +1792,13 @@ class SupabaseWorkflowStore:
                         (run_id,),
                     )
                     if int(cursor.fetchone()[0]) == 0:
-                        cursor.execute("update workflow.close_runs set state = 'approved', updated_at = now() where id = %s::uuid", (run_id,))
+                        cursor.execute(
+                            """
+                            update workflow.close_runs set state = 'approved', updated_at = now()
+                            where id = %s::uuid and state not in ('approved', 'cancelled')
+                            """,
+                            (run_id,),
+                        )
                 self._record_task_event(
                     cursor, organization_id=organization_id, run_id=run_id, task_id=None,
                     event_type="action_updated", payload={"action_id": action_id, "status": status,
@@ -2379,7 +2429,7 @@ class SupabaseWorkflowStore:
                     cursor.execute(
                         """
                         update workflow.close_runs set state = 'blocked', updated_at = now()
-                        where id = %s::uuid and state <> 'cancelled'
+                        where id = %s::uuid and state not in ('approved', 'cancelled')
                         """,
                         (run_id,),
                     )

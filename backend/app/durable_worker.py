@@ -485,8 +485,11 @@ class GoogleEvidenceExecutor:
             self.store.persist_evidence_batch(run_id=task.run_id, batch=batch)
         except TaskBlocked:
             raise
-        except (GoogleOAuthError, SecretStoreError, ValueError) as exc:
-            raise TaskBlocked("Google evidence configuration is invalid") from exc
+        except (EvidencePolicyError, ProviderReadError, GoogleOAuthError, SecretStoreError, ValueError) as exc:
+            # The collector intentionally filters ordinary out-of-period and
+            # unlabeled results.  A remaining collection/policy failure is a
+            # visible close blocker, never an unhandled worker exception.
+            raise TaskBlocked("Google evidence collection could not complete; inspect provider configuration and logs") from exc
 
 
 class ReconciliationMappingGateExecutor:

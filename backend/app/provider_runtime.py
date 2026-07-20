@@ -153,6 +153,10 @@ class XeroProductionHttpClient(XeroDemoHttpClient):
         ("/api.xro/2.0/BankTransactions", "BankTransactions", "bank_transaction"),
         ("/api.xro/2.0/Payments", "Payments", "payment"),
         ("/api.xro/2.0/ManualJournals", "ManualJournals", "manual_journal"),
+        # Payment and ManualJournal payloads commonly contain only an account
+        # code.  The already-authorized Accounts resource supplies the
+        # currency and AccountType needed to project those records safely.
+        ("/api.xro/2.0/Accounts", "Accounts", "account"),
     )
 
     def get_page(self, page: int) -> XeroPage:
@@ -206,7 +210,7 @@ class XeroProductionHttpClient(XeroDemoHttpClient):
 
 
 def _xero_record_id(record: Mapping[str, object]) -> str:
-    for name in ("BankTransactionID", "PaymentID", "ManualJournalID", "JournalID", "InvoiceID", "id"):
+    for name in ("BankTransactionID", "PaymentID", "ManualJournalID", "JournalID", "AccountID", "InvoiceID", "id"):
         value = record.get(name)
         if value is not None and str(value):
             return str(value)

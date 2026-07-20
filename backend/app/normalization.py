@@ -8,7 +8,8 @@ different source version for the same facts.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+import re
+from datetime import date, datetime, timedelta, timezone
 from hashlib import sha256
 from typing import Mapping
 
@@ -49,6 +50,51 @@ def observed_at(payload: Mapping[str, object], fallback: datetime) -> datetime:
     raise PolicyError("provider record has an invalid observation timestamp")
 
 
+_XERO_WIRE_DATE = re.compile(r"^/Date\((-?\d+)([+-]\d{4})?\)/$")
+
+
+def provider_accounting_date(value: object) -> str:
+    """Normalize ISO and Xero ``/Date(milliseconds±offset)/`` values to ISO dates."""
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if not isinstance(value, str) or not value.strip():
+        raise PolicyError("provider record has an invalid accounting date")
+    raw = value.strip()
+    xero_match = _XERO_WIRE_DATE.fullmatch(raw)
+    if xero_match:
+        milliseconds = int(xero_match.group(1))
+        offset = xero_match.group(2) or "+0000"
+        sign = 1 if offset[0] == "+" else -1
+        hours, minutes = int(offset[1:3]), int(offset[3:5])
+        if hours > 23 or minutes > 59:
+            raise PolicyError("provider record has an invalid accounting date")
+        zone = timezone(sign * timedelta(hours=hours, minutes=minutes))
+        return datetime.fromtimestamp(milliseconds / 1000, timezone.utc).astimezone(zone).date().isoformat()
+    try:
+        return date.fromisoformat(raw[:10]).isoformat()
+    except ValueError as exc:
+        raise PolicyError("provider record has an invalid accounting date") from exc
+
+
+def provider_currency(payload: Mapping[str, object]) -> str | None:
+    """Find a provider currency without mistaking a numeric exchange rate for one."""
+    for key in ("currency", "iso_currency_code", "CurrencyCode"):
+        value = payload.get(key)
+        if isinstance(value, str) and len(value.strip()) == 3:
+            return value.strip().upper()
+    # Payments expose the bank account and/or related document rather than a
+    # top-level CurrencyCode.  CurrencyRate is deliberately never a currency.
+    for key in ("BankAccount", "Account", "Invoice", "CreditNote", "Prepayment", "Overpayment"):
+        nested = payload.get(key)
+        if isinstance(nested, Mapping):
+            value = nested.get("CurrencyCode") or nested.get("currency") or nested.get("iso_currency_code")
+            if isinstance(value, str) and len(value.strip()) == 3:
+                return value.strip().upper()
+    return None
+
+
 def normalize_provider_record(
     provider: str,
     provider_record_id: str,
@@ -61,8 +107,14 @@ def normalize_provider_record(
     canonical = canonical_payload(payload)
     content_hash = sha256(canonical.encode("utf-8")).hexdigest()
     version_id = f"{provider}:{provider_record_id}:{content_hash[:24]}"
-    currency_value = payload.get("currency") or payload.get("iso_currency_code")
-    date_value = payload.get("accounting_date") or payload.get("date")
+    currency_value = provider_currency(payload)
+    date_value = (
+        payload.get("accounting_date")
+        or payload.get("date")
+        or payload.get("Date")
+        or payload.get("transaction_date")
+        or payload.get("TransactionDate")
+    )
     return SourceRecordVersion(
         version_id=version_id,
         provider=provider,
@@ -70,6 +122,6 @@ def normalize_provider_record(
         content_hash=content_hash,
         observed_at=observed_at(payload, fallback_observed_at),
         payload_json=canonical,
-        currency=str(currency_value) if currency_value is not None else None,
-        accounting_date=str(date_value) if date_value is not None else None,
+        currency=currency_value,
+        accounting_date=provider_accounting_date(date_value) if date_value is not None else None,
     )

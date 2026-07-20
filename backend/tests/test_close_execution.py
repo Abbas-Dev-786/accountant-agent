@@ -20,14 +20,54 @@ class CloseExecutionTests(unittest.TestCase):
     def test_reconciles_frozen_normalized_records_with_stable_ids(self):
         facts = (
             SnapshotFact("plaid:t-1:v1", "plaid", "t-1", {"transaction_id": "t-1", "account_id": "account-1", "amount": "12.50", "date": "2026-07-02", "iso_currency_code": "USD", "name": "Vendor"}, "2026-07-02", "USD"),
-            SnapshotFact("xero:x-1:v1", "xero", "x-1", {"BankTransactionID": "x-1", "Amount": "12.50", "Date": "2026-07-02", "CurrencyCode": "USD", "BankAccount": {"Code": "1000"}, "Type": "RECEIVE", "record_type": "bank_transaction"}, "2026-07-02", "USD"),
+            SnapshotFact("plaid:t-2:v1", "plaid", "t-2", {"transaction_id": "t-2", "account_id": "account-1", "amount": "-500.00", "date": "2026-07-02", "iso_currency_code": "USD", "name": "Customer"}, "2026-07-02", "USD"),
+            # Xero's wire dates are not ISO and its values are unsigned.  A
+            # SPEND is a Plaid-positive outflow; a RECEIVE is a negative
+            # inflow.  Both assertions prevent a sign-inverted cash match.
+            SnapshotFact("xero:x-1:v1", "xero", "x-1", {"BankTransactionID": "x-1", "Amount": "12.50", "Date": "/Date(1782950400000+0000)/", "CurrencyCode": "USD", "BankAccount": {"Code": "1000"}, "Type": "SPEND", "record_type": "bank_transaction"}, "2026-07-02", "USD"),
+            SnapshotFact("xero:x-2:v1", "xero", "x-2", {"BankTransactionID": "x-2", "Amount": "500.00", "Date": "/Date(1782950400000+0000)/", "CurrencyCode": "USD", "BankAccount": {"Code": "1000"}, "Type": "RECEIVE", "record_type": "bank_transaction"}, "2026-07-02", "USD"),
         )
         first = derive_close_execution(facts, configuration())
         second = derive_close_execution(facts, configuration())
-        self.assertEqual(len(first.reconciliation.matches), 1)
+        self.assertEqual(len(first.reconciliation.matches), 2)
         self.assertEqual(first.reconciliation.matches[0].match_id, second.reconciliation.matches[0].match_id)
         self.assertEqual(first.reconciliation.exceptions, ())
         self.assertEqual(first.report_control_status, "unavailable")
+
+    def test_payment_uses_bank_amount_direction_and_account_metadata(self):
+        facts = (
+            SnapshotFact("plaid:t-1:v1", "plaid", "t-1", {"transaction_id": "t-1", "account_id": "account-1", "amount": "50.00", "date": "2026-07-02", "iso_currency_code": "USD"}, "2026-07-02", "USD"),
+            SnapshotFact(
+                "xero:payment-1:v1", "xero", "payment-1",
+                {
+                    "PaymentID": "payment-1", "BankAmount": "50.00", "Amount": "49.00",
+                    "Date": "/Date(1782950400000+0000)/", "PaymentType": "ACCPAYPAYMENT",
+                    "BankAccount": {"AccountID": "account-1000"},
+                    "CurrencyRate": "1.02",
+                },
+                "2026-07-02", None,
+            ),
+            SnapshotFact(
+                "xero:account-1000:v1", "xero", "account-1000",
+                {"AccountID": "account-1000", "Code": "1000", "Name": "Checking", "CurrencyCode": "USD", "Type": "BANK", "record_type": "account"},
+                None, "USD",
+            ),
+        )
+        execution = derive_close_execution(facts, configuration())
+        self.assertEqual(len(execution.reconciliation.matches), 1)
+        self.assertEqual(execution.reconciliation.exceptions, ())
+
+    def test_manual_journal_without_account_type_preserves_cash_controls(self):
+        facts = (
+            SnapshotFact("plaid:t-1:v1", "plaid", "t-1", {"transaction_id": "t-1", "account_id": "account-1", "amount": "12.50", "date": "2026-07-02", "iso_currency_code": "USD"}, "2026-07-02", "USD"),
+            SnapshotFact("xero:x-1:v1", "xero", "x-1", {"BankTransactionID": "x-1", "Amount": "12.50", "Date": "/Date(1782950400000+0000)/", "CurrencyCode": "USD", "BankAccount": {"Code": "1000"}, "Type": "SPEND"}, "2026-07-02", "USD"),
+            SnapshotFact("xero:journal-1:v1", "xero", "journal-1", {"ManualJournalID": "journal-1", "Date": "/Date(1782950400000+0000)/", "JournalLines": [{"AccountCode": "1000", "LineAmount": "12.50"}, {"AccountCode": "2000", "LineAmount": "-12.50"}]}, "2026-07-02", "USD"),
+        )
+        execution = derive_close_execution(facts, configuration())
+        self.assertEqual(len(execution.reconciliation.matches), 1)
+        self.assertEqual(execution.reconciliation.exceptions, ())
+        self.assertEqual(execution.report_control_status, "unavailable")
+        self.assertIn("without account-type metadata", execution.report["reason"])
 
     def test_unmatched_bank_generates_only_explicit_offset_proposal(self):
         facts = (

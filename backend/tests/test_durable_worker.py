@@ -6,10 +6,13 @@ from app.domain import DeploymentConfig, SourceBatch, SourceRecordVersion
 from app.durable_worker import (
     DemoSourceSyncExecutor,
     DurableWorkflowWorker,
+    GoogleEvidenceExecutor,
     ProductionSourceSyncExecutor,
     ReconciliationMappingGateExecutor,
     TaskBlocked,
 )
+from app.close_mapping import PersistedCloseMapping
+from app.providers import ProviderReadError
 from app.supabase_db import PersistedCloseRun, PersistedConnection, PersistedTask
 
 
@@ -272,6 +275,52 @@ class DurableWorkerTests(unittest.TestCase):
                 ProductionSourceSyncExecutor(SourceStore(), deployment, env).execute(
                     PersistedTask("task-1", "run-1", "synchronize_sources", "running", 1, "worker-1", None, None)
                 )
+
+    def test_evidence_provider_failure_is_a_visible_task_blocker(self):
+        run = PersistedCloseRun(
+            "run-1", "org-1", "2026-07-01", "2026-07-31", "synchronizing", "production", "live", "snapshot-1", None
+        )
+
+        class EvidenceStore:
+            def get_close_run(self, run_id):
+                return run
+
+            def active_close_mapping(self, organization_id):
+                return PersistedCloseMapping(
+                    "mapping-1", "org-1", 1, "active",
+                    {
+                        "xero_tenant_id": "tenant-1",
+                        "bank_mappings": [{"plaid_account_id": "account-1", "xero_account_code": "1000"}],
+                        "evidence": {
+                            "drive_folder_ids": ["folder-1"], "gmail_mailbox": "close@example.test",
+                            "gmail_labels": ["CLOSE"],
+                        },
+                    },
+                    "controller",
+                )
+
+            def connection_secret_ref(self, organization_id, provider, provider_target):
+                return "secret://google/org-1/workspace/refresh-token"
+
+            def persist_evidence_batch(self, **kwargs):
+                raise AssertionError("a failed provider read must not persist a partial batch")
+
+        class FakeSecrets:
+            def resolve(self, reference):
+                return "secret-value"
+
+        with (
+            patch("app.durable_worker.secret_store_from_environment", return_value=FakeSecrets()),
+            patch("app.durable_worker.GoogleOAuthConfig.from_environment", return_value=object()),
+            patch("app.durable_worker.GoogleOAuthClient") as oauth_client,
+            patch("app.durable_worker.EvidenceCollector") as collector,
+        ):
+            collector.return_value.collect.side_effect = ProviderReadError("Gmail page failed")
+            with self.assertRaisesRegex(TaskBlocked, "Google evidence collection could not complete"):
+                GoogleEvidenceExecutor(EvidenceStore()).execute(
+                    PersistedTask("task-1", "run-1", "collect_evidence", "running", 1, "worker-1", None, None)
+                )
+        oauth_client.return_value.refresh_access_token.assert_called_once()
 
 
 if __name__ == "__main__":

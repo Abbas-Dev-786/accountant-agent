@@ -15,6 +15,9 @@ alone do not select bank accounts, ledger facts, or journal accounts.
   credential.
 - Disable or leave unused the Data API for financial schemas. If a public table
   is introduced later, use explicit grants plus organization-aware RLS.
+- Run `python -m app.production_preflight --env-file .env` from `backend/` and
+  resolve every failed check before a controller connects a provider. The
+  preflight is read-only and does not print credential material.
 
 ## 2. Provider evidence
 

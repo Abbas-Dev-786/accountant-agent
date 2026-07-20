@@ -49,14 +49,18 @@ Already implemented:
   normalized records, with Groq explanation audit, B2 compliance retention,
   Gmail recovery send handling, and exact Xero `DRAFT` journal read-back;
 - authenticated SSE event replay and live browser progress updates;
-- 153 backend tests and a successful Next.js production build.
+- read-only production readiness validation for configuration, private Supabase
+  schemas, Vault references, and Vault access revocation;
+- 156 backend tests and a successful Next.js production build.
 
-Not yet complete:
+Remaining production acceptance work (external to the codebase):
 
-- applying and validating the Supabase migrations against the selected remote
-  project;
-- managed secret-manager provisioning and real provider account evidence;
-- production provider, compliance, and operational acceptance evidence.
+- apply and validate the latest Supabase migration against the selected remote
+  project, including the Vault permission hardening migration;
+- provision the referenced credentials in Supabase Vault and supply real
+  production callback URLs and controller configuration;
+- complete controller-authorized provider onboarding, mapping approval, and
+  the provider, compliance, and operational acceptance evidence.
 
 ## Delivery rules
 
@@ -198,8 +202,7 @@ and external evidence are required before this phase can be accepted.
    current source watermarks.
 4. Wire Plaid Production Link/access-token/cursor sync and webhook verification,
    including selected-account completeness and pending-to-posted behavior.
-5. Wire Google Drive/Gmail scoped search, draft, and allowlisted send clients
-   (read clients implemented; draft/send worker wiring pending).
+5. Wire Google Drive/Gmail scoped search, draft, and allowlisted send clients.
 6. Wire B2 upload, signed retrieval, Object Lock, and content-addressed keys.
 7. Wire Groq structured output using the bounded AI context and schema; record
    model ID, latency, token metadata, and 429/failure outcomes.

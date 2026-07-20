@@ -177,8 +177,9 @@ class SupabaseRepositoryTests(unittest.TestCase):
 
     def test_vault_migration_keeps_decrypted_credentials_server_only(self):
         migration = Path(__file__).parents[1] / ".." / "supabase" / "migrations"
-        sql = next(migration.glob("*_supabase_vault_secret_store.sql")).read_text().lower()
-        self.assertIn("create extension if not exists supabase_vault with schema vault", sql)
+        extension_sql = next(migration.glob("*_supabase_vault_secret_store.sql")).read_text().lower()
+        sql = next(migration.glob("*_secure_supabase_vault_permissions.sql")).read_text().lower()
+        self.assertIn("create extension if not exists supabase_vault with schema vault", extension_sql)
         self.assertIn("revoke all on schema vault from public, anon, authenticated", sql)
         self.assertIn("revoke all on all tables in schema vault from public, anon, authenticated", sql)
         self.assertIn("revoke all on all functions in schema vault from public, anon, authenticated", sql)

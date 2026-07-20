@@ -819,10 +819,11 @@ storage region.
 ### Production implementation order
 
 The historical demo-first phase list below is superseded by the production work
-plan in `../plan/remaining-work-plan.md`. The active order is: provision US
-production providers and secrets; apply and verify private Supabase migrations;
-capture the organization's versioned mapping; complete durable
-reconciliation/report/action/artifact workers; then pass production acceptance.
+plan in `../plan/remaining-work-plan.md`. The application code now includes the
+durable reconciliation/report/action/artifact workers. The active order is:
+provision US production providers and secrets; apply and verify private
+Supabase migrations; capture the organization's versioned mapping; then pass
+production acceptance.
 
 ### Historical fixture phases
 

@@ -128,6 +128,16 @@ set -a; source .env; set +a
 .venv/bin/python -m app.worker_main
 ```
 
+Before a production controller connects providers, run the read-only preflight.
+It validates the production boundary, private Supabase schema, Vault references,
+and obsolete file-secret settings without printing a credential or making a
+provider write:
+
+```sh
+cd backend
+.venv/bin/python -m app.production_preflight --env-file .env
+```
+
 Then start the web controller at `http://localhost:3000`:
 
 ```sh
@@ -135,10 +145,9 @@ cd web
 npm run dev
 ```
 
-Configure the Supabase dashboard with `http://localhost:3000` as an allowed
-redirect URL for magic links. Configure the Xero callback URL as
-`http://localhost:8000/api/v1/connections/xero/callback` and the Google callback
-URL as `http://localhost:8000/api/v1/connections/google/callback`.
+For production, configure Supabase Auth, Xero, Google, and Plaid with the exact
+HTTPS web origin, callback URLs, and webhook URL from `backend/.env`; do not use
+the local development URLs shown in older operator notes.
 
 After a controller signs in, they connect the approved Xero tenant, complete
 Plaid Link for the selected bank accounts, and authorize the configured Google

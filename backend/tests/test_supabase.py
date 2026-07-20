@@ -155,6 +155,26 @@ class SupabaseRepositoryTests(unittest.TestCase):
         self.assertIn("review_packages_context_guard", sql)
         self.assertIn("revoke all on workflow.task_events", sql)
 
+    def test_close_mapping_migration_versions_configuration_and_binds_runs(self):
+        migration = Path(__file__).parents[1] / ".." / "supabase" / "migrations"
+        sql = next(migration.glob("*_close_mapping_and_provider_onboarding.sql")).read_text().lower()
+        self.assertIn("create table workflow.close_mappings", sql)
+        self.assertIn("close_mappings_one_active_per_organization", sql)
+        self.assertIn("add column mapping_id", sql)
+        self.assertIn("close_runs_mapping_guard", sql)
+        self.assertIn("revoke all on workflow.close_mappings", sql)
+
+    def test_durable_close_execution_migration_keeps_outputs_private_and_immutable(self):
+        migration = Path(__file__).parents[1] / ".." / "supabase" / "migrations"
+        sql = next(migration.glob("*_durable_close_execution.sql")).read_text().lower()
+        self.assertIn("create table workflow.reconciliations", sql)
+        self.assertIn("create table workflow.reconciliation_exceptions", sql)
+        self.assertIn("create table workflow.close_reports", sql)
+        self.assertIn("create table workflow.close_artifacts", sql)
+        self.assertIn("x-bz-file-retention", (Path(__file__).parents[1] / "app" / "b2.py").read_text().lower())
+        self.assertIn("immutable_reconciliations", sql)
+        self.assertIn("revoke all on workflow.reconciliations", sql)
+
     def test_workflow_store_reads_task_dependencies(self):
         connection = FakeConnection(
             [

@@ -22,17 +22,23 @@ separately isolated test fixtures:
 - a private, TLS-only Supabase Postgres workflow store for organizations,
   connections, idempotent close-run creation, and durable OAuth state;
 - a durable, leased worker with persisted task events, safe retry/cancellation,
-  atomic Xero/Plaid source snapshots, scoped Google evidence collection, and
-  frozen review-package approval records;
+  atomic Xero/Plaid source snapshots, scoped Google evidence collection,
+  persisted reconciliation/results/reports, grounded Groq explanation audit,
+  B2 compliance-retained close packages, and frozen review-package approval
+  records;
+- worker-only Gmail recovery drafts/sends and worker-only Xero manual-journal
+  `DRAFT` creation with marker recovery and exact read-back;
 - a real Next.js controller flow: Supabase magic-link sign-in, organization
-  bootstrap, Xero authorization handoff, truthful connection
-  status, idempotent close-run creation, task progress, events, retry,
-  cancellation, and review approval.
+  bootstrap, Xero authorization, Plaid Link bank consent, Google Workspace
+  OAuth, versioned accountant-approved mapping, truthful connection status,
+  idempotent close-run creation, SSE progress replay, source/evidence/reconciliation/
+  exception/report/artifact review, worker-action recovery, cancellation, and
+  review approval.
 
-Provider account evidence, the organization-specific bank-to-ledger mapping,
-artifact storage, and live acceptance remain explicitly gated. The worker
-blocks safely until those inputs are configured; it never invents financial
-mapping or silently substitutes fixtures. See [the documentation map](docs/README.md),
+Remote migration application, production credentials, and live acceptance
+remain explicitly gated. The worker blocks safely until those inputs are
+configured; it never invents financial mapping or silently substitutes
+fixtures. See [the documentation map](docs/README.md),
 [the technical design](docs/TDD.md), and the [phase-by-phase delivery plan](plan/README.md).
 
 The checked-in API, worker, browser controller, and environment template now
@@ -126,11 +132,15 @@ npm run dev
 
 Configure the Supabase dashboard with `http://localhost:3000` as an allowed
 redirect URL for magic links. Configure the Xero callback URL as
-`http://localhost:8000/api/v1/connections/xero/callback`. Provider connections
-and source/evidence work intentionally remain blocked rather than fabricated
-until their production credentials and capability evidence are available. The
-production worker also requires the approved Xero tenant and selected Plaid
-account IDs to be configured.
-Reconciliation remains blocked until an accountant supplies the organization's
-selected bank accounts, Xero ledger source, and approved account mapping; those
-choices cannot be inferred safely from credentials.
+`http://localhost:8000/api/v1/connections/xero/callback` and the Google callback
+URL as `http://localhost:8000/api/v1/connections/google/callback`.
+
+After a controller signs in, they connect the approved Xero tenant, complete
+Plaid Link for the selected bank accounts, and authorize the configured Google
+Workspace scopes. The controller then creates a versioned mapping that selects
+the Xero tenant, maps each connected Plaid account to its Xero ledger account,
+sets reconciliation tolerances, defines the evidence scope, and restricts
+journal account codes. These selections are stored with the close run and are
+never inferred from credentials. Provider work blocks with an actionable state
+until the required production credentials, connection evidence, and mapping are
+present.

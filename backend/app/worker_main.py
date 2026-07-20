@@ -12,11 +12,13 @@ from .durable_worker import (
     DemoSourceSyncExecutor,
     DurableWorkflowWorker,
     EnvironmentPreflightExecutor,
+    DurableReconciliationExecutor,
+    GmailRecoveryActionExecutor,
     GoogleEvidenceExecutor,
     ProductionPreflightExecutor,
-    ReconciliationMappingGateExecutor,
     ProductionSourceSyncExecutor,
     RegisteredTaskExecutor,
+    XeroDraftActionExecutor,
 )
 from .supabase_db import SupabaseDatabaseConfig, SupabaseWorkflowStore
 
@@ -37,10 +39,12 @@ def build_worker(worker_id: str) -> DurableWorkflowWorker:
     deployment = deployment_from_environment()
     if deployment.mode == "production":
         handlers = {
-            "preflight": ProductionPreflightExecutor(),
+            "preflight": ProductionPreflightExecutor(store),
             "synchronize_sources": ProductionSourceSyncExecutor(store, deployment),
             "collect_evidence": GoogleEvidenceExecutor(store),
-            "reconcile": ReconciliationMappingGateExecutor(),
+            "reconcile": DurableReconciliationExecutor(store),
+            "apply_approved_actions": XeroDraftActionExecutor(store),
+            "send_recovery_request": GmailRecoveryActionExecutor(store),
         }
     else:
         # Fixture execution is retained for isolated test stacks only. It is
@@ -49,7 +53,9 @@ def build_worker(worker_id: str) -> DurableWorkflowWorker:
             "preflight": EnvironmentPreflightExecutor(),
             "synchronize_sources": DemoSourceSyncExecutor(store, deployment),
             "collect_evidence": GoogleEvidenceExecutor(store),
-            "reconcile": ReconciliationMappingGateExecutor(),
+            "reconcile": DurableReconciliationExecutor(store),
+            "apply_approved_actions": XeroDraftActionExecutor(store),
+            "send_recovery_request": GmailRecoveryActionExecutor(store),
         }
     executor = RegisteredTaskExecutor(
         handlers

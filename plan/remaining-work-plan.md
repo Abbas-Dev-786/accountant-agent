@@ -27,6 +27,15 @@ Already implemented:
   records;
 - Supabase Auth magic-link browser sign-in, server-side token verification,
   organization membership checks, and idempotent close-run creation;
+- browser onboarding for the approved Xero tenant, Plaid Link-selected bank
+  accounts, and scoped Google Workspace access, with OAuth credentials and
+  Plaid access tokens retained only in the server-side secret store;
+- versioned, controller-approved organization mappings that bind Plaid accounts
+  to Xero ledger accounts, matching tolerances, evidence scope, recipient
+  policy, retention policy, and allowed journal codes to new close runs;
+- controller review views for frozen source batches, collected evidence,
+  mapping version, reconciliation matches/exceptions, reports, immutable
+  artifacts, package state, journal proposals, and worker action recovery;
 - Xero/Plaid source contracts, normalization, cursor/pagination recovery, and
   immutable snapshot rules;
 - scoped evidence and checklist evaluation;
@@ -36,22 +45,17 @@ Already implemented:
 - frozen controller approvals and Xero `DRAFT` action policy;
 - US production release gates, with India retained only as deferred boundary
   code;
-- 135 backend tests and a successful Next.js production build.
+- durable reconciliation/report/action/artifact execution over frozen
+  normalized records, with Groq explanation audit, B2 compliance retention,
+  Gmail recovery send handling, and exact Xero `DRAFT` journal read-back;
+- authenticated SSE event replay and live browser progress updates;
+- 153 backend tests and a successful Next.js production build.
 
 Not yet complete:
 
 - applying and validating the Supabase migrations against the selected remote
   project;
 - managed secret-manager provisioning and real provider account evidence;
-- replacing the current demo-default bootstrap and source adapters with the
-  production-only organization onboarding and source configuration;
-- the organization-specific selected bank accounts, ledger source, tolerances,
-  and account mappings required to turn provider records into reconciliation
-  facts safely;
-- durable reconciliation/report/action/artifact execution on the frozen
-  mapping, including B2 Object Lock and Xero draft read-back;
-- SSE streaming/replay and the detailed browser screens for source evidence,
-  reconciliation, reports, and action recovery;
 - production provider, compliance, and operational acceptance evidence.
 
 ## Delivery rules
@@ -268,13 +272,11 @@ direct provider writes or secret exposure.
 
 ### Work items
 
-1. Add authenticated organization and connection onboarding endpoints.
-2. Add close-run creation, status, progress, snapshot, evidence, checklist,
-   reconciliation, reports, exception, and package endpoints.
-3. Add approval/request-change endpoints referencing frozen package hashes.
-4. Keep Xero/Gmail external actions worker-only; do not add browser-callable
-   provider action routes.
-5. Replace the static web shell with screens for:
+1. Authenticated organization, connection, close-run, review, reconciliation,
+   report, exception-resolution, and recovery-queue endpoints are implemented.
+2. Frozen-package approval binds all worker-owned provider actions to the
+   approved package hash; no browser route can call Gmail or Xero directly.
+3. The browser provides screens for:
    - connection health and remediation;
    - synchronization progress and watermarks;
    - evidence inventory and missing-document checklist;
@@ -282,8 +284,9 @@ direct provider writes or secret exposure.
    - reports and journal proposals;
    - AI explanations with citations/uncertainty;
    - package review, approval, action status, and recovery.
-6. Add SSE event replay, loading/error/blocked states, and accessible keyboard
-   navigation.
+4. Authenticated SSE replays from the durable event cursor and drives the live
+   progress UI. Accessibility and production browser acceptance remain part of
+   operational sign-off.
 
 ### Exit criterion
 

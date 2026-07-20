@@ -7,15 +7,18 @@ network calls.
 
 from __future__ import annotations
 
+import base64
 import json
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from decimal import Decimal
 from hashlib import sha256
 from typing import Callable, Mapping, Protocol, Sequence
 from urllib.parse import urlencode, urljoin
 from urllib.request import Request, urlopen
 
-from .evidence import DriveEvidenceClient, DriveSearchResult, EvidenceScope, GmailEvidenceClient, GmailSearchResult
+from .actions import XeroDraftRecord, XeroDraftRequest
+from .evidence import DriveEvidenceClient, DriveSearchResult, EvidenceScope, GmailDraft, GmailEvidenceClient, GmailSearchResult, GmailSendResult
 from .providers import PlaidSandboxClient, PlaidSyncPage, ProviderReadError, XeroDemoClient, XeroPage
 from .scenario import XeroBaselineObservation
 from .xero_oauth import XeroOAuthClient
@@ -145,6 +148,82 @@ class XeroProductionHttpClient(XeroDemoHttpClient):
     def get_page(self, page: int) -> XeroPage:
         source_page = super().get_page(page)
         return replace(source_page, provider_environment="production")
+
+
+@dataclass
+class XeroDraftHttpClient:
+    """The sole Xero write client: create and verify a manual journal in DRAFT."""
+
+    tenant_id: str
+    access_token_secret_ref: str
+    secret_resolver: SecretResolver
+    transport: JsonTransport
+    oauth_client: XeroOAuthClient | None = None
+    base_url: str = "https://api.xero.com"
+
+    def _token(self) -> str:
+        return self.oauth_client.access_token() if self.oauth_client else self.secret_resolver.resolve(self.access_token_secret_ref)
+
+    def _request(self, method: str, path: str, payload: Mapping[str, object] | None = None) -> Mapping[str, object]:
+        response = self.transport.request(
+            method,
+            urljoin(self.base_url.rstrip("/") + "/", path.lstrip("/")),
+            {"Authorization": f"Bearer {self._token()}", "Xero-tenant-id": self.tenant_id},
+            payload,
+        )
+        if response.status_code >= 400:
+            raise ProviderReadError(f"Xero manual journal request failed with HTTP {response.status_code}")
+        return response.body
+
+    @staticmethod
+    def _record(value: Mapping[str, object]) -> XeroDraftRecord:
+        journal_id = value.get("ManualJournalID") or value.get("JournalID")
+        status = value.get("Status")
+        narration = value.get("Narration")
+        journal_date = value.get("Date")
+        lines = value.get("JournalLines")
+        if not all(isinstance(item, str) and item for item in (journal_id, status, narration, journal_date)) or not isinstance(lines, list):
+            raise ProviderReadError("Xero manual journal read-back is incomplete")
+        normalized_lines: list[tuple[str, str, str, tuple[str, ...]]] = []
+        for line in lines:
+            if not isinstance(line, Mapping) or not isinstance(line.get("AccountCode"), str):
+                raise ProviderReadError("Xero manual journal read-back has an invalid line")
+            amount = _decimal_for_draft(line.get("LineAmount"))
+            normalized_lines.append((str(line["AccountCode"]), str(amount if amount > 0 else 0), str(-amount if amount < 0 else 0), ()))
+        return XeroDraftRecord(str(journal_id), str(status), str(narration), str(journal_date)[:10], tuple(normalized_lines), "")
+
+    def search_manual_journals(self, marker: str):
+        # Marker is generated server-side and is included in the narration.
+        where = f'Contains(Narration,"{marker}")'
+        body = self._request("GET", f"/api.xro/2.0/ManualJournals?{urlencode({'where': where})}")
+        return tuple(self._record(item) for item in _records(body, "ManualJournals"))
+
+    def create_draft_manual_journal(self, request: XeroDraftRequest) -> XeroDraftRecord:
+        lines = []
+        for account_code, debit, credit, _ in request.lines:
+            lines.append({"AccountCode": account_code, "LineAmount": debit if Decimal(debit) > 0 else f"-{credit}"})
+        body = self._request(
+            "POST", "/api.xro/2.0/ManualJournals",
+            {"ManualJournals": [{"Narration": request.narration, "Date": request.journal_date,
+                                  "Status": "DRAFT", "LineAmountTypes": "NoTax", "JournalLines": lines}]},
+        )
+        records = _records(body, "ManualJournals")
+        if len(records) != 1:
+            raise ProviderReadError("Xero did not return exactly one draft journal")
+        return self._record(records[0])
+
+    def get_manual_journal(self, journal_id: str) -> XeroDraftRecord:
+        records = _records(self._request("GET", f"/api.xro/2.0/ManualJournals/{journal_id}"), "ManualJournals")
+        if len(records) != 1:
+            raise ProviderReadError("Xero draft journal read-back is ambiguous")
+        return self._record(records[0])
+
+
+def _decimal_for_draft(value: object) -> Decimal:
+    try:
+        return Decimal(str(value))
+    except Exception as exc:
+        raise ProviderReadError("Xero manual journal line amount is invalid") from exc
 
 
 @dataclass
@@ -334,3 +413,49 @@ class GmailHttpClient(GmailEvidenceClient):
                 )
             )
         return results
+
+    def _token(self) -> str:
+        return self.secret_resolver.resolve(self.access_token_secret_ref)
+
+    def create_request_draft(self, recipient: str, subject: str, body: str, marker: str) -> GmailDraft:
+        if not recipient or not subject or not marker:
+            raise ProviderReadError("Gmail recovery draft parameters are incomplete")
+        raw = (
+            f"To: {recipient}\r\nSubject: {subject}\r\nMIME-Version: 1.0\r\n"
+            "Content-Type: text/plain; charset=UTF-8\r\n\r\n"
+            f"{body}\n\nReference: {marker}\n"
+        ).encode()
+        encoded = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+        response = self.transport.request(
+            "POST", urljoin(self.base_url, "me/drafts"),
+            {"Authorization": f"Bearer {self._token()}"}, {"message": {"raw": encoded}},
+        )
+        draft_id = response.body.get("id")
+        if response.status_code >= 400 or not isinstance(draft_id, str) or not draft_id:
+            raise ProviderReadError("Gmail recovery draft could not be created")
+        return GmailDraft(draft_id, marker)
+
+    def send_approved_request(self, draft_id: str) -> GmailSendResult:
+        response = self.transport.request(
+            "POST", urljoin(self.base_url, "me/drafts/send"), {"Authorization": f"Bearer {self._token()}"}, {"id": draft_id},
+        )
+        message_id, thread_id = response.body.get("id"), response.body.get("threadId")
+        if response.status_code >= 400 or not isinstance(message_id, str) or not isinstance(thread_id, str):
+            raise ProviderReadError("Gmail recovery draft could not be sent")
+        return GmailSendResult(message_id, thread_id)
+
+    def search_sent_by_marker(self, marker: str) -> Sequence[GmailSendResult] | None:
+        response = self.transport.request(
+            "GET", urljoin(self.base_url, "me/messages") + "?" + urlencode({"q": f'in:sent "{marker}"'}),
+            {"Authorization": f"Bearer {self._token()}"},
+        )
+        if response.status_code >= 500:
+            return None
+        if response.status_code >= 400:
+            raise ProviderReadError("Gmail sent-mail recovery search failed")
+        messages = _records(response.body, "messages")
+        return tuple(
+            GmailSendResult(str(item["id"]), str(item.get("threadId", "")))
+            for item in messages
+            if isinstance(item.get("id"), str)
+        )

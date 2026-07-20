@@ -42,6 +42,77 @@ type CloseEvent = {
   created_at: string;
 };
 type Workspace = { id: string; email: string | null; organizations: Organization[] };
+type CloseMapping = {
+  id: string;
+  organization_id: string;
+  version: number;
+  status: string;
+  configuration: {
+    xero_tenant_id: string;
+    bank_mappings: { plaid_account_id: string; xero_account_code: string; xero_account_name: string }[];
+    matching_rules: {
+      date_window_days: number;
+      fee_tolerance: string;
+      materiality_threshold: string;
+      pending_policy: "exclude" | "exception";
+      max_aggregate_size: number;
+    };
+    permitted_journal_account_codes: string[];
+    journal_adjustment_account_code?: string | null;
+    evidence: {
+      drive_folder_ids: string[];
+      gmail_mailbox: string;
+      gmail_labels: string[];
+      allowed_recipients: string[];
+      retention_policy_version: string;
+    };
+  };
+  approved_by_subject: string;
+  created_at: string | null;
+};
+type ReviewData = {
+  run_id: string;
+  snapshot_id: string | null;
+  mapping: CloseMapping | null;
+  source_batches: { provider: string; environment: string; watermark: string; completed_at: string | null; complete: boolean; warnings: string[] }[];
+  evidence_items: { id: string; provider: string; source_id: string; observed_at: string | null; kind: string; scope_reference: string; tags: string[] }[];
+  review_package: { id: string; package_hash: string; status: string; summary: Record<string, unknown>; frozen_at: string | null } | null;
+  journal_proposals: { id: string; date: string; narration: string; proposal_hash: string; status: string; lines: { account_code: string; debit: string; credit: string; evidence_ids: string[] }[] }[];
+  reconciliation_matches: { id: string; kind: string; amount: string; currency: string; bank_transaction_ids: string[]; ledger_transaction_ids: string[]; evidence_ids: string[] }[];
+  reconciliation_exceptions: { id: string; control_code: string; source_transaction_ids: string[]; evidence_ids: string[]; amount: string; currency: string; remediation: string; status: string; explanation: { cause: string; recommendation: string; evidence_ids: string[]; confidence_label: string; uncertainties: string[] } | null; explanation_status: string; resolution_comment: string | null; resolved_at: string | null }[];
+  report: { data: Record<string, unknown>; hash: string; control_status: string; created_at: string | null } | null;
+  artifacts: { id: string; type: string; object_key: string; content_hash: string; retention_mode: string; retain_until: string; status: string; provider_file_id: string | null }[];
+  actions: { id: string; provider: string; operation: string; status: string; marker: string; provider_object_id: string | null; completed_at: string | null }[];
+};
+type MappingForm = {
+  xeroTenantId: string;
+  bankAccounts: Record<string, { xeroAccountCode: string; xeroAccountName: string }>;
+  dateWindowDays: string;
+  feeTolerance: string;
+  materialityThreshold: string;
+  pendingPolicy: "exclude" | "exception";
+  maxAggregateSize: string;
+  journalCodes: string;
+  journalAdjustmentCode: string;
+  driveFolderIds: string;
+  gmailMailbox: string;
+  gmailLabels: string;
+  allowedRecipients: string;
+  retentionPolicyVersion: string;
+};
+
+type PlaidHandler = { open: () => void };
+type PlaidFactory = {
+  create: (configuration: {
+    token: string;
+    onSuccess: (publicToken: string, metadata: { accounts?: { id?: string; account_id?: string }[] }) => void;
+    onExit: (error: { display_message?: string } | null) => void;
+  }) => PlaidHandler;
+};
+
+declare global {
+  interface Window { Plaid?: PlaidFactory }
+}
 
 const providerCards = [
   { provider: "xero", name: "Xero Production", detail: "Approved tenant, read-only source, DRAFT-only journals" },
@@ -89,6 +160,37 @@ function closePeriodTitle(periodEnd: string): string {
   return new Intl.DateTimeFormat("en-US", { month: "long", year: "numeric", timeZone: "UTC" }).format(timestamp);
 }
 
+function csv(value: string): string[] {
+  return value.split(",").map((item) => item.trim()).filter(Boolean);
+}
+
+function blankMappingForm(): MappingForm {
+  return {
+    xeroTenantId: "", bankAccounts: {}, dateWindowDays: "3", feeTolerance: "0", materialityThreshold: "0",
+    pendingPolicy: "exception", maxAggregateSize: "10", journalCodes: "", journalAdjustmentCode: "", driveFolderIds: "", gmailMailbox: "",
+    gmailLabels: "", allowedRecipients: "", retentionPolicyVersion: "v1",
+  };
+}
+
+function loadPlaidLink(): Promise<PlaidFactory> {
+  if (window.Plaid) return Promise.resolve(window.Plaid);
+  return new Promise((resolve, reject) => {
+    const existing = document.querySelector<HTMLScriptElement>('script[data-accountingos-plaid-link="true"]');
+    if (existing) {
+      existing.addEventListener("load", () => window.Plaid ? resolve(window.Plaid) : reject(new Error("Plaid Link did not load")), { once: true });
+      existing.addEventListener("error", () => reject(new Error("Plaid Link could not load")), { once: true });
+      return;
+    }
+    const script = document.createElement("script");
+    script.src = "https://cdn.plaid.com/link/v2/stable/link-initialize.js";
+    script.async = true;
+    script.dataset.accountingosPlaidLink = "true";
+    script.onload = () => window.Plaid ? resolve(window.Plaid) : reject(new Error("Plaid Link did not load"));
+    script.onerror = () => reject(new Error("Plaid Link could not load"));
+    document.head.appendChild(script);
+  });
+}
+
 export default function Home() {
   const [session, setSession] = useState<Session | null>(null);
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
@@ -97,6 +199,11 @@ export default function Home() {
   const [run, setRun] = useState<CloseRun | null>(null);
   const [tasks, setTasks] = useState<CloseTask[]>([]);
   const [events, setEvents] = useState<CloseEvent[]>([]);
+  const [mapping, setMapping] = useState<CloseMapping | null>(null);
+  const [review, setReview] = useState<ReviewData | null>(null);
+  const [mappingForm, setMappingForm] = useState<MappingForm>(blankMappingForm);
+  const [exceptionNotes, setExceptionNotes] = useState<Record<string, string>>({});
+  const [recoveryRecipient, setRecoveryRecipient] = useState("");
   const [email, setEmail] = useState("");
   const [organizationName, setOrganizationName] = useState("");
   const [organizationSlug, setOrganizationSlug] = useState("");
@@ -122,6 +229,38 @@ export default function Home() {
     setConnections(nextConnections);
   }
 
+  async function loadMapping(token: string, nextOrganizationId: string) {
+    if (!nextOrganizationId) {
+      setMapping(null);
+      return;
+    }
+    const nextMapping = await api<CloseMapping | null>(
+      `/api/v1/organizations/${encodeURIComponent(nextOrganizationId)}/close-mapping`, token,
+    );
+    setMapping(nextMapping);
+    if (nextMapping) {
+      const config = nextMapping.configuration;
+      setMappingForm({
+        xeroTenantId: config.xero_tenant_id,
+        bankAccounts: Object.fromEntries(config.bank_mappings.map((item) => [item.plaid_account_id, {
+          xeroAccountCode: item.xero_account_code, xeroAccountName: item.xero_account_name,
+        }])),
+        dateWindowDays: String(config.matching_rules.date_window_days),
+        feeTolerance: config.matching_rules.fee_tolerance,
+        materialityThreshold: config.matching_rules.materiality_threshold,
+        pendingPolicy: config.matching_rules.pending_policy,
+        maxAggregateSize: String(config.matching_rules.max_aggregate_size),
+        journalCodes: config.permitted_journal_account_codes.join(", "),
+        journalAdjustmentCode: config.journal_adjustment_account_code || "",
+        driveFolderIds: config.evidence.drive_folder_ids.join(", "),
+        gmailMailbox: config.evidence.gmail_mailbox,
+        gmailLabels: config.evidence.gmail_labels.join(", "),
+        allowedRecipients: config.evidence.allowed_recipients.join(", "),
+        retentionPolicyVersion: config.evidence.retention_policy_version,
+      });
+    }
+  }
+
   async function loadWorkspace(nextSession: Session) {
     const nextWorkspace = await api<Workspace>("/api/v1/me", nextSession.access_token);
     setWorkspace(nextWorkspace);
@@ -130,18 +269,20 @@ export default function Home() {
       nextWorkspace.organizations[0]?.id ||
       "";
     setOrganizationId(nextOrganizationId);
-    await loadConnections(nextSession.access_token, nextOrganizationId);
+    await Promise.all([loadConnections(nextSession.access_token, nextOrganizationId), loadMapping(nextSession.access_token, nextOrganizationId)]);
   }
 
   async function loadRunDetails(token: string, runId: string) {
-    const [nextRun, nextTasks, nextEvents] = await Promise.all([
+    const [nextRun, nextTasks, nextEvents, nextReview] = await Promise.all([
       api<CloseRun>(`/api/v1/close-runs/${encodeURIComponent(runId)}`, token),
       api<CloseTask[]>(`/api/v1/close-runs/${encodeURIComponent(runId)}/tasks`, token),
       api<CloseEvent[]>(`/api/v1/close-runs/${encodeURIComponent(runId)}/events`, token),
+      api<ReviewData>(`/api/v1/close-runs/${encodeURIComponent(runId)}/review`, token),
     ]);
     setRun(nextRun);
     setTasks(nextTasks);
     setEvents(nextEvents);
+    setReview(nextReview);
   }
 
   useEffect(() => {
@@ -167,6 +308,8 @@ export default function Home() {
         setRun(null);
         setTasks([]);
         setEvents([]);
+        setMapping(null);
+        setReview(null);
         return;
       }
       void loadWorkspace(nextSession).catch((loadError: unknown) => {
@@ -184,18 +327,54 @@ export default function Home() {
 
   useEffect(() => {
     if (!session || !organizationId) return;
-    void loadConnections(session.access_token, organizationId).catch((loadError: unknown) => {
+    setRun(null);
+    setReview(null);
+    void Promise.all([loadConnections(session.access_token, organizationId), loadMapping(session.access_token, organizationId)]).catch((loadError: unknown) => {
       setError(loadError instanceof Error ? loadError.message : "Could not load connections");
     });
   }, [organizationId, session]);
 
   useEffect(() => {
-    if (!session || !run || ["approved", "cancelled", "failed"].includes(run.status)) return;
-    const timer = window.setInterval(() => {
-      void loadRunDetails(session.access_token, run.id).catch(() => undefined);
-    }, 10_000);
-    return () => window.clearInterval(timer);
-  }, [run, session]);
+    if (!session || !run?.id) return;
+    const runId = run.id;
+    const accessToken = session.access_token;
+    const controller = new AbortController();
+    let active = true;
+    async function followProgress() {
+      try {
+        const after = events.length ? events[events.length - 1].id : 0;
+        const response = await fetch(`${apiBaseUrl}/api/v1/close-runs/${encodeURIComponent(runId)}/events/stream?after=${after}`, {
+          headers: { Authorization: `Bearer ${accessToken}` }, signal: controller.signal, cache: "no-store",
+        });
+        if (!response.ok || !response.body) throw new Error(`Live progress unavailable (${response.status})`);
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        while (active) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          buffer += decoder.decode(chunk.value, { stream: true });
+          const frames = buffer.split("\n\n");
+          buffer = frames.pop() || "";
+          for (const frame of frames) {
+            const data = frame.split("\n").find((line) => line.startsWith("data: "))?.slice(6);
+            if (!data) continue;
+            const event = JSON.parse(data) as CloseEvent;
+            setEvents((current) => current.some((item) => item.id === event.id) ? current : [...current, event]);
+            void loadRunDetails(accessToken, runId).catch(() => undefined);
+          }
+        }
+      } catch (streamError) {
+        if (active && !(streamError instanceof DOMException && streamError.name === "AbortError")) {
+          setError(streamError instanceof Error ? streamError.message : "Live progress stream disconnected");
+        }
+      }
+    }
+    void followProgress();
+    return () => { active = false; controller.abort(); };
+    // Events are replayed with their durable cursor; reconnect only when the run changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [run?.id, session?.access_token]);
 
   async function sendMagicLink(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -274,6 +453,123 @@ export default function Home() {
     }
   }
 
+  async function connectGoogle() {
+    if (!session || !selectedOrganization) return;
+    setBusy(true);
+    setError("");
+    try {
+      const authorization = await api<{ authorization_url: string }>(
+        `/api/v1/organizations/${encodeURIComponent(selectedOrganization.id)}/connections/google/authorize`,
+        session.access_token,
+      );
+      window.location.assign(authorization.authorization_url);
+    } catch (connectionError) {
+      setError(connectionError instanceof Error ? connectionError.message : "Could not start Google authorization");
+      setBusy(false);
+    }
+  }
+
+  async function connectPlaid() {
+    if (!session || !selectedOrganization) return;
+    setBusy(true);
+    setError("");
+    setMessage("");
+    try {
+      const [{ link_token }, Plaid] = await Promise.all([
+        api<{ link_token: string }>(
+          `/api/v1/organizations/${encodeURIComponent(selectedOrganization.id)}/connections/plaid/link-token`, session.access_token,
+        ),
+        loadPlaidLink(),
+      ]);
+      setBusy(false);
+      Plaid.create({
+        token: link_token,
+        onSuccess: (publicToken, metadata) => {
+          const selectedAccountIds = (metadata.accounts || [])
+            .map((account) => account.id || account.account_id || "").filter(Boolean);
+          void (async () => {
+            setBusy(true);
+            try {
+              await api<Connection[]>(
+                `/api/v1/organizations/${encodeURIComponent(selectedOrganization.id)}/connections/plaid/exchange`, session.access_token,
+                { method: "POST", body: JSON.stringify({ public_token: publicToken, selected_account_ids: selectedAccountIds }) },
+              );
+              await loadConnections(session.access_token, selectedOrganization.id);
+              setMessage("Selected production bank accounts are connected. Map each one to its Xero ledger account before a close run.");
+            } catch (exchangeError) {
+              setError(exchangeError instanceof Error ? exchangeError.message : "Could not complete the Plaid connection");
+            } finally {
+              setBusy(false);
+            }
+          })();
+        },
+        onExit: (exitError) => {
+          if (exitError?.display_message) setError(exitError.display_message);
+        },
+      }).open();
+    } catch (connectionError) {
+      setError(connectionError instanceof Error ? connectionError.message : "Could not start Plaid Link");
+      setBusy(false);
+    }
+  }
+
+  function updateBankMapping(accountId: string, field: "xeroAccountCode" | "xeroAccountName", value: string) {
+    setMappingForm((current) => {
+      const existing = current.bankAccounts[accountId] || { xeroAccountCode: "", xeroAccountName: "" };
+      return {
+        ...current,
+        bankAccounts: { ...current.bankAccounts, [accountId]: { ...existing, [field]: value } },
+      };
+    });
+  }
+
+  async function saveMapping(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!session || !selectedOrganization) return;
+    const plaidAccounts = connections.filter((connection) => connection.provider === "plaid" && connection.status === "healthy");
+    setBusy(true);
+    setError("");
+    setMessage("");
+    try {
+      const saved = await api<CloseMapping>(
+        `/api/v1/organizations/${encodeURIComponent(selectedOrganization.id)}/close-mapping`, session.access_token,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            xero_tenant_id: mappingForm.xeroTenantId,
+            bank_mappings: plaidAccounts.map((account) => ({
+              plaid_account_id: account.provider_tenant_or_account_id,
+              xero_account_code: mappingForm.bankAccounts[account.provider_tenant_or_account_id]?.xeroAccountCode || "",
+              xero_account_name: mappingForm.bankAccounts[account.provider_tenant_or_account_id]?.xeroAccountName || "",
+            })),
+            matching_rules: {
+              date_window_days: Number(mappingForm.dateWindowDays),
+              fee_tolerance: mappingForm.feeTolerance,
+              materiality_threshold: mappingForm.materialityThreshold,
+              pending_policy: mappingForm.pendingPolicy,
+              max_aggregate_size: Number(mappingForm.maxAggregateSize),
+            },
+            permitted_journal_account_codes: csv(mappingForm.journalCodes),
+            journal_adjustment_account_code: mappingForm.journalAdjustmentCode.trim() || null,
+            evidence: {
+              drive_folder_ids: csv(mappingForm.driveFolderIds),
+              gmail_mailbox: mappingForm.gmailMailbox,
+              gmail_labels: csv(mappingForm.gmailLabels),
+              allowed_recipients: csv(mappingForm.allowedRecipients),
+              retention_policy_version: mappingForm.retentionPolicyVersion,
+            },
+          }),
+        },
+      );
+      setMapping(saved);
+      setMessage(`Close mapping version ${saved.version} is approved for the next close run.`);
+    } catch (mappingError) {
+      setError(mappingError instanceof Error ? mappingError.message : "Could not save the close mapping");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function signOut() {
     const client = supabaseBrowserClient();
     if (!client) return;
@@ -295,24 +591,6 @@ export default function Home() {
     }
   }
 
-  async function freezeReviewPackage() {
-    if (!session || !run) return;
-    setBusy(true);
-    setError("");
-    try {
-      await api<{ package_hash: string }>(`/api/v1/close-runs/${run.id}/prepare-review`, session.access_token, {
-        method: "POST",
-        body: JSON.stringify([]),
-      });
-      await loadRunDetails(session.access_token, run.id);
-      setMessage("The evidence-bound review package is frozen and ready for controller approval.");
-    } catch (packageError) {
-      setError(packageError instanceof Error ? packageError.message : "Could not freeze the review package");
-    } finally {
-      setBusy(false);
-    }
-  }
-
   async function approvePackage() {
     if (!session || !run?.package_hash) return;
     setBusy(true);
@@ -329,6 +607,44 @@ export default function Home() {
     } finally {
       setBusy(false);
     }
+  }
+
+  async function resolveException(exceptionId: string, status: "resolved" | "ignored") {
+    if (!session || !run) return;
+    const comment = (exceptionNotes[exceptionId] || "").trim();
+    if (comment.length < 3) {
+      setError("Add a brief resolution note before closing an exception.");
+      return;
+    }
+    setBusy(true); setError("");
+    try {
+      await api(`/api/v1/close-runs/${run.id}/exceptions/${encodeURIComponent(exceptionId)}/resolve`, session.access_token, {
+        method: "POST", body: JSON.stringify({ status, comment }),
+      });
+      await loadRunDetails(session.access_token, run.id);
+      setMessage(`Exception ${status}. The decision and note are now in the durable close record.`);
+    } catch (actionError) {
+      setError(actionError instanceof Error ? actionError.message : "Could not resolve the exception");
+    } finally { setBusy(false); }
+  }
+
+  async function requestRecoveryEmail(exceptionId: string) {
+    if (!session || !run) return;
+    const recipient = recoveryRecipient || mapping?.configuration.evidence.allowed_recipients[0] || "";
+    if (!recipient) {
+      setError("Enter an allowlisted recovery recipient.");
+      return;
+    }
+    setBusy(true); setError("");
+    try {
+      await api(`/api/v1/close-runs/${run.id}/exceptions/${encodeURIComponent(exceptionId)}/recovery-email`, session.access_token, {
+        method: "POST", body: JSON.stringify({ recipient }),
+      });
+      await loadRunDetails(session.access_token, run.id);
+      setMessage("Approved recovery email queued. The worker will create, send, and reconcile it.");
+    } catch (actionError) {
+      setError(actionError instanceof Error ? actionError.message : "Could not queue recovery email");
+    } finally { setBusy(false); }
   }
 
   if (!supabaseBrowserIsConfigured()) {
@@ -394,7 +710,7 @@ export default function Home() {
         {selectedOrganization && <div className="close-setup">
           <label>Period start<input type="date" value={period.start} onChange={(event) => setPeriod({ ...period, start: event.target.value })} /></label>
           <label>Period end<input type="date" value={period.end} onChange={(event) => setPeriod({ ...period, end: event.target.value })} /></label>
-          <button onClick={createRun} disabled={busy || period.end < period.start}>{busy ? "Working…" : "Prepare close package"}</button>
+          <button onClick={createRun} disabled={busy || !mapping || period.end < period.start}>{busy ? "Working…" : "Prepare close package"}</button>
         </div>}
       </header>
 
@@ -439,9 +755,11 @@ export default function Home() {
                   );
                 })}
               </ul>
-              <button className="secondary" onClick={connectXero} disabled={busy || !selectedOrganization || selectedOrganization.role === "viewer"}>
-                Connect approved Xero tenant
-              </button>
+              <div className="connection-actions">
+                <button className="secondary" onClick={connectXero} disabled={busy || !selectedOrganization || selectedOrganization.role === "viewer"}>Connect Xero tenant</button>
+                <button className="secondary" onClick={connectPlaid} disabled={busy || !selectedOrganization || selectedOrganization.role === "viewer"}>Connect bank with Plaid</button>
+                <button className="secondary" onClick={connectGoogle} disabled={busy || !selectedOrganization || selectedOrganization.role === "viewer"}>Connect Google Workspace</button>
+              </div>
             </article>
 
             <article className="card progress">
@@ -454,7 +772,6 @@ export default function Home() {
               {run && <div className="run-actions">
                 {run.status === "blocked" && <button className="secondary" onClick={() => changeRun("retry")} disabled={busy}>Retry blocked work</button>}
                 {["synchronizing", "running", "blocked"].includes(run.status) && <button className="secondary" onClick={() => changeRun("cancel")} disabled={busy}>Cancel run</button>}
-                {run.status === "running" && selectedOrganization?.role !== "viewer" && <button className="secondary" onClick={freezeReviewPackage} disabled={busy}>Freeze review package</button>}
                 {run.status === "awaiting_approval" && selectedOrganization?.role === "controller" && <button className="secondary" onClick={approvePackage} disabled={busy}>Approve frozen package</button>}
               </div>}
             </article>
@@ -464,6 +781,56 @@ export default function Home() {
               <h2>Bounded by design</h2>
               <p>Only a controller may approve a frozen package. The sole accounting write is a balanced Xero manual journal in <strong>DRAFT</strong> status.</p>
               <div className="forbidden">Posting, payments, deletion, and period locking are unavailable.</div>
+            </article>
+
+            <article className="card mapping">
+              <p className="eyebrow">ACCOUNTANT-APPROVED CONFIGURATION</p>
+              <h2>Bank-to-ledger mapping</h2>
+              <p className="card-copy">This versioned configuration is required before a close run. It binds selected Plaid accounts to Xero ledger accounts, matching rules, evidence scope, and permitted journal codes.</p>
+              {selectedOrganization?.role === "controller" ? (
+                <form className="mapping-form" onSubmit={saveMapping}>
+                  <label>Xero tenant
+                    <select value={mappingForm.xeroTenantId} onChange={(event) => setMappingForm({ ...mappingForm, xeroTenantId: event.target.value })} required>
+                      <option value="">Choose connected tenant</option>
+                      {connections.filter((connection) => connection.provider === "xero" && connection.status === "healthy").map((connection) => (
+                        <option key={connection.id} value={connection.provider_tenant_or_account_id}>{connection.provider_tenant_or_account_id}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <div className="mapping-accounts">
+                    <p>Selected Plaid accounts</p>
+                    {connections.filter((connection) => connection.provider === "plaid" && connection.status === "healthy").map((connection) => {
+                      const accountId = connection.provider_tenant_or_account_id;
+                      const values = mappingForm.bankAccounts[accountId] || { xeroAccountCode: "", xeroAccountName: "" };
+                      return <div className="account-map" key={connection.id}>
+                        <code>{accountId}</code>
+                        <label>Xero account code<input value={values.xeroAccountCode} onChange={(event) => updateBankMapping(accountId, "xeroAccountCode", event.target.value)} required /></label>
+                        <label>Xero account name<input value={values.xeroAccountName} onChange={(event) => updateBankMapping(accountId, "xeroAccountName", event.target.value)} required /></label>
+                      </div>;
+                    })}
+                    {!connections.some((connection) => connection.provider === "plaid" && connection.status === "healthy") && <p className="empty-state">Connect one or more selected Plaid accounts to create this mapping.</p>}
+                  </div>
+                  <div className="form-columns">
+                    <label>Date window (days)<input type="number" min="0" max="60" value={mappingForm.dateWindowDays} onChange={(event) => setMappingForm({ ...mappingForm, dateWindowDays: event.target.value })} required /></label>
+                    <label>Fee tolerance<input inputMode="decimal" value={mappingForm.feeTolerance} onChange={(event) => setMappingForm({ ...mappingForm, feeTolerance: event.target.value })} required /></label>
+                    <label>Materiality threshold<input inputMode="decimal" value={mappingForm.materialityThreshold} onChange={(event) => setMappingForm({ ...mappingForm, materialityThreshold: event.target.value })} required /></label>
+                    <label>Pending policy<select value={mappingForm.pendingPolicy} onChange={(event) => setMappingForm({ ...mappingForm, pendingPolicy: event.target.value as "exclude" | "exception" })}><option value="exception">Keep as exception</option><option value="exclude">Exclude by policy</option></select></label>
+                    <label>Maximum aggregate size<input type="number" min="1" max="100" value={mappingForm.maxAggregateSize} onChange={(event) => setMappingForm({ ...mappingForm, maxAggregateSize: event.target.value })} required /></label>
+                    <label>Permitted journal codes<input value={mappingForm.journalCodes} onChange={(event) => setMappingForm({ ...mappingForm, journalCodes: event.target.value })} placeholder="1000, 2000" required /></label>
+                    <label>Adjustment offset code<input value={mappingForm.journalAdjustmentCode} onChange={(event) => setMappingForm({ ...mappingForm, journalAdjustmentCode: event.target.value })} placeholder="Optional; must be permitted" /></label>
+                  </div>
+                  <div className="form-columns evidence-fields">
+                    <label>Drive folder IDs<input value={mappingForm.driveFolderIds} onChange={(event) => setMappingForm({ ...mappingForm, driveFolderIds: event.target.value })} placeholder="folder-id, folder-id" required /></label>
+                    <label>Gmail mailbox<input type="email" value={mappingForm.gmailMailbox} onChange={(event) => setMappingForm({ ...mappingForm, gmailMailbox: event.target.value })} placeholder="close@example.com" required /></label>
+                    <label>Gmail labels<input value={mappingForm.gmailLabels} onChange={(event) => setMappingForm({ ...mappingForm, gmailLabels: event.target.value })} placeholder="MONTH_END" required /></label>
+                    <label>Allowed recipients<input value={mappingForm.allowedRecipients} onChange={(event) => setMappingForm({ ...mappingForm, allowedRecipients: event.target.value })} placeholder="controller@example.com" required /></label>
+                    <label>Retention policy version<input value={mappingForm.retentionPolicyVersion} onChange={(event) => setMappingForm({ ...mappingForm, retentionPolicyVersion: event.target.value })} required /></label>
+                  </div>
+                  <button type="submit" disabled={busy || !connections.some((connection) => connection.provider === "xero" && connection.status === "healthy") || !connections.some((connection) => connection.provider === "plaid" && connection.status === "healthy")}>{mapping ? `Save new version (current v${mapping.version})` : "Approve close mapping"}</button>
+                </form>
+              ) : (
+                <p className="empty-state">Only a controller can create a new mapping version.</p>
+              )}
             </article>
 
             {run && <article className="card timeline">
@@ -479,6 +846,40 @@ export default function Home() {
               {events.length > 0 && <div className="event-log">
                 {events.slice(-4).reverse().map((event) => <p key={event.id}><strong>{readableStatus(event.type)}</strong> <span>{new Date(event.created_at).toLocaleString()}</span></p>)}
               </div>}
+            </article>}
+
+            {run && review && <article className="card review">
+              <p className="eyebrow">CONTROLLER REVIEW</p>
+              <h2>Frozen-source detail</h2>
+              <div className="review-summary">
+                <p><span>Snapshot</span><code>{review.snapshot_id || "Not committed yet"}</code></p>
+                <p><span>Mapping</span>{review.mapping ? `Version ${review.mapping.version}` : "Not configured"}</p>
+                <p><span>Evidence items</span>{review.evidence_items.length}</p>
+                <p><span>Journal proposals</span>{review.journal_proposals.length}</p>
+              </div>
+              <div className="review-columns">
+                <section><h3>Source batches</h3>{review.source_batches.length ? <ul className="review-list">{review.source_batches.map((batch) => <li key={`${batch.provider}-${batch.watermark}`}><span><strong>{batch.provider}</strong><small>{batch.environment} · {batch.complete ? "complete" : "incomplete"}</small></span><code>{batch.watermark}</code></li>)}</ul> : <p className="empty-state">No frozen source batch yet.</p>}</section>
+                <section><h3>Evidence</h3>{review.evidence_items.length ? <ul className="review-list">{review.evidence_items.slice(0, 8).map((item) => <li key={item.id}><span><strong>{item.kind}</strong><small>{item.provider} · {item.scope_reference}</small></span><code>{item.source_id}</code></li>)}</ul> : <p className="empty-state">No scoped evidence collected yet.</p>}</section>
+              </div>
+              <section className="reconciliation-panel"><h3>Reconciliation</h3>
+                {review.reconciliation_matches.length ? <ul className="review-list">{review.reconciliation_matches.map((match) => <li key={match.id}><span><strong>{match.kind} match · {match.amount} {match.currency}</strong><small>{match.bank_transaction_ids.join(", ")} ↔ {match.ledger_transaction_ids.join(", ")}</small></span><code>{match.evidence_ids.length} sources</code></li>)}</ul> : <p className="empty-state">No persisted reconciliation matches yet.</p>}
+              </section>
+              <section className="exceptions-panel"><div><h3>Exceptions and recovery</h3><p className="card-copy">Every recovery action is queued for the worker; no email or accounting write happens from this browser.</p></div>
+                {review.reconciliation_exceptions.some((item) => item.status === "open") && <label className="recovery-recipient">Allowlisted recovery recipient<input type="email" value={recoveryRecipient} onChange={(event) => setRecoveryRecipient(event.target.value)} placeholder={mapping?.configuration.evidence.allowed_recipients[0] || "controller@example.com"} /></label>}
+                {review.reconciliation_exceptions.length ? review.reconciliation_exceptions.map((item) => <article className={`exception ${statusClass(item.status)}`} key={item.id}>
+                  <p><strong>{readableStatus(item.control_code)} · {item.amount} {item.currency}</strong><small>{item.status} · explanation {readableStatus(item.explanation_status)}</small></p>
+                  <p className="exception-remediation">{item.remediation}</p>
+                  {item.explanation && <div className="explanation"><p><b>Grounded explanation</b> {item.explanation.cause}</p><p><b>Recommended next step</b> {item.explanation.recommendation}</p><small>Cites: {item.explanation.evidence_ids.join(", ")} · confidence {item.explanation.confidence_label}</small></div>}
+                  {item.status === "open" && selectedOrganization?.role !== "viewer" && <div className="exception-actions"><input value={exceptionNotes[item.id] || ""} onChange={(event) => setExceptionNotes({ ...exceptionNotes, [item.id]: event.target.value })} placeholder="Resolution or policy note" /><button className="secondary" onClick={() => void resolveException(item.id, "resolved")} disabled={busy}>Resolve</button><button className="secondary" onClick={() => void resolveException(item.id, "ignored")} disabled={busy}>Ignore by policy</button><button className="secondary" onClick={() => void requestRecoveryEmail(item.id)} disabled={busy}>Request evidence</button></div>}
+                  {item.resolution_comment && <p className="resolution-note">Decision: {item.resolution_comment}</p>}
+                </article>) : <p className="empty-state">No persisted exceptions.</p>}
+              </section>
+              <section className="reports-panel"><h3>Reports and immutable archive</h3>
+                {review.report ? <><p className={`report-status ${statusClass(review.report.control_status)}`}>Report controls: {readableStatus(review.report.control_status)}</p><pre>{JSON.stringify(review.report.data, null, 2)}</pre></> : <p className="empty-state">Reports will appear after durable reconciliation.</p>}
+                {review.artifacts.length ? <ul className="review-list">{review.artifacts.map((artifact) => <li key={artifact.id}><span><strong>{readableStatus(artifact.type)} · {artifact.status}</strong><small>Object Lock: {artifact.retention_mode} through {new Date(artifact.retain_until).toLocaleDateString()}</small></span><code>{artifact.content_hash.slice(0, 16)}</code></li>)}</ul> : <p className="empty-state">No verified immutable B2 artifact yet.</p>}
+              </section>
+              <section className="proposals"><h3>Journal proposals</h3>{review.journal_proposals.length ? review.journal_proposals.map((proposal) => <div className="proposal" key={proposal.id}><p><strong>{proposal.narration}</strong><small>{proposal.date} · {readableStatus(proposal.status)}</small></p>{proposal.lines.map((line, index) => <p className="proposal-line" key={`${proposal.id}-${index}`}><code>{line.account_code}</code><span>Debit {line.debit} · Credit {line.credit}</span></p>)}</div>) : <p className="empty-state">No proposed journals. A close may complete with no adjustment.</p>}</section>
+              <section className="action-panel"><h3>Worker action recovery</h3>{review.actions.length ? <ul className="review-list">{review.actions.map((action) => <li key={action.id}><span><strong>{action.provider} · {readableStatus(action.operation)}</strong><small>{action.provider_object_id ? `Provider object ${action.provider_object_id}` : "Awaiting provider object"} · {action.marker}</small></span><b className={statusClass(action.status)}>{readableStatus(action.status)}</b></li>)}</ul> : <p className="empty-state">No provider action has been requested.</p>}</section>
             </article>}
           </section>
         </>

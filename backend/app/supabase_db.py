@@ -16,6 +16,8 @@ from json import dumps, loads
 from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence
 from urllib.parse import parse_qs, urlparse
 
+from .close_mapping import CloseMappingDraft, PersistedCloseMapping
+from .close_execution import DerivedCloseExecution, SnapshotFact
 from .connections import ConnectionHealth, ConnectionStatus
 from .domain import CloseRun, JournalProposal, PolicyError, SourceBatch, SourceSnapshot
 from .evidence import EvidenceBatch
@@ -124,6 +126,22 @@ class PersistedReviewPackage:
     status: str
     summary: Mapping[str, object]
     frozen_at: datetime | None
+
+
+@dataclass(frozen=True)
+class ReviewData:
+    run_id: str
+    snapshot_id: str | None
+    mapping: PersistedCloseMapping | None
+    source_batches: tuple[Mapping[str, object], ...]
+    evidence_items: tuple[Mapping[str, object], ...]
+    review_package: Mapping[str, object] | None
+    journal_proposals: tuple[Mapping[str, object], ...]
+    reconciliation_matches: tuple[Mapping[str, object], ...] = ()
+    reconciliation_exceptions: tuple[Mapping[str, object], ...] = ()
+    report: Mapping[str, object] | None = None
+    artifacts: tuple[Mapping[str, object], ...] = ()
+    actions: tuple[Mapping[str, object], ...] = ()
 
 
 DEFAULT_CLOSE_TASKS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -453,10 +471,21 @@ class SupabaseWorkflowStore:
             with transaction(connection) as cursor:
                 cursor.execute(
                     """
+                    select id::text
+                    from workflow.close_mappings
+                    where organization_id = %s and status = 'active'
+                    """,
+                    (organization_id,),
+                )
+                mapping_row = cursor.fetchone()
+                if mapping_row is None:
+                    raise SupabaseConfigError("an accountant-approved close mapping is required before starting a close run")
+                cursor.execute(
+                    """
                     insert into workflow.close_runs
                         (organization_id, deployment_id, period_start, period_end,
-                         deployment_mode, data_class, market, currency, state, request_key)
-                    values (%s, %s, %s::date, %s::date, %s, %s, %s, %s, 'synchronizing', %s)
+                         deployment_mode, data_class, market, currency, state, request_key, mapping_id)
+                    values (%s, %s, %s::date, %s::date, %s, %s, %s, %s, 'synchronizing', %s, %s::uuid)
                     on conflict (organization_id, request_key) do update
                     set updated_at = workflow.close_runs.updated_at
                     returning id::text, organization_id, period_start::text, period_end::text,
@@ -472,11 +501,554 @@ class SupabaseWorkflowStore:
                         deployment.market,
                         deployment.currency,
                         idempotency_key,
+                        str(mapping_row[0]),
                     ),
                 )
                 row = cursor.fetchone()
                 self._ensure_default_tasks(cursor, str(row[0]), str(row[1]))
             return self._run_from_row(row)
+        finally:
+            self._close(connection)
+
+    def active_close_mapping(self, organization_id: str) -> PersistedCloseMapping | None:
+        connection = connect(self.config)
+        try:
+            with transaction(connection) as cursor:
+                cursor.execute(
+                    """
+                    select id::text, organization_id, version, status, configuration_json,
+                           approved_by_subject, created_at
+                    from workflow.close_mappings
+                    where organization_id = %s and status = 'active'
+                    """,
+                    (organization_id,),
+                )
+                row = cursor.fetchone()
+            return self._mapping_from_row(row) if row is not None else None
+        finally:
+            self._close(connection)
+
+    def save_close_mapping(
+        self,
+        *,
+        organization_id: str,
+        mapping: CloseMappingDraft,
+        approved_by_subject: str,
+    ) -> PersistedCloseMapping:
+        """Create an immutable mapping version and supersede the previous active one."""
+        connection = connect(self.config)
+        try:
+            with transaction(connection) as cursor:
+                cursor.execute("select id from workflow.organizations where id = %s for update", (organization_id,))
+                if cursor.fetchone() is None:
+                    raise SupabaseConfigError("organization does not exist")
+                cursor.execute(
+                    """
+                    select count(*)
+                    from workflow.connections
+                    where organization_id = %s and provider = 'xero'
+                      and provider_environment = 'production' and status = 'healthy'
+                      and provider_tenant_or_account_id = %s
+                    """,
+                    (organization_id, mapping.xero_tenant_id),
+                )
+                if int(cursor.fetchone()[0]) != 1:
+                    raise SupabaseConfigError("the selected Xero tenant must be a healthy production connection")
+                selected_accounts = [item.plaid_account_id for item in mapping.bank_mappings]
+                cursor.execute(
+                    """
+                    select provider_tenant_or_account_id
+                    from workflow.connections
+                    where organization_id = %s and provider = 'plaid'
+                      and provider_environment = 'production' and status = 'healthy'
+                      and provider_tenant_or_account_id = any(%s)
+                    """,
+                    (organization_id, selected_accounts),
+                )
+                found_accounts = {str(row[0]) for row in cursor.fetchall()}
+                if found_accounts != set(selected_accounts):
+                    raise SupabaseConfigError("every mapped Plaid account must be a healthy production connection")
+                cursor.execute(
+                    "select coalesce(max(version), 0) + 1 from workflow.close_mappings where organization_id = %s",
+                    (organization_id,),
+                )
+                version = int(cursor.fetchone()[0])
+                cursor.execute(
+                    """
+                    update workflow.close_mappings
+                    set status = 'superseded', superseded_at = now()
+                    where organization_id = %s and status = 'active'
+                    """,
+                    (organization_id,),
+                )
+                cursor.execute(
+                    """
+                    insert into workflow.close_mappings
+                        (organization_id, version, status, configuration_json, approved_by_subject)
+                    values (%s, %s, 'active', %s::jsonb, %s)
+                    returning id::text, organization_id, version, status, configuration_json,
+                              approved_by_subject, created_at
+                    """,
+                    (organization_id, version, dumps(mapping.as_dict()), approved_by_subject),
+                )
+                row = cursor.fetchone()
+            return self._mapping_from_row(row)
+        finally:
+            self._close(connection)
+
+    def snapshot_facts_for_run(self, run_id: str) -> tuple[SnapshotFact, ...]:
+        """Read only the exact normalized versions frozen into this close run."""
+        connection = connect(self.config)
+        try:
+            with transaction(connection) as cursor:
+                cursor.execute(
+                    """
+                    select v.version_id, v.provider, v.provider_record_id, v.payload_json,
+                           v.accounting_date::text, v.currency
+                    from workflow.close_runs r
+                    join normalized.snapshot_records s on s.snapshot_id = r.snapshot_id
+                    join normalized.record_versions v on v.version_id = s.normalized_record_version_id
+                    where r.id = %s::uuid
+                    order by v.provider, v.provider_record_id, v.version_id
+                    """,
+                    (run_id,),
+                )
+                rows = cursor.fetchall()
+            return tuple(
+                SnapshotFact(
+                    str(row[0]), str(row[1]), str(row[2]),
+                    row[3] if isinstance(row[3], Mapping) else {},
+                    str(row[4]) if row[4] is not None else None,
+                    str(row[5]) if row[5] is not None else None,
+                )
+                for row in rows
+            )
+        finally:
+            self._close(connection)
+
+    def persist_close_execution(self, *, run_id: str, execution: DerivedCloseExecution) -> None:
+        """Commit deterministic close outputs exactly once for the frozen run."""
+        connection = connect(self.config)
+        try:
+            with transaction(connection) as cursor:
+                cursor.execute(
+                    """
+                    select organization_id, snapshot_id::text, state
+                    from workflow.close_runs where id = %s::uuid for update
+                    """,
+                    (run_id,),
+                )
+                run = cursor.fetchone()
+                if run is None or run[1] is None:
+                    raise SupabaseConfigError("a frozen source snapshot is required for reconciliation")
+                organization_id, snapshot_id, state = str(run[0]), str(run[1]), str(run[2])
+                cursor.execute("select input_hash from workflow.reconciliations where run_id = %s::uuid", (run_id,))
+                existing = cursor.fetchone()
+                result_hash = sha256(
+                    dumps({
+                        "matches": [item.match_id for item in execution.reconciliation.matches],
+                        "exceptions": [item.exception_id for item in execution.reconciliation.exceptions],
+                        "report": execution.report_hash,
+                        "proposals": [item.proposal_hash for item in execution.proposals],
+                    }, sort_keys=True).encode()
+                ).hexdigest()
+                if existing is not None:
+                    if str(existing[0]) != execution.input_hash:
+                        raise SupabaseConfigError("reconciliation input differs from the frozen persisted snapshot")
+                    return
+                if state not in {"synchronizing", "running"}:
+                    raise SupabaseConfigError("close run is not available for reconciliation")
+                cursor.execute(
+                    """
+                    insert into workflow.reconciliations
+                        (run_id, organization_id, snapshot_id, input_hash, result_hash, matched_count, exception_count)
+                    values (%s::uuid, %s, %s::uuid, %s, %s, %s, %s)
+                    """,
+                    (run_id, organization_id, snapshot_id, execution.input_hash, result_hash,
+                     len(execution.reconciliation.matches), len(execution.reconciliation.exceptions)),
+                )
+                for match in execution.reconciliation.matches:
+                    cursor.execute(
+                        """
+                        insert into workflow.reconciliation_matches
+                            (id, run_id, organization_id, match_kind, amount, currency,
+                             bank_transaction_ids, ledger_transaction_ids, evidence_ids)
+                        values (%s, %s::uuid, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb)
+                        """,
+                        (match.match_id, run_id, organization_id, match.kind, match.amount, match.currency,
+                         dumps(list(match.bank_transaction_ids)), dumps(list(match.ledger_transaction_ids)),
+                         dumps(list(match.evidence_ids))),
+                    )
+                for exception in execution.reconciliation.exceptions:
+                    cursor.execute(
+                        """
+                        insert into workflow.reconciliation_exceptions
+                            (id, run_id, organization_id, control_code, source_transaction_ids,
+                             evidence_ids, amount, currency, remediation, facts_json)
+                        values (%s, %s::uuid, %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s::jsonb)
+                        """,
+                        (exception.exception_id, run_id, organization_id, exception.control_code,
+                         dumps(list(exception.source_transaction_ids)), dumps(list(exception.evidence_ids)),
+                         exception.amount, exception.currency, exception.remediation,
+                         dumps(list(execution.exception_facts.get(exception.exception_id, ()))),),
+                    )
+                cursor.execute(
+                    """
+                    insert into workflow.close_reports
+                        (run_id, organization_id, snapshot_id, report_json, report_hash, control_status)
+                    values (%s::uuid, %s, %s::uuid, %s::jsonb, %s, %s)
+                    """,
+                    (run_id, organization_id, snapshot_id, dumps(execution.report), execution.report_hash,
+                     execution.report_control_status),
+                )
+                cursor.execute(
+                    """
+                    update workflow.close_runs set state = 'running', updated_at = now()
+                    where id = %s::uuid and state = 'synchronizing'
+                    """,
+                    (run_id,),
+                )
+                self._record_task_event(
+                    cursor, organization_id=organization_id, run_id=run_id, task_id=None,
+                    event_type="reconciliation_persisted",
+                    payload={"matched_count": len(execution.reconciliation.matches),
+                             "exception_count": len(execution.reconciliation.exceptions),
+                             "report_status": execution.report_control_status},
+                )
+        finally:
+            self._close(connection)
+
+    def unexplained_exceptions_for_run(self, run_id: str) -> tuple[Mapping[str, object], ...]:
+        connection = connect(self.config)
+        try:
+            with transaction(connection) as cursor:
+                cursor.execute(
+                    """
+                    select id, facts_json, amount, currency, source_transaction_ids, evidence_ids
+                    from workflow.reconciliation_exceptions
+                    where run_id = %s::uuid and explanation_status = 'pending'
+                    order by created_at, id
+                    """,
+                    (run_id,),
+                )
+                rows = cursor.fetchall()
+            return tuple({
+                "id": str(row[0]), "facts": list(row[1] or []), "amount": str(row[2]),
+                "currency": str(row[3]), "source_transaction_ids": list(row[4] or []),
+                "evidence_ids": list(row[5] or []),
+            } for row in rows)
+        finally:
+            self._close(connection)
+
+    def record_exception_explanation(
+        self,
+        *,
+        run_id: str,
+        exception_id: str,
+        explanation: Mapping[str, object] | None,
+        model_id: str,
+        prompt_version: str,
+        schema_version: str,
+        input_hash: str,
+        output_hash: str | None,
+        validation_status: str,
+        latency_ms: int | None,
+        input_tokens: int | None,
+        output_tokens: int | None,
+    ) -> None:
+        if validation_status not in {"verified", "rejected"}:
+            raise SupabaseConfigError("AI validation status is invalid")
+        connection = connect(self.config)
+        try:
+            with transaction(connection) as cursor:
+                cursor.execute(
+                    """
+                    select organization_id from workflow.reconciliation_exceptions
+                    where id = %s and run_id = %s::uuid for update
+                    """,
+                    (exception_id, run_id),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    raise SupabaseConfigError("reconciliation exception does not exist")
+                organization_id = str(row[0])
+                cursor.execute(
+                    """
+                    update workflow.reconciliation_exceptions
+                    set explanation_json = %s::jsonb,
+                        explanation_status = %s,
+                        explanation_updated_at = now()
+                    where id = %s and run_id = %s::uuid
+                    """,
+                    (dumps(explanation) if explanation is not None else None,
+                     "verified" if validation_status == "verified" else "rejected", exception_id, run_id),
+                )
+                cursor.execute(
+                    """
+                    insert into audit.ai_calls
+                        (organization_id, run_id, model_id, prompt_version, schema_version,
+                         input_hash, output_hash, validation_status, latency_ms, input_tokens, output_tokens,
+                         metadata_json)
+                    values (%s, %s::uuid, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                    """,
+                    (organization_id, run_id, model_id, prompt_version, schema_version, input_hash, output_hash,
+                     validation_status, latency_ms, input_tokens, output_tokens,
+                     dumps({"exception_id": exception_id})),
+                )
+        finally:
+            self._close(connection)
+
+    def close_artifact_payload(self, run_id: str) -> Mapping[str, object]:
+        """Build a deterministic, credential-free package for immutable B2 storage."""
+        review = self.review_data_for_run(run_id)
+        return {
+            "schema_version": "close-package-v1",
+            "run_id": review.run_id,
+            "snapshot_id": review.snapshot_id,
+            "mapping_version": review.mapping.version if review.mapping else None,
+            "matches": list(review.reconciliation_matches),
+            "exceptions": list(review.reconciliation_exceptions),
+            "report": review.report,
+            "journal_proposals": list(review.journal_proposals),
+            "review_package": review.review_package,
+        }
+
+    def record_close_artifact(
+        self, *, run_id: str, object_key: str, content_hash: str, retain_until: datetime, provider_file_id: str | None
+    ) -> None:
+        connection = connect(self.config)
+        try:
+            with transaction(connection) as cursor:
+                cursor.execute("select organization_id from workflow.close_runs where id = %s::uuid", (run_id,))
+                row = cursor.fetchone()
+                if row is None:
+                    raise SupabaseConfigError("close run does not exist")
+                cursor.execute(
+                    """
+                    insert into workflow.close_artifacts
+                        (organization_id, run_id, artifact_type, object_key, content_hash,
+                         retention_mode, retain_until, status, provider_file_id)
+                    values (%s, %s::uuid, 'close_package_json', %s, %s, 'compliance', %s, 'verified', %s)
+                    on conflict (run_id, artifact_type, content_hash) do nothing
+                    """,
+                    (str(row[0]), run_id, object_key, content_hash, retain_until, provider_file_id),
+                )
+                self._record_task_event(
+                    cursor, organization_id=str(row[0]), run_id=run_id, task_id=None,
+                    event_type="close_artifact_verified", payload={"object_key": object_key, "content_hash": content_hash},
+                )
+        finally:
+            self._close(connection)
+
+    def review_data_for_run(self, run_id: str) -> ReviewData:
+        """Return only reviewable metadata and control outputs for the controller UI."""
+        connection = connect(self.config)
+        try:
+            with transaction(connection) as cursor:
+                cursor.execute(
+                    """
+                    select r.id::text, r.snapshot_id::text, r.mapping_id::text,
+                           m.organization_id, m.version, m.status, m.configuration_json,
+                           m.approved_by_subject, m.created_at
+                    from workflow.close_runs r
+                    left join workflow.close_mappings m on m.id = r.mapping_id
+                    where r.id = %s::uuid
+                    """,
+                    (run_id,),
+                )
+                run_row = cursor.fetchone()
+                if run_row is None:
+                    raise SupabaseConfigError("close run does not exist")
+                mapping = None
+                if run_row[2] is not None:
+                    mapping = self._mapping_from_row(
+                        (run_row[2], run_row[3], run_row[4], run_row[5], run_row[6], run_row[7], run_row[8])
+                    )
+                cursor.execute(
+                    """
+                    select provider, provider_environment, watermark, completed_at, complete, warnings
+                    from normalized.source_batches
+                    where run_id = %s::uuid
+                    order by completed_at, provider
+                    """,
+                    (run_id,),
+                )
+                source_batches = tuple(
+                    {
+                        "provider": str(row[0]),
+                        "environment": str(row[1]),
+                        "watermark": str(row[2]),
+                        "completed_at": row[3].isoformat() if row[3] is not None else None,
+                        "complete": bool(row[4]),
+                        "warnings": list(row[5] or []),
+                    }
+                    for row in cursor.fetchall()
+                )
+                cursor.execute(
+                    """
+                    select evidence_id, provider, source_id, observed_at, kind, scope_reference, tags
+                    from normalized.evidence_items
+                    where run_id = %s::uuid
+                    order by observed_at desc, evidence_id
+                    limit 250
+                    """,
+                    (run_id,),
+                )
+                evidence_items = tuple(
+                    {
+                        "id": str(row[0]),
+                        "provider": str(row[1]),
+                        "source_id": str(row[2]),
+                        "observed_at": row[3].isoformat() if row[3] is not None else None,
+                        "kind": str(row[4]),
+                        "scope_reference": str(row[5]),
+                        "tags": list(row[6] or []),
+                    }
+                    for row in cursor.fetchall()
+                )
+                cursor.execute(
+                    """
+                    select id::text, package_hash, status, summary_json, frozen_at
+                    from workflow.review_packages where run_id = %s::uuid
+                    """,
+                    (run_id,),
+                )
+                package_row = cursor.fetchone()
+                review_package = (
+                    {
+                        "id": str(package_row[0]),
+                        "package_hash": str(package_row[1]),
+                        "status": str(package_row[2]),
+                        "summary": dict(package_row[3] or {}),
+                        "frozen_at": package_row[4].isoformat() if package_row[4] is not None else None,
+                    }
+                    if package_row is not None
+                    else None
+                )
+                cursor.execute(
+                    """
+                    select p.id, p.journal_date::text, p.narration, p.proposal_hash, p.status,
+                           coalesce(json_agg(json_build_object(
+                               'account_code', l.account_code, 'debit', l.debit,
+                               'credit', l.credit, 'evidence_ids', l.evidence_ids
+                           ) order by l.line_number) filter (where l.proposal_id is not null), '[]'::json)
+                    from workflow.journal_proposals p
+                    left join workflow.journal_proposal_lines l on l.proposal_id = p.id
+                    where p.run_id = %s::uuid
+                    group by p.id
+                    order by p.created_at, p.id
+                    """,
+                    (run_id,),
+                )
+                journal_proposals = tuple(
+                    {
+                        "id": str(row[0]),
+                        "date": str(row[1]),
+                        "narration": str(row[2]),
+                        "proposal_hash": str(row[3]),
+                        "status": str(row[4]),
+                        "lines": list(row[5] or []),
+                    }
+                    for row in cursor.fetchall()
+                )
+                cursor.execute(
+                    """
+                    select id, match_kind, amount, currency, bank_transaction_ids,
+                           ledger_transaction_ids, evidence_ids
+                    from workflow.reconciliation_matches
+                    where run_id = %s::uuid order by created_at, id
+                    """,
+                    (run_id,),
+                )
+                reconciliation_matches = tuple({
+                    "id": str(row[0]), "kind": str(row[1]), "amount": str(row[2]), "currency": str(row[3]),
+                    "bank_transaction_ids": list(row[4] or []), "ledger_transaction_ids": list(row[5] or []),
+                    "evidence_ids": list(row[6] or []),
+                } for row in cursor.fetchall())
+                cursor.execute(
+                    """
+                    select id, control_code, source_transaction_ids, evidence_ids, amount, currency,
+                           remediation, status, explanation_json, explanation_status, resolution_comment,
+                           resolved_at
+                    from workflow.reconciliation_exceptions
+                    where run_id = %s::uuid order by created_at, id
+                    """,
+                    (run_id,),
+                )
+                reconciliation_exceptions = tuple({
+                    "id": str(row[0]), "control_code": str(row[1]), "source_transaction_ids": list(row[2] or []),
+                    "evidence_ids": list(row[3] or []), "amount": str(row[4]), "currency": str(row[5]),
+                    "remediation": str(row[6]), "status": str(row[7]),
+                    "explanation": dict(row[8]) if isinstance(row[8], Mapping) else None,
+                    "explanation_status": str(row[9]),
+                    "resolution_comment": str(row[10]) if row[10] is not None else None,
+                    "resolved_at": row[11].isoformat() if row[11] is not None else None,
+                } for row in cursor.fetchall())
+                cursor.execute(
+                    """
+                    select report_json, report_hash, control_status, created_at
+                    from workflow.close_reports where run_id = %s::uuid
+                    """,
+                    (run_id,),
+                )
+                report_row = cursor.fetchone()
+                report = ({
+                    "data": dict(report_row[0]) if isinstance(report_row[0], Mapping) else {},
+                    "hash": str(report_row[1]), "control_status": str(report_row[2]),
+                    "created_at": report_row[3].isoformat() if report_row[3] is not None else None,
+                } if report_row is not None else None)
+                cursor.execute(
+                    """
+                    select id::text, artifact_type, object_key, content_hash, retention_mode,
+                           retain_until, status, provider_file_id, created_at
+                    from workflow.close_artifacts where run_id = %s::uuid order by created_at, id
+                    """,
+                    (run_id,),
+                )
+                artifacts = tuple({
+                    "id": str(row[0]), "type": str(row[1]), "object_key": str(row[2]), "content_hash": str(row[3]),
+                    "retention_mode": str(row[4]), "retain_until": row[5].isoformat(), "status": str(row[6]),
+                    "provider_file_id": str(row[7]) if row[7] is not None else None,
+                    "created_at": row[8].isoformat() if row[8] is not None else None,
+                } for row in cursor.fetchall())
+                cursor.execute(
+                    """
+                    select id::text, provider, operation, status, marker, provider_object_id,
+                           completed_at, created_at
+                    from workflow.action_executions where run_id = %s::uuid
+                    order by created_at, id
+                    """,
+                    (run_id,),
+                )
+                actions = tuple({
+                    "id": str(row[0]), "provider": str(row[1]), "operation": str(row[2]), "status": str(row[3]),
+                    "marker": str(row[4]), "provider_object_id": str(row[5]) if row[5] is not None else None,
+                    "completed_at": row[6].isoformat() if row[6] is not None else None,
+                    "created_at": row[7].isoformat() if row[7] is not None else None,
+                } for row in cursor.fetchall())
+            return ReviewData(
+                str(run_row[0]), str(run_row[1]) if run_row[1] is not None else None, mapping,
+                source_batches, evidence_items, review_package, journal_proposals,
+                reconciliation_matches, reconciliation_exceptions, report, artifacts, actions,
+            )
+        finally:
+            self._close(connection)
+
+    def connection_secret_ref(self, organization_id: str, provider: str, provider_target: str) -> str | None:
+        """Server/worker-only lookup. Never serialize this result in an API response."""
+        connection = connect(self.config)
+        try:
+            with transaction(connection) as cursor:
+                cursor.execute(
+                    """
+                    select credential_secret_ref from workflow.connections
+                    where organization_id = %s and provider = %s
+                      and provider_tenant_or_account_id = %s and status = 'healthy'
+                    """,
+                    (organization_id, provider, provider_target),
+                )
+                row = cursor.fetchone()
+            return str(row[0]) if row is not None else None
         finally:
             self._close(connection)
 
@@ -697,7 +1269,7 @@ class SupabaseWorkflowStore:
                 if run is None:
                     raise SupabaseConfigError("close run does not exist")
                 organization_id, snapshot_id, state = str(run[0]), run[1], str(run[2])
-                if state != "running" or snapshot_id is None:
+                if state not in {"running", "awaiting_approval"} or snapshot_id is None:
                     raise SupabaseConfigError("a complete source snapshot is required before review")
                 package_hash = sha256(
                     f"{snapshot_id}|{'|'.join(proposal.proposal_hash for proposal in proposals)}".encode()
@@ -819,6 +1391,20 @@ class SupabaseWorkflowStore:
                         "update workflow.journal_proposals set status = 'approved' where review_package_id = %s::uuid",
                         (package_id,),
                     )
+                    cursor.execute(
+                        """
+                        insert into workflow.tasks (run_id, task_key, state, idempotency_key)
+                        values (%s::uuid, 'apply_approved_actions', 'ready', %s)
+                        on conflict (run_id, task_key) do update
+                        set state = case when workflow.tasks.state in ('succeeded', 'blocked', 'failed') then 'ready'
+                                         else workflow.tasks.state end,
+                            last_error = null,
+                            lease_owner = null,
+                            lease_expires_at = null,
+                            updated_at = now()
+                        """,
+                        (run_id, f"{run_id}:apply_approved_actions"),
+                    )
                 next_state = "applying_approved_actions" if proposal_count else "approved"
                 cursor.execute(
                     """
@@ -839,6 +1425,274 @@ class SupabaseWorkflowStore:
                     payload={"package_hash": package_hash, "proposal_count": proposal_count},
                 )
             return self._run_from_row(run_row)
+        finally:
+            self._close(connection)
+
+    def approved_xero_proposals_for_run(self, run_id: str) -> tuple[Mapping[str, object], ...]:
+        """Return approved package facts for the worker-only Xero executor."""
+        connection = connect(self.config)
+        try:
+            with transaction(connection) as cursor:
+                cursor.execute(
+                    """
+                    select a.id::text, r.organization_id, rp.package_hash, p.id, p.proposal_hash, p.journal_date::text,
+                           p.narration,
+                           coalesce(json_agg(json_build_object(
+                               'account_code', l.account_code, 'debit', l.debit,
+                               'credit', l.credit, 'evidence_ids', l.evidence_ids
+                           ) order by l.line_number) filter (where l.proposal_id is not null), '[]'::json)
+                    from workflow.close_runs r
+                    join workflow.review_packages rp on rp.run_id = r.id
+                    join workflow.approvals a on a.run_id = r.id and a.package_hash = rp.package_hash
+                    join workflow.journal_proposals p on p.review_package_id = rp.id and p.status = 'approved'
+                    left join workflow.journal_proposal_lines l on l.proposal_id = p.id
+                    where r.id = %s::uuid and a.decision = 'approved'
+                    group by a.id, r.organization_id, rp.package_hash, p.id, p.proposal_hash, p.journal_date, p.narration
+                    order by p.created_at, p.id
+                    """,
+                    (run_id,),
+                )
+                rows = cursor.fetchall()
+            return tuple({
+                "approval_id": str(row[0]), "organization_id": str(row[1]), "package_hash": str(row[2]),
+                "proposal_id": str(row[3]), "proposal_hash": str(row[4]), "journal_date": str(row[5]), "narration": str(row[6]),
+                "lines": list(row[7] or []),
+            } for row in rows)
+        finally:
+            self._close(connection)
+
+    def ensure_action_execution(
+        self,
+        *,
+        run_id: str,
+        approval_id: str,
+        provider: str,
+        operation: str,
+        idempotency_key: str,
+        request_hash: str,
+        marker: str,
+    ) -> Mapping[str, object]:
+        if provider not in {"xero", "gmail"} or operation not in {"create_draft_manual_journal", "send_approved_request"}:
+            raise SupabaseConfigError("action provider or operation is invalid")
+        connection = connect(self.config)
+        try:
+            with transaction(connection) as cursor:
+                cursor.execute("select organization_id from workflow.close_runs where id = %s::uuid", (run_id,))
+                run = cursor.fetchone()
+                if run is None:
+                    raise SupabaseConfigError("close run does not exist")
+                cursor.execute(
+                    """
+                    insert into workflow.action_executions
+                        (organization_id, run_id, approval_id, provider, operation, idempotency_key,
+                         request_hash, marker, status)
+                    values (%s, %s::uuid, %s::uuid, %s, %s, %s, %s, %s, 'prepared')
+                    on conflict (idempotency_key) do update set idempotency_key = excluded.idempotency_key
+                    returning id::text, status, provider_object_id, marker, request_hash
+                    """,
+                    (str(run[0]), run_id, approval_id, provider, operation, idempotency_key, request_hash, marker),
+                )
+                row = cursor.fetchone()
+            return {"id": str(row[0]), "status": str(row[1]), "provider_object_id": str(row[2]) if row[2] is not None else None,
+                    "marker": str(row[3]), "request_hash": str(row[4])}
+        finally:
+            self._close(connection)
+
+    def update_action_execution(
+        self,
+        *,
+        action_id: str,
+        status: str,
+        provider_object_id: str | None = None,
+        proposal_id: str | None = None,
+        package_hash: str | None = None,
+        proposal_hash: str | None = None,
+    ) -> None:
+        if status not in {"started", "succeeded", "failed", "outcome_unknown", "reconciled"}:
+            raise SupabaseConfigError("action status is invalid")
+        connection = connect(self.config)
+        try:
+            with transaction(connection) as cursor:
+                cursor.execute(
+                    """
+                    update workflow.action_executions
+                    set status = %s, provider_object_id = coalesce(%s, provider_object_id),
+                        started_at = case when %s = 'started' then coalesce(started_at, now()) else started_at end,
+                        completed_at = case when %s in ('succeeded', 'failed', 'outcome_unknown', 'reconciled') then now() else completed_at end
+                    where id = %s::uuid
+                    returning organization_id, run_id::text, approval_id::text, request_hash, provider_object_id
+                    """,
+                    (status, provider_object_id, status, status, action_id),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    raise SupabaseConfigError("action execution does not exist")
+                organization_id, run_id, _, request_hash, object_id = str(row[0]), str(row[1]), str(row[2]), str(row[3]), row[4]
+                if proposal_id and status in {"succeeded", "reconciled"}:
+                    cursor.execute("update workflow.journal_proposals set status = 'actioned' where id = %s", (proposal_id,))
+                    cursor.execute(
+                        """
+                        insert into workflow.action_manifests
+                            (action_id, run_id, package_hash, proposal_hash, request_hash, provider_object_id, status)
+                        values (%s::uuid, %s::uuid, %s, %s, %s, %s, %s)
+                        on conflict (action_id) do nothing
+                        """,
+                        (action_id, run_id, package_hash or "", proposal_hash, request_hash,
+                         str(object_id) if object_id is not None else None, status),
+                    )
+                if status in {"failed", "outcome_unknown"}:
+                    cursor.execute("update workflow.close_runs set state = 'action_failed', updated_at = now() where id = %s::uuid", (run_id,))
+                elif proposal_id and status in {"succeeded", "reconciled"}:
+                    cursor.execute(
+                        """
+                        select count(*) from workflow.action_executions
+                        where run_id = %s::uuid and provider = 'xero'
+                          and status not in ('succeeded', 'reconciled')
+                        """,
+                        (run_id,),
+                    )
+                    if int(cursor.fetchone()[0]) == 0:
+                        cursor.execute("update workflow.close_runs set state = 'approved', updated_at = now() where id = %s::uuid", (run_id,))
+                self._record_task_event(
+                    cursor, organization_id=organization_id, run_id=run_id, task_id=None,
+                    event_type="action_updated", payload={"action_id": action_id, "status": status,
+                                                            "provider_object_id": str(object_id) if object_id else None},
+                )
+        finally:
+            self._close(connection)
+
+    def resolve_reconciliation_exception(
+        self, *, run_id: str, exception_id: str, status: str, comment: str, actor_subject: str
+    ) -> None:
+        if status not in {"resolved", "ignored"} or not comment.strip():
+            raise SupabaseConfigError("exception resolution needs a status and comment")
+        connection = connect(self.config)
+        try:
+            with transaction(connection) as cursor:
+                cursor.execute(
+                    """
+                    update workflow.reconciliation_exceptions
+                    set status = %s, resolution_comment = %s, resolved_by_subject = %s, resolved_at = now()
+                    where id = %s and run_id = %s::uuid and status = 'open'
+                    returning organization_id
+                    """,
+                    (status, comment.strip(), actor_subject, exception_id, run_id),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    raise SupabaseConfigError("open reconciliation exception does not exist")
+                self._record_task_event(
+                    cursor, organization_id=str(row[0]), run_id=run_id, task_id=None,
+                    event_type="exception_resolved", payload={"exception_id": exception_id, "status": status},
+                )
+        finally:
+            self._close(connection)
+
+    def queue_exception_recovery_email(
+        self, *, run_id: str, exception_id: str, recipient: str
+    ) -> Mapping[str, object]:
+        """Queue an allowlisted Gmail recovery action; the worker owns send/read-back."""
+        normalized_recipient = recipient.strip().lower()
+        connection = connect(self.config)
+        try:
+            with transaction(connection) as cursor:
+                cursor.execute(
+                    """
+                    select r.organization_id, m.configuration_json, a.id::text
+                    from workflow.close_runs r
+                    join workflow.close_mappings m on m.id = r.mapping_id
+                    join workflow.review_packages rp on rp.run_id = r.id
+                    join workflow.approvals a on a.run_id = r.id and a.package_hash = rp.package_hash
+                    where r.id = %s::uuid and a.decision = 'approved'
+                    order by a.decided_at desc limit 1
+                    for update
+                    """,
+                    (run_id,),
+                )
+                run = cursor.fetchone()
+                if run is None:
+                    raise SupabaseConfigError("recovery email requires an approved frozen package")
+                configuration = run[1] if isinstance(run[1], Mapping) else {}
+                evidence = configuration.get("evidence") if isinstance(configuration, Mapping) else None
+                recipients = {str(item).lower() for item in evidence.get("allowed_recipients", [])} if isinstance(evidence, Mapping) else set()
+                if normalized_recipient not in recipients:
+                    raise SupabaseConfigError("recovery email recipient is not allowlisted by the close mapping")
+                cursor.execute(
+                    """
+                    select control_code, remediation from workflow.reconciliation_exceptions
+                    where id = %s and run_id = %s::uuid and status = 'open'
+                    """,
+                    (exception_id, run_id),
+                )
+                exception = cursor.fetchone()
+                if exception is None:
+                    raise SupabaseConfigError("open reconciliation exception does not exist")
+                request_hash = sha256(f"{run_id}|{exception_id}|{normalized_recipient}|{exception[0]}|{exception[1]}".encode()).hexdigest()
+                marker = f"AOSMAILv1/{run_id[:8]}/{exception_id[:12]}/{request_hash[:12]}"
+                cursor.execute(
+                    """
+                    insert into workflow.action_executions
+                        (organization_id, run_id, approval_id, provider, operation, idempotency_key,
+                         request_hash, marker, status)
+                    values (%s, %s::uuid, %s::uuid, 'gmail', 'send_approved_request', %s, %s, %s, 'prepared')
+                    on conflict (idempotency_key) do update set idempotency_key = excluded.idempotency_key
+                    returning id::text, status, marker
+                    """,
+                    (str(run[0]), run_id, str(run[2]), f"{run_id}:gmail:{request_hash}", request_hash, marker),
+                )
+                action = cursor.fetchone()
+                cursor.execute(
+                    """
+                    insert into workflow.recovery_email_requests (action_id, run_id, exception_id, recipient)
+                    values (%s::uuid, %s::uuid, %s, %s)
+                    on conflict (action_id) do nothing
+                    """,
+                    (str(action[0]), run_id, exception_id, normalized_recipient),
+                )
+                cursor.execute(
+                    """
+                    insert into workflow.tasks (run_id, task_key, state, idempotency_key)
+                    values (%s::uuid, 'send_recovery_request', 'ready', %s)
+                    on conflict (run_id, task_key) do update
+                    set state = case when workflow.tasks.state in ('succeeded', 'blocked', 'failed') then 'ready'
+                                     else workflow.tasks.state end,
+                        last_error = null, lease_owner = null, lease_expires_at = null, updated_at = now()
+                    """,
+                    (run_id, f"{run_id}:send_recovery_request"),
+                )
+                self._record_task_event(
+                    cursor, organization_id=str(run[0]), run_id=run_id, task_id=None,
+                    event_type="recovery_email_queued", payload={"exception_id": exception_id, "action_id": str(action[0])},
+                )
+            return {"id": str(action[0]), "status": str(action[1]), "marker": str(action[2])}
+        finally:
+            self._close(connection)
+
+    def prepared_recovery_email_actions(self, run_id: str) -> tuple[Mapping[str, object], ...]:
+        connection = connect(self.config)
+        try:
+            with transaction(connection) as cursor:
+                cursor.execute(
+                    """
+                    select a.id::text, a.marker, a.request_hash, e.id, e.control_code, e.remediation,
+                           request.recipient, m.configuration_json
+                    from workflow.action_executions a
+                    join workflow.close_runs r on r.id = a.run_id
+                    join workflow.close_mappings m on m.id = r.mapping_id
+                    join workflow.recovery_email_requests request on request.action_id = a.id
+                    join workflow.reconciliation_exceptions e on e.id = request.exception_id
+                    where a.run_id = %s::uuid and a.provider = 'gmail'
+                      and a.operation = 'send_approved_request' and a.status in ('prepared', 'outcome_unknown')
+                    order by a.created_at, a.id
+                    """,
+                    (run_id,),
+                )
+                rows = cursor.fetchall()
+            return tuple({
+                "action_id": str(row[0]), "marker": str(row[1]), "request_hash": str(row[2]),
+                "exception_id": str(row[3]), "control_code": str(row[4]), "remediation": str(row[5]),
+                "recipient": str(row[6]), "configuration": row[7] if isinstance(row[7], Mapping) else {},
+            } for row in rows)
         finally:
             self._close(connection)
 
@@ -1448,6 +2302,26 @@ class SupabaseWorkflowStore:
             str(row[6]),
             str(row[7]) if row[7] is not None else None,
             str(row[8]) if row[8] is not None else None,
+        )
+
+    @staticmethod
+    def _mapping_from_row(row: Sequence[object]) -> PersistedCloseMapping:
+        raw_configuration = row[4]
+        if isinstance(raw_configuration, str):
+            try:
+                raw_configuration = loads(raw_configuration)
+            except ValueError as exc:
+                raise SupabaseConfigError("persisted close mapping is malformed") from exc
+        if not isinstance(raw_configuration, Mapping):
+            raise SupabaseConfigError("persisted close mapping is malformed")
+        return PersistedCloseMapping(
+            str(row[0]),
+            str(row[1]),
+            int(row[2]),
+            str(row[3]),
+            dict(raw_configuration),
+            str(row[5]),
+            row[6],
         )
 
     @staticmethod

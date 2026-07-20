@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import logging
 import os
+import asyncio
+import json
+from hashlib import sha256
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -12,11 +15,19 @@ from urllib.parse import urlencode, urlparse
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from .close_mapping import (
+    BankLedgerMapping,
+    CloseMappingDraft,
+    EvidenceConfiguration,
+    MatchingRules,
+)
 from .connections import ConnectionHealth, ConnectionRegistry, ConnectionStatus
 from .domain import CloseService, DeploymentConfig, JournalLine, JournalProposal, PolicyError
+from .google_oauth import GoogleOAuthClient, GoogleOAuthConfig, GoogleOAuthError
+from .plaid_link import PlaidLinkClient, PlaidLinkConfig, PlaidLinkError
 from .secrets_store import SecretStoreError, secret_store_from_environment
 from .security import create_oauth_transaction, validate_oauth_callback
 from .supabase_auth import (
@@ -96,10 +107,27 @@ class WorkflowStore(Protocol):
     def approve_review_package(self, **kwargs) -> PersistedCloseRun:
         ...
 
+    def active_close_mapping(self, organization_id: str):
+        ...
+
+    def save_close_mapping(self, **kwargs):
+        ...
+
+    def review_data_for_run(self, run_id: str):
+        ...
+
+    def resolve_reconciliation_exception(self, **kwargs):
+        ...
+
+    def queue_exception_recovery_email(self, **kwargs):
+        ...
+
 
 service = CloseService(deployment_from_environment())
 connections = ConnectionRegistry(service.deployment)
 xero_oauth_client: XeroOAuthClient | None = None
+google_oauth_client: GoogleOAuthClient | None = None
+plaid_link_client: PlaidLinkClient | None = None
 xero_oauth_sessions: OAuthSessionStore = InMemoryOAuthSessionStore()
 auth_verifier: AuthVerifier | None = None
 workflow_store: WorkflowStore | None = None
@@ -109,6 +137,18 @@ def configure_xero_oauth(client: XeroOAuthClient | None) -> None:
     """Inject the server-side Xero client during application bootstrap/tests."""
     global xero_oauth_client
     xero_oauth_client = client
+
+
+def configure_google_oauth(client: GoogleOAuthClient | None) -> None:
+    """Inject the server-side Google Workspace OAuth client for startup/tests."""
+    global google_oauth_client
+    google_oauth_client = client
+
+
+def configure_plaid_link(client: PlaidLinkClient | None) -> None:
+    """Inject the server-side Plaid Link client for startup/tests."""
+    global plaid_link_client
+    plaid_link_client = client
 
 
 def configure_oauth_sessions(store: OAuthSessionStore) -> None:
@@ -147,6 +187,26 @@ def _build_xero_oauth_client() -> XeroOAuthClient | None:
     return XeroOAuthClient(config, secrets)
 
 
+def _build_google_oauth_client() -> GoogleOAuthClient | None:
+    try:
+        config = GoogleOAuthConfig.from_environment()
+        secrets = secret_store_from_environment()
+    except (GoogleOAuthError, SecretStoreError) as exc:
+        logger.info("Google OAuth not configured at startup: %s", exc)
+        return None
+    return GoogleOAuthClient(config, secrets)
+
+
+def _build_plaid_link_client() -> PlaidLinkClient | None:
+    try:
+        config = PlaidLinkConfig.from_environment()
+        secrets = secret_store_from_environment()
+    except (PlaidLinkError, SecretStoreError) as exc:
+        logger.info("Plaid Link not configured at startup: %s", exc)
+        return None
+    return PlaidLinkClient(config, secrets)
+
+
 def _build_auth_verifier() -> AuthVerifier | None:
     try:
         return SupabaseAuthVerifier(SupabaseAuthConfig.from_environment())
@@ -167,6 +227,10 @@ def _build_workflow_store() -> WorkflowStore | None:
 async def lifespan(_: FastAPI):
     if xero_oauth_client is None:
         configure_xero_oauth(_build_xero_oauth_client())
+    if google_oauth_client is None:
+        configure_google_oauth(_build_google_oauth_client())
+    if plaid_link_client is None:
+        configure_plaid_link(_build_plaid_link_client())
     if os.getenv("SUPABASE_DB_URL", "").strip():
         configure_oauth_sessions(_build_oauth_session_store())
     if auth_verifier is None:
@@ -233,6 +297,76 @@ class ProposalRequest(BaseModel):
 
 class ApprovalRequest(BaseModel):
     package_hash: str
+
+
+class BankMappingRequest(BaseModel):
+    plaid_account_id: str = Field(min_length=1, max_length=300)
+    xero_account_code: str = Field(min_length=1, max_length=80)
+    xero_account_name: str = Field(min_length=1, max_length=300)
+
+
+class MatchingRulesRequest(BaseModel):
+    date_window_days: int = Field(ge=0, le=60)
+    fee_tolerance: Decimal = Field(ge=0)
+    materiality_threshold: Decimal = Field(ge=0)
+    pending_policy: str = Field(pattern=r"^(exclude|exception)$")
+    max_aggregate_size: int = Field(ge=1, le=100)
+
+
+class EvidenceConfigurationRequest(BaseModel):
+    drive_folder_ids: list[str] = Field(min_length=1, max_length=50)
+    gmail_mailbox: str = Field(min_length=3, max_length=300)
+    gmail_labels: list[str] = Field(min_length=1, max_length=50)
+    allowed_recipients: list[str] = Field(min_length=1, max_length=100)
+    retention_policy_version: str = Field(min_length=1, max_length=100)
+
+
+class CloseMappingRequest(BaseModel):
+    xero_tenant_id: str = Field(min_length=1, max_length=300)
+    bank_mappings: list[BankMappingRequest] = Field(min_length=1, max_length=50)
+    matching_rules: MatchingRulesRequest
+    permitted_journal_account_codes: list[str] = Field(min_length=1, max_length=200)
+    evidence: EvidenceConfigurationRequest
+    journal_adjustment_account_code: str | None = Field(default=None, min_length=1, max_length=80)
+
+    def to_domain(self) -> CloseMappingDraft:
+        return CloseMappingDraft(
+            self.xero_tenant_id,
+            tuple(
+                BankLedgerMapping(item.plaid_account_id, item.xero_account_code, item.xero_account_name)
+                for item in self.bank_mappings
+            ),
+            MatchingRules(
+                self.matching_rules.date_window_days,
+                self.matching_rules.fee_tolerance,
+                self.matching_rules.materiality_threshold,
+                self.matching_rules.pending_policy,
+                self.matching_rules.max_aggregate_size,
+            ),
+            tuple(self.permitted_journal_account_codes),
+            EvidenceConfiguration(
+                tuple(self.evidence.drive_folder_ids),
+                self.evidence.gmail_mailbox,
+                tuple(self.evidence.gmail_labels),
+                tuple(self.evidence.allowed_recipients),
+                self.evidence.retention_policy_version,
+            ),
+            self.journal_adjustment_account_code,
+        )
+
+
+class PlaidExchangeRequest(BaseModel):
+    public_token: str = Field(min_length=1, max_length=2000)
+    selected_account_ids: list[str] = Field(min_length=1, max_length=50)
+
+
+class ExceptionResolutionRequest(BaseModel):
+    status: str = Field(pattern=r"^(resolved|ignored)$")
+    comment: str = Field(min_length=3, max_length=2000)
+
+
+class RecoveryEmailRequest(BaseModel):
+    recipient: str = Field(min_length=3, max_length=300)
 
 
 @app.exception_handler(PolicyError)
@@ -325,6 +459,26 @@ def serialize_task_event(event) -> dict[str, object]:
         "payload": dict(event.payload),
         "created_at": event.created_at.isoformat(),
     }
+
+
+def serialize_close_mapping(mapping) -> dict[str, object] | None:
+    if mapping is None:
+        return None
+    return {
+        "id": mapping.mapping_id,
+        "organization_id": mapping.organization_id,
+        "version": mapping.version,
+        "status": mapping.status,
+        "configuration": dict(mapping.configuration),
+        "approved_by_subject": mapping.approved_by_subject,
+        "created_at": mapping.created_at.isoformat() if getattr(mapping, "created_at", None) else None,
+    }
+
+
+def _connection_secret_ref(provider: str, organization_id: str, connection_id: str, credential_kind: str) -> str:
+    """Create an opaque secret-manager reference without leaking external IDs."""
+    digest = sha256(f"{organization_id}|{connection_id}".encode("utf-8")).hexdigest()[:32]
+    return f"secret://{provider}/production/connection-{digest}/{credential_kind}"
 
 
 @app.get("/health")
@@ -432,6 +586,104 @@ def get_close_run_events(
     ]
 
 
+@app.get("/api/v1/close-runs/{run_id}/events/stream")
+async def stream_close_run_events(
+    run_id: str,
+    user: CurrentUser,
+    after: int = 0,
+) -> StreamingResponse:
+    """Authenticated SSE with durable replay from the supplied event cursor.
+
+    The browser sends its bearer token using fetch rather than an EventSource
+    query string, so the session is never placed in a URL or event log.
+    """
+    run = require_store().get_close_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="close run not found")
+    require_organization_role(run.organization_id, user)
+    if after < 0:
+        raise HTTPException(status_code=422, detail="event cursor must be non-negative")
+
+    async def event_stream():
+        cursor = after
+        idle_cycles = 0
+        while True:
+            batch = require_store().events_for_run(run_id, after_event_id=cursor, limit=100)
+            if batch:
+                idle_cycles = 0
+                for event in batch:
+                    cursor = event.event_id
+                    payload = serialize_task_event(event)
+                    yield f"id: {event.event_id}\nevent: close_progress\ndata: {json.dumps(payload, default=str)}\n\n"
+            else:
+                idle_cycles += 1
+                if idle_cycles % 15 == 0:
+                    yield ": keepalive\n\n"
+                await asyncio.sleep(1)
+
+    return StreamingResponse(
+        event_stream(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/v1/close-runs/{run_id}/review")
+def get_close_run_review(run_id: str, user: CurrentUser) -> dict[str, object]:
+    run = require_store().get_close_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="close run not found")
+    require_organization_role(run.organization_id, user)
+    review = require_store().review_data_for_run(run_id)
+    return {
+        "run_id": review.run_id,
+        "snapshot_id": review.snapshot_id,
+        "mapping": serialize_close_mapping(review.mapping),
+        "source_batches": [dict(item) for item in review.source_batches],
+        "evidence_items": [dict(item) for item in review.evidence_items],
+        "review_package": dict(review.review_package) if review.review_package else None,
+        "journal_proposals": [dict(item) for item in review.journal_proposals],
+        "reconciliation_matches": [dict(item) for item in review.reconciliation_matches],
+        "reconciliation_exceptions": [dict(item) for item in review.reconciliation_exceptions],
+        "report": dict(review.report) if review.report else None,
+        "artifacts": [dict(item) for item in review.artifacts],
+        "actions": [dict(item) for item in review.actions],
+    }
+
+
+@app.post("/api/v1/close-runs/{run_id}/exceptions/{exception_id}/resolve")
+def resolve_reconciliation_exception(
+    run_id: str,
+    exception_id: str,
+    request: ExceptionResolutionRequest,
+    user: CurrentUser,
+) -> dict[str, str]:
+    run = require_store().get_close_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="close run not found")
+    require_organization_role(run.organization_id, user, frozenset({"controller", "operator"}))
+    require_store().resolve_reconciliation_exception(
+        run_id=run_id, exception_id=exception_id, status=request.status,
+        comment=request.comment, actor_subject=user.subject,
+    )
+    return {"status": request.status}
+
+
+@app.post("/api/v1/close-runs/{run_id}/exceptions/{exception_id}/recovery-email", status_code=202)
+def queue_recovery_email(
+    run_id: str,
+    exception_id: str,
+    request: RecoveryEmailRequest,
+    user: CurrentUser,
+) -> dict[str, object]:
+    run = require_store().get_close_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="close run not found")
+    require_organization_role(run.organization_id, user, frozenset({"controller", "operator"}))
+    return dict(require_store().queue_exception_recovery_email(
+        run_id=run_id, exception_id=exception_id, recipient=request.recipient,
+    ))
+
+
 @app.post("/api/v1/close-runs/{run_id}/retry")
 def retry_close_run(run_id: str, user: CurrentUser) -> dict[str, object]:
     run = require_store().get_close_run(run_id)
@@ -454,6 +706,91 @@ def cancel_close_run(run_id: str, user: CurrentUser) -> dict[str, object]:
 def get_connections(organization_id: str, user: CurrentUser) -> list[dict[str, object]]:
     require_organization_role(organization_id, user)
     return [serialize_connection(connection) for connection in require_store().connections_for_organization(organization_id)]
+
+
+@app.get("/api/v1/organizations/{organization_id}/close-mapping")
+def get_close_mapping(organization_id: str, user: CurrentUser) -> dict[str, object] | None:
+    require_organization_role(organization_id, user)
+    return serialize_close_mapping(require_store().active_close_mapping(organization_id))
+
+
+@app.post("/api/v1/organizations/{organization_id}/close-mapping", status_code=201)
+def save_close_mapping(organization_id: str, request: CloseMappingRequest, user: CurrentUser) -> dict[str, object]:
+    require_organization_role(organization_id, user, frozenset({"controller"}))
+    mapping = require_store().save_close_mapping(
+        organization_id=organization_id,
+        mapping=request.to_domain(),
+        approved_by_subject=user.subject,
+    )
+    return serialize_close_mapping(mapping) or {}
+
+
+@app.get("/api/v1/organizations/{organization_id}/connections/plaid/link-token")
+def create_plaid_link_token(organization_id: str, user: CurrentUser) -> dict[str, str | None]:
+    require_organization_role(organization_id, user, frozenset({"controller", "operator"}))
+    if plaid_link_client is None:
+        raise HTTPException(status_code=503, detail="Plaid Link is not configured")
+    try:
+        token, expires_at = plaid_link_client.create_link_token(organization_id)
+    except PlaidLinkError as exc:
+        logger.warning("Plaid Link token creation failed for organization %s: %s", organization_id, exc)
+        raise HTTPException(status_code=502, detail="Plaid Link could not be started") from exc
+    return {"link_token": token, "expires_at": expires_at}
+
+
+@app.post("/api/v1/organizations/{organization_id}/connections/plaid/exchange", status_code=201)
+def exchange_plaid_public_token(
+    organization_id: str,
+    request: PlaidExchangeRequest,
+    user: CurrentUser,
+) -> list[dict[str, object]]:
+    require_organization_role(organization_id, user, frozenset({"controller", "operator"}))
+    if plaid_link_client is None:
+        raise HTTPException(status_code=503, detail="Plaid Link is not configured")
+    try:
+        linked = plaid_link_client.exchange_public_token(request.public_token, request.selected_account_ids)
+        access_ref = _connection_secret_ref("plaid", organization_id, linked.item_id, "access-token")
+        plaid_link_client.secrets.store(access_ref, linked.access_token)
+        now = datetime.now(timezone.utc)
+        registered = []
+        for account in linked.accounts:
+            target = account.account_id
+            health = connections.register(
+                ConnectionHealth(
+                    connection_id=f"plaid:{linked.item_id}:{target}",
+                    organization_id=organization_id,
+                    provider="plaid",
+                    provider_environment="production",
+                    provider_tenant_or_account_id=target,
+                    status=ConnectionStatus.HEALTHY,
+                    granted_scopes=("transactions",),
+                    last_verified_at=now,
+                    last_success_at=now,
+                    remediation=None,
+                ),
+                credential_secret_ref=access_ref,
+            )
+            registered.append(require_store().upsert_connection(connection_health=health, credential_secret_ref=access_ref))
+    except (PlaidLinkError, SecretStoreError, PolicyError) as exc:
+        logger.warning("Plaid Link exchange failed for organization %s: %s", organization_id, exc)
+        raise HTTPException(status_code=502, detail="Plaid account connection could not be completed") from exc
+    return [serialize_connection(connection) for connection in registered]
+
+
+@app.get("/api/v1/organizations/{organization_id}/connections/google/authorize")
+def authorize_google(organization_id: str, user: CurrentUser) -> dict[str, str]:
+    require_organization_role(organization_id, user, frozenset({"controller", "operator"}))
+    if service.deployment.mode == "production" and workflow_store is None:
+        raise HTTPException(status_code=503, detail="durable workflow storage is required for production OAuth")
+    if google_oauth_client is None:
+        raise HTTPException(status_code=503, detail="Google OAuth is not configured")
+    transaction = create_oauth_transaction("drive", google_oauth_client.config.redirect_uri)
+    xero_oauth_sessions.put(transaction, organization_id)
+    try:
+        authorization_url = google_oauth_client.authorization_url(transaction)
+    except GoogleOAuthError as exc:
+        raise HTTPException(status_code=503, detail="Google OAuth configuration is invalid") from exc
+    return {"authorization_url": authorization_url, "state": transaction.state}
 
 
 @app.get("/api/v1/organizations/{organization_id}/connections/xero/authorize")
@@ -492,7 +829,12 @@ def xero_callback(
         raise HTTPException(status_code=400, detail="Xero OAuth authorization code is required")
     try:
         validate_oauth_callback(transaction, state, xero_oauth_client.config.redirect_uri)
-        token = xero_oauth_client.exchange_code(code, transaction.code_verifier)
+        refresh_ref = _connection_secret_ref("xero", organization_id, "oauth", "refresh-token")
+        token = xero_oauth_client.exchange_code(
+            code,
+            transaction.code_verifier,
+            refresh_token_secret_ref=refresh_ref,
+        )
     except XeroOAuthError as exc:
         raise HTTPException(status_code=502, detail="Xero OAuth token exchange failed") from exc
     except PolicyError as exc:
@@ -500,7 +842,7 @@ def xero_callback(
     if token.scope is not None and frozenset(token.scope.split()) != frozenset(xero_oauth_client.config.scopes):
         raise HTTPException(status_code=502, detail="Xero granted scopes do not match the approved scope profile")
     try:
-        registered_tenants = _register_xero_connection(organization_id)
+        registered_tenants = _register_xero_connection(organization_id, refresh_ref)
     except (XeroOAuthError, PolicyError) as exc:
         logger.warning("Xero tenant registration failed after OAuth: %s", exc)
         raise HTTPException(status_code=502, detail="Xero authorization could not be linked to an approved tenant") from exc
@@ -520,6 +862,71 @@ def xero_callback(
     return payload
 
 
+@app.get("/api/v1/connections/google/callback")
+def google_callback(
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+) -> dict[str, object]:
+    if google_oauth_client is None:
+        raise HTTPException(status_code=503, detail="Google OAuth is not configured")
+    if not state:
+        raise HTTPException(status_code=400, detail="Google OAuth state is required")
+    session = xero_oauth_sessions.consume(state)
+    if session is None:
+        raise HTTPException(status_code=400, detail="Google OAuth state is invalid or already used")
+    transaction, organization_id = session
+    if transaction.provider != "drive":
+        raise HTTPException(status_code=400, detail="Google OAuth state is invalid")
+    if error:
+        raise HTTPException(status_code=400, detail="Google authorization was declined")
+    if not code:
+        raise HTTPException(status_code=400, detail="Google OAuth authorization code is required")
+    try:
+        validate_oauth_callback(transaction, state, google_oauth_client.config.redirect_uri)
+        token = google_oauth_client.exchange_code(code, transaction)
+        if token.scope:
+            granted = frozenset(token.scope.split())
+            if not frozenset(google_oauth_client.config.scopes).issubset(granted):
+                raise GoogleOAuthError("Google granted scopes do not match the approved scope profile")
+        if not token.refresh_token:
+            raise GoogleOAuthError("Google did not grant a durable refresh token")
+        refresh_ref = _connection_secret_ref("google", organization_id, "workspace", "refresh-token")
+        access_ref = _connection_secret_ref("google", organization_id, "workspace", "access-token")
+        google_oauth_client.secrets.store(refresh_ref, token.refresh_token)
+        google_oauth_client.secrets.store(access_ref, token.access_token)
+        now = datetime.now(timezone.utc)
+        scope = google_oauth_client.config.scopes
+        for provider in ("drive", "gmail"):
+            health = connections.register(
+                ConnectionHealth(
+                    connection_id=f"google:{organization_id}:{provider}",
+                    organization_id=organization_id,
+                    provider=provider,
+                    provider_environment="production",
+                    provider_tenant_or_account_id="workspace",
+                    status=ConnectionStatus.HEALTHY,
+                    granted_scopes=scope,
+                    last_verified_at=now,
+                    last_success_at=now,
+                    remediation=None,
+                ),
+                credential_secret_ref=refresh_ref,
+            )
+            require_store().upsert_connection(connection_health=health, credential_secret_ref=refresh_ref)
+    except (GoogleOAuthError, SecretStoreError, PolicyError) as exc:
+        logger.warning("Google OAuth callback failed for organization %s: %s", organization_id, exc)
+        raise HTTPException(status_code=502, detail="Google authorization could not be connected") from exc
+    payload = {"status": "authorized", "organization_id": organization_id}
+    web_app_url = _web_app_url()
+    if web_app_url:
+        return RedirectResponse(
+            f"{web_app_url}/?{urlencode({'google': payload['status'], 'organization_id': organization_id})}",
+            status_code=303,
+        )
+    return payload
+
+
 def _xero_tenant_allowlist() -> frozenset[str]:
     raw = os.getenv("ACCOUNTINGOS_XERO_TENANT_ALLOWLIST", "")
     return frozenset(
@@ -527,7 +934,7 @@ def _xero_tenant_allowlist() -> frozenset[str]:
     )
 
 
-def _register_xero_connection(organization_id: str) -> int:
+def _register_xero_connection(organization_id: str, refresh_token_secret_ref: str | None = None) -> int:
     if xero_oauth_client is None:
         raise XeroOAuthError("Xero OAuth is not configured")
     allowlist = _xero_tenant_allowlist()
@@ -553,12 +960,12 @@ def _register_xero_connection(organization_id: str) -> int:
                     last_success_at=now,
                     remediation=None,
                 ),
-                credential_secret_ref=xero_oauth_client.config.refresh_token_secret_ref,
+                credential_secret_ref=refresh_token_secret_ref or xero_oauth_client.config.refresh_token_secret_ref,
             )
             if workflow_store is not None:
                 workflow_store.upsert_connection(
                     connection_health=connection_health,
-                    credential_secret_ref=xero_oauth_client.config.refresh_token_secret_ref,
+                    credential_secret_ref=refresh_token_secret_ref or xero_oauth_client.config.refresh_token_secret_ref,
                 )
             registered += 1
         except PolicyError as exc:

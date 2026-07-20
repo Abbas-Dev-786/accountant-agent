@@ -49,7 +49,8 @@ The root `../contradictions.md` records the review history and final decisions.
 ## Current runnable path
 
 The current application path is Supabase magic-link sign-in → server-side
-Supabase token validation → controller bootstrap → Xero OAuth handoff →
+Supabase token validation → controller bootstrap → Xero OAuth, Plaid Link, and
+Google Workspace authorization → controller-approved versioned close mapping →
 idempotent close-run creation. Browser requests go only to FastAPI; all
 financial tables live in private Supabase schemas. See the root
 [`README.md`](../README.md) for the required environment values and migration

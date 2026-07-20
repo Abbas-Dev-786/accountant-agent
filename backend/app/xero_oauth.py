@@ -210,7 +210,13 @@ class XeroOAuthClient:
         parts = urlsplit(self.config.authorize_endpoint)
         return urlunsplit((parts.scheme, parts.netloc, parts.path, query, ""))
 
-    def exchange_code(self, code: str, code_verifier: str) -> XeroToken:
+    def exchange_code(
+        self,
+        code: str,
+        code_verifier: str,
+        *,
+        refresh_token_secret_ref: str | None = None,
+    ) -> XeroToken:
         if not code or not code_verifier:
             raise XeroOAuthError("authorization code and PKCE verifier are required")
         token = self._token(
@@ -221,7 +227,7 @@ class XeroOAuthClient:
                 "code_verifier": code_verifier,
             }
         )
-        self._store_refresh_token(token.refresh_token)
+        self._store_refresh_token(token.refresh_token, refresh_token_secret_ref)
         self._cache(token)
         return token
 
@@ -283,9 +289,9 @@ class XeroOAuthClient:
         self._cached_token = token
         self._cached_until = current + timedelta(seconds=token.expires_in)
 
-    def _store_refresh_token(self, refresh_token: str) -> None:
+    def _store_refresh_token(self, refresh_token: str, secret_ref: str | None = None) -> None:
         try:
-            self.secrets.store(self.config.refresh_token_secret_ref, refresh_token)
+            self.secrets.store(secret_ref or self.config.refresh_token_secret_ref, refresh_token)
         except Exception as exc:
             raise XeroOAuthError("Xero refresh token could not be persisted") from exc
 

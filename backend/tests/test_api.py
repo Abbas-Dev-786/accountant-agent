@@ -34,11 +34,6 @@ class FakeWorkflowStore:
     def organizations_for_user(self, issuer, subject):
         return self.organizations
 
-    def bootstrap_organization(self, **kwargs):
-        organization = OrganizationSummary(kwargs["organization_id"], kwargs["organization_name"], "controller")
-        self.organizations = (organization,)
-        return organization
-
     def create_close_run(self, **kwargs):
         key = (kwargs["organization_id"], kwargs["idempotency_key"])
         if key not in self.keys:
@@ -266,23 +261,6 @@ class ApiTests(unittest.TestCase):
 
         chunks = asyncio.run(read_stream())
         self.assertTrue(any("id: 2" in chunk for chunk in chunks))
-
-    def test_bootstrap_is_limited_to_the_configured_controller_and_one_us_organization(self) -> None:
-        self.store.organizations = ()
-        with patch.dict("os.environ", {"ACCOUNTINGOS_BOOTSTRAP_CONTROLLER_EMAIL": "controller@example.test"}):
-            allowed = self.client.post(
-                "/api/v1/organizations/bootstrap",
-                json={"organization_id": "acme-us", "name": "Acme US"},
-                headers=self._headers(),
-            )
-            rejected = self.client.post(
-                "/api/v1/organizations/bootstrap",
-                json={"organization_id": "another-us", "name": "Another organization"},
-                headers=self._headers(),
-            )
-        self.assertEqual(allowed.status_code, 201)
-        self.assertEqual(rejected.status_code, 409)
-
 
 if __name__ == "__main__":
     unittest.main()

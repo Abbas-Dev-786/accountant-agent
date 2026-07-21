@@ -89,9 +89,6 @@ def _require_web_configuration(env: Mapping[str, str]) -> None:
     ]
     if invalid:
         raise ValueError(f"production HTTPS URL is missing or invalid: {', '.join(invalid)}")
-    email = env.get("ACCOUNTINGOS_BOOTSTRAP_CONTROLLER_EMAIL", "").strip()
-    if _is_placeholder(email) or "@" not in email or email.startswith("@") or email.endswith("@"):
-        raise ValueError("ACCOUNTINGOS_BOOTSTRAP_CONTROLLER_EMAIL must be a real controller email")
 
 
 def _require_no_legacy_secret_configuration(env: Mapping[str, str]) -> None:

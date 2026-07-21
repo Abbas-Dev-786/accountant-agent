@@ -13,7 +13,6 @@ def production_env():
         "ACCOUNTINGOS_CURRENCY": "USD",
         "ACCOUNTINGOS_CORS_ORIGINS": "https://app.example.test",
         "ACCOUNTINGOS_WEB_APP_URL": "https://app.example.test",
-        "ACCOUNTINGOS_BOOTSTRAP_CONTROLLER_EMAIL": "controller@example.test",
         "SUPABASE_URL": "https://example.supabase.co",
         "SUPABASE_PUBLISHABLE_KEY": "sb_publishable_test-key",
         "SUPABASE_DB_URL": "postgresql://postgres:secret@db.example/postgres?sslmode=require",

@@ -150,7 +150,15 @@ async function api<T>(path: string, token: string, init: RequestInit = {}): Prom
   const headers = new Headers(init.headers);
   headers.set("Authorization", `Bearer ${token}`);
   if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
-  const response = await fetch(`${apiBaseUrl}${path}`, { ...init, cache: "no-store", headers });
+  let response: Response;
+  try {
+    response = await fetch(`${apiBaseUrl}${path}`, { ...init, cache: "no-store", headers });
+  } catch (fetchError) {
+    if (fetchError instanceof TypeError) {
+      throw new Error(`Cannot reach the API at ${apiBaseUrl}. Start it with ./backend/start.sh and confirm its CORS origin matches this web app.`);
+    }
+    throw fetchError;
+  }
   if (!response.ok) {
     const body = await response.json().catch(() => null);
     throw new Error(apiErrorDetail(body) || `Request failed (${response.status})`);
@@ -244,8 +252,6 @@ export default function Home() {
   const [recoveryRecipient, setRecoveryRecipient] = useState("");
   const [reviewComment, setReviewComment] = useState("");
   const [email, setEmail] = useState("");
-  const [organizationName, setOrganizationName] = useState("");
-  const [organizationSlug, setOrganizationSlug] = useState("");
   const [period, setPeriod] = useState(previousMonthRange);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
@@ -547,26 +553,6 @@ export default function Home() {
     setBusy(false);
     if (signInError) setError(signInError.message);
     else setMessage("Check your inbox for a secure sign-in link.");
-  }
-
-  async function bootstrapOrganization(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!session) return;
-    setBusy(true);
-    setError("");
-    setMessage("");
-    try {
-      await api<Organization>("/api/v1/organizations/bootstrap", session.access_token, {
-        method: "POST",
-        body: JSON.stringify({ organization_id: organizationSlug, name: organizationName }),
-      });
-      await loadWorkspace(session, true);
-      setMessage("US organization is ready. Connect the approved Xero tenant when production credentials are configured.");
-    } catch (bootstrapError) {
-      setError(bootstrapError instanceof Error ? bootstrapError.message : "Could not bootstrap the organization");
-    } finally {
-      setBusy(false);
-    }
   }
 
   async function createRun() {
@@ -929,16 +915,7 @@ export default function Home() {
       {streamError && <p className="notice error">{streamError}</p>}
       {message && <p className="notice good">{message}</p>}
 
-      {!workspace?.organizations.length ? (
-        <form className="empty card" onSubmit={bootstrapOrganization}>
-          <p className="eyebrow">FIRST-TIME SETUP</p>
-          <h2>Set up the US organization.</h2>
-          <p>Your email must match <code>ACCOUNTINGOS_BOOTSTRAP_CONTROLLER_EMAIL</code> on the API. This creates one controller organization.</p>
-          <label>Organization name<input value={organizationName} onChange={(event) => setOrganizationName(event.target.value)} placeholder="Acme US" required /></label>
-          <label>Organization ID<input value={organizationSlug} onChange={(event) => setOrganizationSlug(event.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ""))} placeholder="acme-us" pattern="[a-z0-9][a-z0-9-]*" required /></label>
-          <button type="submit" disabled={busy}>{busy ? "Creating…" : "Create US organization"}</button>
-        </form>
-      ) : (
+      {workspace?.organizations.length ? (
         <>
           <section className="workspace-bar" aria-label="Organization selector">
             <div><p className="eyebrow">ACTIVE ORGANIZATION</p><strong>{selectedOrganization?.name}</strong></div>
@@ -1106,6 +1083,12 @@ export default function Home() {
             </article>}
           </section>
         </>
+      ) : (
+        <section className="empty card">
+          <p className="eyebrow">WORKSPACE</p>
+          <h2>Preparing your organization…</h2>
+          <p>Your first signed-in session creates the controller organization automatically.</p>
+        </section>
       )}
     </main>
   );

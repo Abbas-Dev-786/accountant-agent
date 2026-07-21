@@ -17,6 +17,7 @@ from hashlib import sha256
 from json import dumps, loads
 from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence
 from urllib.parse import parse_qs, urlparse
+from uuid import uuid4
 
 from .close_mapping import CloseMappingDraft, PersistedCloseMapping
 from .close_execution import DerivedCloseExecution, SnapshotFact
@@ -28,6 +29,10 @@ from .security import OAuthTransaction
 
 class SupabaseConfigError(PolicyError):
     """Raised when the backend cannot safely connect to Supabase Postgres."""
+
+
+class SupabaseConnectionUnavailable(SupabaseConfigError):
+    """Raised when a valid Supabase configuration cannot reach Postgres."""
 
 
 @dataclass(frozen=True)
@@ -61,14 +66,12 @@ class SupabaseDatabaseConfig:
         if any(key.startswith("NEXT_PUBLIC_") for key in values if "SERVICE_ROLE" in key):
             raise SupabaseConfigError("Supabase service-role credentials cannot be public")
         try:
-            return cls(
-                database_url,
-                int(values.get("SUPABASE_DB_CONNECT_TIMEOUT", "10")),
-                int(values.get("SUPABASE_DB_POOL_MAX", "10")),
-                int(values.get("SUPABASE_DB_POOL_WAIT_SECONDS", "15")),
-            )
+            connect_timeout_seconds = int(values.get("SUPABASE_DB_CONNECT_TIMEOUT", "10"))
+            pool_max_size = int(values.get("SUPABASE_DB_POOL_MAX", "10"))
+            pool_wait_seconds = int(values.get("SUPABASE_DB_POOL_WAIT_SECONDS", "15"))
         except ValueError as exc:
             raise SupabaseConfigError("Supabase connection configuration must use integer timeouts and pool sizes") from exc
+        return cls(database_url, connect_timeout_seconds, pool_max_size, pool_wait_seconds)
 
 
 @dataclass(frozen=True)
@@ -214,7 +217,12 @@ def _open_connection(config: SupabaseDatabaseConfig):
         import psycopg
     except ImportError as exc:  # pragma: no cover - exercised in deployment
         raise SupabaseConfigError("install psycopg[binary] to connect to Supabase") from exc
-    return psycopg.connect(config.database_url, connect_timeout=config.connect_timeout_seconds)
+    try:
+        return psycopg.connect(config.database_url, connect_timeout=config.connect_timeout_seconds)
+    except psycopg.OperationalError as exc:
+        # Keep connectivity failures out of the API's generic 500 path.  The
+        # original error remains chained for server logs, never the client.
+        raise SupabaseConnectionUnavailable("Supabase Postgres is unreachable") from exc
 
 
 class _PooledConnection:
@@ -566,23 +574,48 @@ class SupabaseWorkflowStore:
         finally:
             self._close(connection)
 
-    def bootstrap_organization(
+    def ensure_initial_organization(
         self,
         *,
-        organization_id: str,
-        organization_name: str,
         deployment: "DeploymentConfig",
         issuer: str,
         subject: str,
-    ) -> OrganizationSummary:
-        """Create the one configured demo organization and its controller membership.
+    ) -> OrganizationSummary | None:
+        """Create the initial controller organization for the first signed-in user.
 
-        The caller is allowlisted by the API before this method runs. Repeated
-        calls are idempotent and never change an existing deployment boundary.
+        A transaction-scoped advisory lock serializes first sign-ins. This keeps
+        the generated ID server-owned and ensures a later user cannot silently
+        gain control of an existing accounting workspace.
         """
         connection = connect(self.config)
         try:
             with transaction(connection) as cursor:
+                cursor.execute("select pg_advisory_xact_lock(%s, %s)", (241_937, 814_603))
+                cursor.execute(
+                    """
+                    select o.id, o.name, u.role
+                    from workflow.organization_users u
+                    join workflow.organizations o on o.id = u.organization_id
+                    where u.identity_issuer = %s and u.identity_subject = %s and o.status = 'active'
+                    order by o.name, o.id
+                    limit 1
+                    """,
+                    (issuer, subject),
+                )
+                existing_membership = cursor.fetchone()
+                if existing_membership is not None:
+                    return OrganizationSummary(
+                        str(existing_membership[0]), str(existing_membership[1]), str(existing_membership[2])
+                    )
+                cursor.execute(
+                    "select 1 from workflow.organizations where deployment_id = %s limit 1",
+                    (deployment.deployment_id,),
+                )
+                if cursor.fetchone() is not None:
+                    return None
+
+                organization_id = f"org-{uuid4().hex}"
+                organization_name = "My US Organization"
                 cursor.execute(
                     """
                     insert into workflow.deployments

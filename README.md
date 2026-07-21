@@ -99,7 +99,7 @@ cp web/.env.local.example web/.env.local
 ```
 
 The API requires the server-only `SUPABASE_DB_URL`, `SUPABASE_URL`,
-`SUPABASE_PUBLISHABLE_KEY`, and `ACCOUNTINGOS_BOOTSTRAP_CONTROLLER_EMAIL`.
+and `SUPABASE_PUBLISHABLE_KEY`.
 Before starting the API or worker, provision every `secret://` reference from
 `backend/.env.example` in Supabase Vault using that exact reference as the
 Vault secret name. Provider onboarding then creates and rotates its connection
@@ -110,6 +110,15 @@ The browser needs only `NEXT_PUBLIC_SUPABASE_URL`,
 Provider and artifact values in `backend/.env` remain server-only. Keep the
 template's `secret://` references and supply the actual values through the
 chosen secret store; do not add any credential to `web/.env.local`.
+
+The first authenticated user receives one controller organization automatically
+with a server-generated ID. There is no bootstrap form or controller-email
+allow-list to configure.
+
+For a local network without IPv6, set `SUPABASE_DB_URL` to the exact **Session
+pooler** URI from Supabase Dashboard → Connect (with `sslmode=require`), not
+the direct `db.<project-ref>.supabase.co` URI. The direct endpoint is IPv6-only
+unless the project has Supabase's IPv4 add-on.
 
 Apply the repository migrations to the remote Supabase project after supplying
 your project reference and authenticating the CLI:
@@ -122,10 +131,15 @@ npx supabase db push
 Start the API with the environment loaded:
 
 ```sh
-cd backend
-set -a; source .env; set +a
-.venv/bin/python -m uvicorn app.main:app --reload
+./backend/start.sh
 ```
+
+The launcher reads `backend/.env`, serves on `127.0.0.1:8000`, and enables
+reload by default. Override these with `ACCOUNTINGOS_API_HOST`,
+`ACCOUNTINGOS_API_PORT`, or set `ACCOUNTINGOS_API_RELOAD=0`.
+When the local environment still has its template URL placeholders, it safely
+uses `http://localhost:3000` for CORS and OAuth returns. Set
+`ACCOUNTINGOS_LOCAL_WEB_ORIGIN` if your web app uses a different local origin.
 
 ```powershell
 cd backend

@@ -44,6 +44,7 @@ from .supabase_auth import (
 )
 from .supabase_db import (
     PersistedCloseRun,
+    SupabaseConnectionUnavailable,
     SupabaseConfigError,
     SupabaseDatabaseConfig,
     SupabaseWorkflowStore,
@@ -79,7 +80,7 @@ class WorkflowStore(Protocol):
     def organizations_for_user(self, issuer: str, subject: str):
         ...
 
-    def bootstrap_organization(self, **kwargs):
+    def ensure_initial_organization(self, **kwargs):
         ...
 
     def create_close_run(self, **kwargs) -> PersistedCloseRun:
@@ -305,7 +306,25 @@ async def lifespan(_: FastAPI):
 
 def _cors_origins() -> list[str]:
     raw = os.getenv("ACCOUNTINGOS_CORS_ORIGINS", "http://localhost:3000")
-    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+    origins = list(dict.fromkeys(origin.strip().rstrip("/") for origin in raw.split(",") if origin.strip()))
+
+    # localhost and 127.0.0.1 are different browser origins, even though both
+    # reach the same local process. Keep local API startup resilient to either
+    # spelling without broadening the production allow-list.
+    for origin in tuple(origins):
+        parsed = urlparse(origin)
+        if parsed.scheme != "http" or parsed.hostname not in {"localhost", "127.0.0.1"}:
+            continue
+        try:
+            port = f":{parsed.port}" if parsed.port is not None else ""
+        except ValueError:
+            logger.warning("Ignoring malformed CORS origin: %s", origin)
+            continue
+        alternate_host = "127.0.0.1" if parsed.hostname == "localhost" else "localhost"
+        alternate_origin = f"http://{alternate_host}{port}"
+        if alternate_origin not in origins:
+            origins.append(alternate_origin)
+    return origins
 
 
 def _web_app_url() -> str | None:
@@ -357,15 +376,20 @@ app.add_middleware(
 )
 
 
+@app.exception_handler(SupabaseConnectionUnavailable)
+async def supabase_connection_unavailable(_: Request, exc: SupabaseConnectionUnavailable) -> JSONResponse:
+    """Return a retryable API response when Postgres cannot be reached."""
+    logger.warning("Supabase Postgres is unavailable: %s", exc, exc_info=exc)
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"detail": "The workflow database is temporarily unavailable. Please try again shortly."},
+    )
+
+
 class CreateRunRequest(BaseModel):
     organization_id: str = Field(min_length=1, max_length=200)
     period_start: str
     period_end: str
-
-
-class BootstrapOrganizationRequest(BaseModel):
-    organization_id: str = Field(min_length=1, max_length=200, pattern=r"^[a-z0-9][a-z0-9-]*$")
-    name: str = Field(min_length=1, max_length=200)
 
 
 class JournalLineRequest(BaseModel):
@@ -618,6 +642,22 @@ def health() -> dict[str, object]:
 @app.get("/api/v1/me")
 def get_me(user: CurrentUser) -> dict[str, object]:
     organizations = require_store().organizations_for_user(user.issuer, user.subject)
+    if not organizations:
+        if (service.deployment.mode, service.deployment.data_class, service.deployment.market, service.deployment.currency) != (
+            "production",
+            "live",
+            "US",
+            "USD",
+        ):
+            raise HTTPException(status_code=409, detail="automatic organization provisioning requires the US production deployment")
+        organization = require_store().ensure_initial_organization(
+            deployment=service.deployment,
+            issuer=user.issuer,
+            subject=user.subject,
+        )
+        if organization is None:
+            raise HTTPException(status_code=403, detail="this workspace is already initialized; ask its controller for access")
+        organizations = (organization,)
     return {
         "id": user.subject,
         "email": user.email,
@@ -625,33 +665,6 @@ def get_me(user: CurrentUser) -> dict[str, object]:
             {"id": item.organization_id, "name": item.name, "role": item.role} for item in organizations
         ],
     }
-
-
-@app.post("/api/v1/organizations/bootstrap", status_code=201)
-def bootstrap_organization(request: BootstrapOrganizationRequest, user: CurrentUser) -> dict[str, object]:
-    expected_email = os.getenv("ACCOUNTINGOS_BOOTSTRAP_CONTROLLER_EMAIL", "").strip().lower()
-    if not expected_email:
-        raise HTTPException(status_code=503, detail="bootstrap controller email is not configured")
-    if not user.email or user.email.lower() != expected_email:
-        raise HTTPException(status_code=403, detail="user is not allowed to bootstrap this organization")
-    if (service.deployment.mode, service.deployment.data_class, service.deployment.market, service.deployment.currency) != (
-        "production",
-        "live",
-        "US",
-        "USD",
-    ):
-        raise HTTPException(status_code=409, detail="organization bootstrap is restricted to the US production deployment")
-    if require_store().organizations_for_user(user.issuer, user.subject):
-        raise HTTPException(status_code=409, detail="bootstrap controller already belongs to an organization")
-    organization = require_store().bootstrap_organization(
-        organization_id=request.organization_id,
-        organization_name=request.name,
-        deployment=service.deployment,
-        issuer=user.issuer,
-        subject=user.subject,
-    )
-    return {"id": organization.organization_id, "name": organization.name, "role": organization.role}
-
 
 @app.post("/api/v1/close-runs", status_code=201)
 def create_close_run(

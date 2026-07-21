@@ -3,6 +3,7 @@ Name: accountingos-api
 Version: 0.1.0
 Summary: AccountingOS close-readiness API
 Requires-Python: >=3.12
+Requires-Dist: cryptography<47,>=43
 Requires-Dist: fastapi<1.0,>=0.115
 Requires-Dist: pydantic<3.0,>=2.9
 Requires-Dist: psycopg[binary]<4.0,>=3.2

@@ -36,6 +36,7 @@ from .evidence import (
 )
 from .google_oauth import GoogleOAuthClient, GoogleOAuthConfig, GoogleOAuthError
 from .groq import GroqConfig, GroqError, GroqExplanationModel
+from .plaid_link import PlaidLinkConfig, PlaidLinkError
 from .provider_runtime import GmailHttpClient, GoogleDriveHttpClient, XeroDraftHttpClient
 from .provider_runtime import (
     PlaidHttpSandboxClient,
@@ -228,13 +229,12 @@ class EnvironmentPreflightExecutor:
         try:
             xero = XeroOAuthConfig.from_environment(self.env)
             secrets = secret_store_from_environment(self.env)
-            secrets.resolve(xero.client_secret_ref)
             secrets.resolve(xero.refresh_token_secret_ref)
-            required = ("PLAID_CLIENT_ID", "PLAID_SECRET_REF", "PLAID_ACCESS_TOKEN_REF", "PLAID_ITEM_ID")
+            PlaidLinkConfig.from_environment(self.env)
+            required = ("PLAID_ACCESS_TOKEN_REF", "PLAID_ITEM_ID")
             missing = [name for name in required if not self.env.get(name, "").strip() or "replace-with" in self.env.get(name, "")]
             if missing:
                 raise TaskBlocked(f"missing required fixture configuration: {', '.join(missing)}")
-            secrets.resolve(self.env["PLAID_SECRET_REF"])
             secrets.resolve(self.env["PLAID_ACCESS_TOKEN_REF"])
         except (XeroOAuthError, SecretStoreError) as exc:
             raise TaskBlocked(str(exc)) from exc
@@ -262,16 +262,11 @@ class ProductionPreflightExecutor:
         try:
             secrets = secret_store_from_environment(self.env)
             xero_config = XeroOAuthConfig.from_environment(self.env)
-            secrets.resolve(xero_config.client_secret_ref)
             xero_refresh_ref = self.store.connection_secret_ref(run.organization_id, "xero", tenant_id)
             if not xero_refresh_ref:
                 raise TaskBlocked("the mapped Xero tenant is not a healthy production connection")
             secrets.resolve(xero_refresh_ref)
-            client_id = self.env.get("PLAID_CLIENT_ID", "").strip()
-            secret_ref = self.env.get("PLAID_SECRET_REF", "").strip()
-            if not client_id or client_id.startswith("replace-") or not secret_ref:
-                raise TaskBlocked("Plaid production application credentials are not configured")
-            secrets.resolve(secret_ref)
+            PlaidLinkConfig.from_environment(self.env)
             access_refs = {
                 self.store.connection_secret_ref(run.organization_id, "plaid", account_id)
                 for account_id in selected_accounts
@@ -284,8 +279,8 @@ class ProductionPreflightExecutor:
                 raise TaskBlocked("Google Workspace is not a healthy production connection")
             GoogleOAuthConfig.from_environment(self.env)
             secrets.resolve(google_refresh_ref)
-        except (GoogleOAuthError, SecretStoreError, XeroOAuthError) as exc:
-            raise TaskBlocked("a required production secret reference is unavailable") from exc
+        except (GoogleOAuthError, PlaidLinkError, SecretStoreError, XeroOAuthError) as exc:
+            raise TaskBlocked("required production provider credentials are unavailable") from exc
 
 
 def _configured_values(env: Mapping[str, str], key: str) -> frozenset[str]:
@@ -366,8 +361,7 @@ class DemoSourceSyncExecutor:
             plaid = PlaidSandboxAdapter(
                 PlaidHttpSandboxClient(
                     client_id=self.env.get("PLAID_CLIENT_ID", "").strip(),
-                    client_secret_secret_ref=self.env.get("PLAID_SECRET_REF", "").strip(),
-                    secret_resolver=secrets,
+                    client_secret=PlaidLinkConfig.from_environment(self.env).client_secret,
                     transport=UrllibJsonTransport(),
                 ),
                 secrets.resolve(plaid_access_ref),
@@ -506,8 +500,7 @@ class ProductionSourceSyncExecutor:
             plaid = PlaidProductionAdapter(
                 PlaidProductionHttpClient(
                     client_id=self.env.get("PLAID_CLIENT_ID", "").strip(),
-                    client_secret_secret_ref=self.env.get("PLAID_SECRET_REF", "").strip(),
-                    secret_resolver=secrets,
+                    client_secret=PlaidLinkConfig.from_environment(self.env).client_secret,
                     transport=UrllibJsonTransport(),
                 ),
                 secrets.resolve(plaid_access_ref),
@@ -612,11 +605,7 @@ class PlaidWebhookSyncWorker:
     def _sync(self, request: PersistedPlaidSyncRequest) -> None:
         try:
             secrets = secret_store_from_environment(self.env)
-            client_id = self.env.get("PLAID_CLIENT_ID", "").strip()
-            secret_ref = self.env.get("PLAID_SECRET_REF", "").strip()
-            if not client_id or not secret_ref:
-                raise TaskBlocked("Plaid production application credentials are not configured")
-            secrets.resolve(secret_ref)
+            plaid_config = PlaidLinkConfig.from_environment(self.env)
             account_ids = frozenset(str(value) for value in self.store.plaid_accounts_for_item(request.organization_id, request.item_id))
             if not account_ids:
                 raise TaskBlocked("Plaid webhook Item is no longer connected to a healthy production account")
@@ -629,9 +618,8 @@ class PlaidWebhookSyncWorker:
             state = self.store.plaid_sync_state_for_item(request.organization_id, request.item_id)
             adapter = PlaidProductionAdapter(
                 PlaidProductionHttpClient(
-                    client_id=client_id,
-                    client_secret_secret_ref=secret_ref,
-                    secret_resolver=secrets,
+                    client_id=plaid_config.client_id,
+                    client_secret=plaid_config.client_secret,
                     transport=UrllibJsonTransport(),
                 ),
                 secrets.resolve(next(iter(access_refs))),
@@ -855,7 +843,7 @@ class DurableReconciliationExecutor:
                     organization_id=run.organization_id,
                     provider="groq",
                     provider_target="grounded-explanations",
-                    credential_ref=self.env.get("GROQ_API_KEY_REF", ""),
+                    credential_ref="secret://environment/groq/api-key",
                 )
             except Exception as exc:
                 audit = service.audit_records[-1] if service.audit_records else None
@@ -876,7 +864,7 @@ class DurableReconciliationExecutor:
     def _archive_close_package(self, run_id: str, organization_id: str) -> None:
         try:
             config = B2Config.from_environment(self.env)
-            client = B2ObjectLockClient(config, env=self.env)
+            client = B2ObjectLockClient(config)
             artifact = client.upload_close_package(run_id=run_id, package=self.store.close_artifact_payload(run_id))
             self.store.record_close_artifact(
                 run_id=run_id, object_key=artifact.object_key, content_hash=artifact.content_hash,
@@ -886,7 +874,7 @@ class DurableReconciliationExecutor:
                 organization_id=organization_id,
                 provider="b2",
                 provider_target="compliance-close-archive",
-                credential_ref=config.key_id_ref,
+                credential_ref="secret://environment/b2/static-credentials",
             )
         except B2Error as exc:
             raise TaskBlocked("B2 immutable close-package storage is not configured or did not confirm Object Lock") from exc

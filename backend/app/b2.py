@@ -17,25 +17,36 @@ from typing import Mapping, Protocol
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
-from .secrets_store import SecretStoreError, secret_store_from_environment
-
-
 class B2Error(RuntimeError):
     pass
+
+
+def _environment_secret(values: Mapping[str, str], name: str, legacy_name: str) -> str:
+    """Read a static server credential without consulting Supabase Vault."""
+    value = values.get(name, "").strip()
+    if value:
+        return value
+    legacy_value = values.get(legacy_name, "").strip()
+    return "" if legacy_value.startswith("secret://") else legacy_value
 
 
 @dataclass(frozen=True)
 class B2Config:
     bucket_name: str
-    key_id_ref: str
-    application_key_ref: str
+    key_id: str
+    application_key: str
     retention_days: int = 2555
 
     def __post_init__(self) -> None:
         if not self.bucket_name or self.bucket_name.startswith("replace-"):
             raise B2Error("B2_BUCKET_NAME must be configured")
-        if not self.key_id_ref.startswith("secret://") or not self.application_key_ref.startswith("secret://"):
-            raise B2Error("B2 credentials must be secret-manager references")
+        if (
+            not self.key_id
+            or not self.application_key
+            or self.key_id.startswith(("replace-", "secret://"))
+            or self.application_key.startswith(("replace-", "secret://"))
+        ):
+            raise B2Error("B2_KEY_ID and B2_APPLICATION_KEY must be configured server-side")
         if not 1 <= self.retention_days <= 36500:
             raise B2Error("B2 retention days must be between 1 and 36500")
 
@@ -48,8 +59,8 @@ class B2Config:
             raise B2Error("B2_OBJECT_LOCK_RETENTION_DAYS must be an integer") from exc
         return cls(
             values.get("B2_BUCKET_NAME", "").strip(),
-            values.get("B2_KEY_ID_REF", "").strip(),
-            values.get("B2_APPLICATION_KEY_REF", "").strip(),
+            _environment_secret(values, "B2_KEY_ID", "B2_KEY_ID_REF"),
+            _environment_secret(values, "B2_APPLICATION_KEY", "B2_APPLICATION_KEY_REF"),
             retention_days,
         )
 
@@ -85,21 +96,12 @@ class B2Artifact:
 
 
 class B2ObjectLockClient:
-    def __init__(self, config: B2Config, *, transport: B2Transport | None = None, env: Mapping[str, str] | None = None) -> None:
+    def __init__(self, config: B2Config, *, transport: B2Transport | None = None) -> None:
         self.config = config
         self.transport = transport or UrllibB2Transport()
-        try:
-            self.secrets = secret_store_from_environment(env)
-        except SecretStoreError as exc:
-            raise B2Error("B2 secret store is not configured") from exc
 
     def _authorized(self) -> Mapping[str, object]:
-        try:
-            key_id = self.secrets.resolve(self.config.key_id_ref)
-            application_key = self.secrets.resolve(self.config.application_key_ref)
-        except SecretStoreError as exc:
-            raise B2Error("B2 credentials are unavailable") from exc
-        basic = base64.b64encode(f"{key_id}:{application_key}".encode()).decode()
+        basic = base64.b64encode(f"{self.config.key_id}:{self.config.application_key}".encode()).decode()
         response = self.transport.request(
             "GET", "https://api.backblazeb2.com/b2api/v2/b2_authorize_account",
             {"Authorization": f"Basic {basic}", "Accept": "application/json"},

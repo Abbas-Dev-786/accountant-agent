@@ -208,8 +208,7 @@ def require_plaid_webhook_verifier() -> PlaidWebhookVerifier:
             config = PlaidLinkConfig.from_environment()
             plaid_webhook_verifier = PlaidWebhookVerifier(
                 client_id=config.client_id,
-                client_secret_ref=config.client_secret_ref,
-                secret_resolver=secret_store_from_environment(),
+                client_secret=config.client_secret,
                 transport=UrllibJsonTransport(),
             )
     return plaid_webhook_verifier

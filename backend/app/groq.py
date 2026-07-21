@@ -10,9 +10,6 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from .ai import AIValidationError, ExplanationModel
-from .secrets_store import SecretStoreError, secret_store_from_environment
-
-
 class GroqError(AIValidationError):
     """Raised when Groq cannot produce a usable bounded response."""
 
@@ -45,16 +42,10 @@ class GroqConfig:
             timeout_seconds = int(values.get("GROQ_TIMEOUT_SECONDS", "30"))
         except (TypeError, ValueError) as exc:
             raise GroqError("GROQ_TIMEOUT_SECONDS must be an integer") from exc
-        api_key_ref = values.get("GROQ_API_KEY_REF", "").strip()
-        if api_key_ref:
-            try:
-                api_key = secret_store_from_environment(values).resolve(api_key_ref)
-            except SecretStoreError as exc:
-                raise GroqError("GROQ_API_KEY_REF could not be resolved server-side") from exc
-        else:
-            api_key = values.get("GROQ_API_KEY", "")
-            if values.get("ACCOUNTINGOS_DEPLOYMENT_MODE", "").strip() == "production":
-                raise GroqError("production deployments require GROQ_API_KEY_REF")
+        api_key = values.get("GROQ_API_KEY", "").strip()
+        if not api_key:
+            legacy_value = values.get("GROQ_API_KEY_REF", "").strip()
+            api_key = "" if legacy_value.startswith("secret://") else legacy_value
         return cls(
             api_key,
             values.get("GROQ_MODEL", "openai/gpt-oss-20b"),

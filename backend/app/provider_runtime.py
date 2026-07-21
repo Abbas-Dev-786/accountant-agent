@@ -435,20 +435,18 @@ class XeroBaselineHttpClient:
 @dataclass
 class PlaidHttpSandboxClient(PlaidSandboxClient):
     client_id: str
-    client_secret_secret_ref: str
-    secret_resolver: SecretResolver
+    client_secret: str
     transport: JsonTransport
     base_url: str = "https://sandbox.plaid.com"
 
     def __post_init__(self) -> None:
-        if not self.client_id or not self.base_url.startswith("https://"):
+        if not self.client_id or not self.client_secret or self.client_secret.startswith("secret://") or not self.base_url.startswith("https://"):
             raise RuntimeConfigError("Plaid Sandbox HTTP configuration is invalid")
 
     def sync(self, access_token: str, cursor: str | None) -> PlaidSyncPage:
         if not access_token or access_token.startswith("secret://"):
             raise RuntimeConfigError("Plaid adapter must receive a resolved access token")
-        secret = self.secret_resolver.resolve(self.client_secret_secret_ref)
-        payload: dict[str, object] = {"client_id": self.client_id, "secret": secret, "access_token": access_token}
+        payload: dict[str, object] = {"client_id": self.client_id, "secret": self.client_secret, "access_token": access_token}
         if cursor:
             payload["cursor"] = cursor
         response = self.transport.request("POST", f"{self.base_url.rstrip('/')}/transactions/sync", {}, payload)
@@ -480,12 +478,11 @@ class PlaidProductionHttpClient(PlaidHttpSandboxClient):
     def __init__(
         self,
         client_id: str,
-        client_secret_secret_ref: str,
-        secret_resolver: SecretResolver,
+        client_secret: str,
         transport: JsonTransport,
         base_url: str = "https://production.plaid.com",
     ) -> None:
-        super().__init__(client_id, client_secret_secret_ref, secret_resolver, transport, base_url)
+        super().__init__(client_id, client_secret, transport, base_url)
 
     def sync(self, access_token: str, cursor: str | None) -> PlaidSyncPage:
         source_page = super().sync(access_token, cursor)

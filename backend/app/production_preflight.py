@@ -1,9 +1,10 @@
 """Read-only production readiness checks for AccountingOS.
 
 The command deliberately validates configuration, Supabase schema state, and
-Vault-backed static credentials without printing a secret or contacting a
-provider API. Provider OAuth consent and close execution remain controller
-actions in the browser/worker, respectively.
+the Vault boundary for runtime OAuth tokens without printing a secret or
+contacting a provider API. Static provider credentials are read only from the
+server environment. Provider OAuth consent and close execution remain
+controller actions in the browser/worker, respectively.
 """
 
 from __future__ import annotations
@@ -17,22 +18,12 @@ from urllib.parse import urlparse
 
 from .b2 import B2Config, B2Error
 from .google_oauth import GoogleOAuthConfig, GoogleOAuthError
+from .groq import GroqConfig, GroqError
 from .plaid_link import PlaidLinkConfig, PlaidLinkError
 from .secrets_store import SecretStoreError
 from .supabase_auth import AuthenticationUnavailable, SupabaseAuthConfig
 from .supabase_db import SupabaseConfigError, SupabaseDatabaseConfig, connect, transaction
 from .xero_oauth import XeroOAuthConfig, XeroOAuthError
-
-
-STATIC_SECRET_REFS: tuple[tuple[str, str], ...] = (
-    ("Xero client secret", "ACCOUNTINGOS_XERO_CLIENT_SECRET_REF"),
-    ("Plaid client secret", "PLAID_SECRET_REF"),
-    ("Google client secret", "GOOGLE_CLIENT_SECRET_REF"),
-    ("Groq API key", "GROQ_API_KEY_REF"),
-    ("B2 key ID", "B2_KEY_ID_REF"),
-    ("B2 application key", "B2_APPLICATION_KEY_REF"),
-)
-
 
 @dataclass(frozen=True)
 class PreflightCheck:
@@ -97,7 +88,7 @@ def _require_no_legacy_secret_configuration(env: Mapping[str, str]) -> None:
         legacy.append("ACCOUNTINGOS_SECRET_STORE_PATH")
     legacy.extend(sorted(key for key in env if key.startswith("SECRET_")))
     if legacy:
-        raise ValueError(f"remove obsolete file-store/raw-secret variables: {', '.join(legacy)}")
+        raise ValueError(f"remove obsolete local secret-store variables: {', '.join(legacy)}")
 
 
 def _validate_application_configs(env: Mapping[str, str]) -> None:
@@ -107,13 +98,14 @@ def _validate_application_configs(env: Mapping[str, str]) -> None:
         ("Xero OAuth", lambda: XeroOAuthConfig.from_environment(env)),
         ("Plaid Link", lambda: PlaidLinkConfig.from_environment(env)),
         ("Google OAuth", lambda: GoogleOAuthConfig.from_environment(env)),
+        ("Groq", lambda: GroqConfig.from_environment(env)),
         ("B2", lambda: B2Config.from_environment(env)),
     )
     errors: list[str] = []
     for name, validator in validators:
         try:
             validator()
-        except (SupabaseConfigError, AuthenticationUnavailable, XeroOAuthError, PlaidLinkError, GoogleOAuthError, B2Error, ValueError) as exc:
+        except (SupabaseConfigError, AuthenticationUnavailable, XeroOAuthError, PlaidLinkError, GoogleOAuthError, GroqError, B2Error, ValueError) as exc:
             errors.append(f"{name}: {str(exc) or 'invalid configuration'}")
 
     required_https = (
@@ -130,11 +122,14 @@ def _validate_application_configs(env: Mapping[str, str]) -> None:
     if invalid_https:
         errors.append(f"production HTTPS URL is missing or invalid: {', '.join(invalid_https)}")
 
-    groq_reference = env.get("GROQ_API_KEY_REF", "").strip()
-    if not groq_reference.startswith("secret://") or _is_placeholder(groq_reference):
-        errors.append("GROQ_API_KEY_REF must be a Supabase Vault reference")
-    if any(key.startswith("NEXT_PUBLIC_") and "GROQ" in key for key in env):
-        errors.append("Groq credentials cannot be public client variables")
+    public_credentials = [
+        key
+        for key in env
+        if key.startswith("NEXT_PUBLIC_")
+        and any(fragment in key for fragment in ("SECRET", "API_KEY", "APPLICATION_KEY", "KEY_ID", "PASSWORD", "PRIVATE_KEY"))
+    ]
+    if public_credentials:
+        errors.append(f"credentials cannot be public client variables: {', '.join(sorted(public_credentials))}")
     tenant_allowlist = [
         value for value in env.get("ACCOUNTINGOS_XERO_TENANT_ALLOWLIST", "").replace(",", " ").split()
         if value and not _is_placeholder(value)
@@ -143,16 +138,6 @@ def _validate_application_configs(env: Mapping[str, str]) -> None:
         errors.append("ACCOUNTINGOS_XERO_TENANT_ALLOWLIST must name at least one approved Xero tenant")
     if errors:
         raise ValueError("; ".join(errors))
-
-
-def _first_value(row: object) -> object | None:
-    if row is None:
-        return None
-    if isinstance(row, Mapping):
-        return next(iter(row.values()), None)
-    if isinstance(row, (tuple, list)):
-        return row[0] if row else None
-    return row
 
 
 def _database_and_vault_checks(
@@ -201,20 +186,8 @@ def _database_and_vault_checks(
                 for name, value in zip(expected, values, strict=True)
             )
 
-            for label, key in STATIC_SECRET_REFS:
-                reference = env.get(key, "").strip()
-                if _is_placeholder(reference) or not reference.startswith("secret://"):
-                    checks.append(PreflightCheck(f"Vault {label}", False, f"{key} is invalid"))
-                    continue
-                cursor.execute(
-                    "select decrypted_secret from vault.decrypted_secrets where name = %s",
-                    (reference,),
-                )
-                value = _first_value(cursor.fetchone())
-                valid = isinstance(value, str) and not _is_placeholder(value)
-                checks.append(PreflightCheck(f"Vault {label}", valid, "ok" if valid else "missing or placeholder"))
     except Exception as exc:
-        return (PreflightCheck("Supabase database and Vault", False, str(exc) or "connection failed"),)
+        return (PreflightCheck("Supabase database and OAuth token Vault", False, str(exc) or "connection failed"),)
     finally:
         close = getattr(connection, "close", None)
         if callable(close):
@@ -238,8 +211,8 @@ def production_preflight(
     if all(check.passed for check in checks):
         try:
             checks.extend(_database_and_vault_checks(values, connection_factory))
-        except (SupabaseConfigError, AuthenticationUnavailable, XeroOAuthError, PlaidLinkError, GoogleOAuthError, B2Error, SecretStoreError) as exc:
-            checks.append(PreflightCheck("Supabase database and Vault", False, str(exc)))
+        except (SupabaseConfigError, AuthenticationUnavailable, XeroOAuthError, PlaidLinkError, GoogleOAuthError, GroqError, B2Error, SecretStoreError) as exc:
+            checks.append(PreflightCheck("Supabase database and OAuth token Vault", False, str(exc)))
     return PreflightReport(tuple(checks))
 
 

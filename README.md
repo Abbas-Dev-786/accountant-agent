@@ -99,17 +99,15 @@ cp web/.env.local.example web/.env.local
 ```
 
 The API requires the server-only `SUPABASE_DB_URL`, `SUPABASE_URL`,
-and `SUPABASE_PUBLISHABLE_KEY`.
-Before starting the API or worker, provision every `secret://` reference from
-`backend/.env.example` in Supabase Vault using that exact reference as the
-Vault secret name. Provider onboarding then creates and rotates its connection
-credentials in Vault; `workflow.connections` stores references only, never
-token material.
+and `SUPABASE_PUBLISHABLE_KEY`. Static provider credentials in
+`backend/.env` are read directly by the API and worker; they are never read
+from Supabase Vault. Provider onboarding creates and rotates each connected
+account's OAuth credentials in Vault; `workflow.connections` stores references
+only, never token material.
 The browser needs only `NEXT_PUBLIC_SUPABASE_URL`,
 `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`, and `NEXT_PUBLIC_API_BASE_URL`.
-Provider and artifact values in `backend/.env` remain server-only. Keep the
-template's `secret://` references and supply the actual values through the
-chosen secret store; do not add any credential to `web/.env.local`.
+Provider and artifact values in `backend/.env` remain server-only. Do not add
+any credential to `web/.env.local` or a `NEXT_PUBLIC_` variable.
 
 The first authenticated user receives one controller organization automatically
 with a server-generated ID. There is no bootstrap form or controller-email
@@ -162,9 +160,9 @@ Get-Content .env | ForEach-Object { if ($_ -match '^([^#=]+)=(.*)$') { [Environm
 ```
 
 Before a production controller connects providers, run the read-only preflight.
-It validates the production boundary, private Supabase schema, Vault references,
-and obsolete file-secret settings without printing a credential or making a
-provider write:
+It validates the production boundary, private Supabase schema, server-only
+static credentials, and the Vault boundary for OAuth tokens without printing a
+credential or making a provider write:
 
 ```sh
 cd backend

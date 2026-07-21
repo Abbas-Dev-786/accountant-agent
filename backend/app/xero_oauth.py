@@ -26,6 +26,17 @@ class XeroOAuthError(RuntimeError):
     """Raised when Xero OAuth configuration or token exchange fails."""
 
 
+def _environment_secret(values: Mapping[str, str], name: str, legacy_name: str) -> str:
+    """Read a static server credential without consulting Supabase Vault."""
+    value = values.get(name, "").strip()
+    if value:
+        return value
+    legacy_value = values.get(legacy_name, "").strip()
+    # Existing local .env files used an inaccurate *_REF variable name. Accept
+    # its literal value during migration, but never resolve a Vault reference.
+    return "" if legacy_value.startswith("secret://") else legacy_value
+
+
 class SecretStore(Protocol):
     def resolve(self, secret_ref: str) -> str:
         ...
@@ -130,7 +141,7 @@ class UrllibFormTransport:
 @dataclass(frozen=True)
 class XeroOAuthConfig:
     client_id: str
-    client_secret_ref: str
+    client_secret: str
     refresh_token_secret_ref: str
     redirect_uri: str
     scopes: tuple[str, ...]
@@ -140,8 +151,8 @@ class XeroOAuthConfig:
     def __post_init__(self) -> None:
         if not self.client_id or self.client_id.startswith("replace-"):
             raise XeroOAuthError("Xero client ID must be configured")
-        if not self.client_secret_ref.startswith("secret://"):
-            raise XeroOAuthError("Xero client secret must be a secret:// reference")
+        if not self.client_secret or self.client_secret.startswith(("replace-", "secret://")):
+            raise XeroOAuthError("ACCOUNTINGOS_XERO_CLIENT_SECRET must be configured server-side")
         if self.refresh_token_secret_ref and not self.refresh_token_secret_ref.startswith("secret://"):
             raise XeroOAuthError("Xero refresh token must be a secret:// reference")
         redirect = urlsplit(self.redirect_uri)
@@ -162,7 +173,7 @@ class XeroOAuthConfig:
         scopes = tuple(values.get("ACCOUNTINGOS_XERO_SCOPES", "").split())
         return cls(
             values.get("ACCOUNTINGOS_XERO_CLIENT_ID", ""),
-            values.get("ACCOUNTINGOS_XERO_CLIENT_SECRET_REF", ""),
+            _environment_secret(values, "ACCOUNTINGOS_XERO_CLIENT_SECRET", "ACCOUNTINGOS_XERO_CLIENT_SECRET_REF"),
             values.get("ACCOUNTINGOS_XERO_REFRESH_TOKEN_SECRET_REF", "").strip(),
             values.get("ACCOUNTINGOS_XERO_REDIRECT_URI", ""),
             scopes,
@@ -310,7 +321,7 @@ class XeroOAuthClient:
             raise XeroOAuthError("Xero refresh token could not be persisted") from exc
 
     def _token(self, form: Mapping[str, str]) -> XeroToken:
-        client_secret = self.secrets.resolve(self.config.client_secret_ref)
+        client_secret = self.config.client_secret
         if not client_secret or client_secret.startswith("replace-"):
             raise XeroOAuthError("Xero client secret is unavailable")
         basic = base64.b64encode(f"{self.config.client_id}:{client_secret}".encode("utf-8")).decode("ascii")

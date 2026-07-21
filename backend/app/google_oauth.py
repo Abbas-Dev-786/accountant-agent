@@ -1,4 +1,4 @@
-"""Server-only Google Workspace OAuth with PKCE and durable secret references."""
+"""Server-only Google Workspace OAuth with PKCE and durable OAuth token references."""
 
 from __future__ import annotations
 
@@ -18,10 +18,19 @@ class GoogleOAuthError(RuntimeError):
     """Raised when Google authorization cannot complete safely."""
 
 
+def _environment_secret(values: Mapping[str, str], name: str, legacy_name: str) -> str:
+    """Read a static server credential without consulting Supabase Vault."""
+    value = values.get(name, "").strip()
+    if value:
+        return value
+    legacy_value = values.get(legacy_name, "").strip()
+    return "" if legacy_value.startswith("secret://") else legacy_value
+
+
 @dataclass(frozen=True)
 class GoogleOAuthConfig:
     client_id: str
-    client_secret_ref: str
+    client_secret: str
     redirect_uri: str
     scopes: tuple[str, ...]
     token_endpoint: str = "https://oauth2.googleapis.com/token"
@@ -30,8 +39,8 @@ class GoogleOAuthConfig:
     def __post_init__(self) -> None:
         if not self.client_id or self.client_id.startswith("replace-"):
             raise GoogleOAuthError("Google client ID must be configured")
-        if not self.client_secret_ref.startswith("secret://"):
-            raise GoogleOAuthError("Google client secret must be a secret:// reference")
+        if not self.client_secret or self.client_secret.startswith(("replace-", "secret://")):
+            raise GoogleOAuthError("GOOGLE_CLIENT_SECRET must be configured server-side")
         redirect = urlsplit(self.redirect_uri)
         if redirect.scheme not in {"http", "https"} or not redirect.netloc:
             raise GoogleOAuthError("Google redirect URI must be an absolute HTTP(S) URL")
@@ -56,7 +65,7 @@ class GoogleOAuthConfig:
         )
         return cls(
             values.get("GOOGLE_CLIENT_ID", ""),
-            values.get("GOOGLE_CLIENT_SECRET_REF", ""),
+            _environment_secret(values, "GOOGLE_CLIENT_SECRET", "GOOGLE_CLIENT_SECRET_REF"),
             values.get("GOOGLE_REDIRECT_URI", ""),
             scopes,
             values.get("GOOGLE_TOKEN_ENDPOINT", "https://oauth2.googleapis.com/token"),
@@ -141,7 +150,7 @@ class GoogleOAuthClient:
                 "grant_type": "authorization_code",
                 "code": code,
                 "client_id": self.config.client_id,
-                "client_secret": self.secrets.resolve(self.config.client_secret_ref),
+                "client_secret": self.config.client_secret,
                 "redirect_uri": self.config.redirect_uri,
                 "code_verifier": transaction.code_verifier,
             },
@@ -154,7 +163,7 @@ class GoogleOAuthClient:
             {
                 "grant_type": "refresh_token",
                 "client_id": self.config.client_id,
-                "client_secret": self.secrets.resolve(self.config.client_secret_ref),
+                "client_secret": self.config.client_secret,
                 "refresh_token": refresh_token,
             },
             require_refresh=False,

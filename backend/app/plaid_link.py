@@ -21,18 +21,27 @@ class PlaidLinkError(RuntimeError):
     """Raised when a Plaid Link operation cannot safely complete."""
 
 
+def _environment_secret(values: Mapping[str, str], name: str, legacy_name: str) -> str:
+    """Read a static server credential without consulting Supabase Vault."""
+    value = values.get(name, "").strip()
+    if value:
+        return value
+    legacy_value = values.get(legacy_name, "").strip()
+    return "" if legacy_value.startswith("secret://") else legacy_value
+
+
 @dataclass(frozen=True)
 class PlaidLinkConfig:
     client_id: str
-    client_secret_ref: str
+    client_secret: str
     webhook_url: str
     base_url: str = "https://production.plaid.com"
 
     def __post_init__(self) -> None:
         if not self.client_id or self.client_id.startswith("replace-"):
             raise PlaidLinkError("Plaid client ID must be configured")
-        if not self.client_secret_ref.startswith("secret://"):
-            raise PlaidLinkError("Plaid client secret must be a secret:// reference")
+        if not self.client_secret or self.client_secret.startswith(("replace-", "secret://")):
+            raise PlaidLinkError("PLAID_SECRET must be configured server-side")
         if not self.webhook_url.startswith("https://"):
             raise PlaidLinkError("Plaid production webhook must use HTTPS")
         if self.base_url != "https://production.plaid.com":
@@ -43,7 +52,7 @@ class PlaidLinkConfig:
         values = os.environ if env is None else env
         return cls(
             values.get("PLAID_CLIENT_ID", ""),
-            values.get("PLAID_SECRET_REF", ""),
+            _environment_secret(values, "PLAID_SECRET", "PLAID_SECRET_REF"),
             values.get("PLAID_WEBHOOK_URL", ""),
             values.get("PLAID_PRODUCTION_URL", "https://production.plaid.com"),
         )
@@ -167,10 +176,9 @@ class PlaidLinkClient:
         return tuple(accounts)
 
     def _post(self, path: str, body: Mapping[str, object]) -> Mapping[str, object]:
-        secret = self.secrets.resolve(self.config.client_secret_ref)
         response = self.transport.post(
             f"{self.config.base_url}{path}",
-            {"client_id": self.config.client_id, "secret": secret, **body},
+            {"client_id": self.config.client_id, "secret": self.config.client_secret, **body},
         )
         if response.status_code >= 400:
             raise PlaidLinkError(f"Plaid request returned HTTP {response.status_code}")

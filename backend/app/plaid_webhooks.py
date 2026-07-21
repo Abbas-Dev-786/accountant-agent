@@ -13,7 +13,7 @@ from hashlib import sha256
 from threading import Event, Lock
 from typing import Mapping
 
-from .provider_runtime import JsonTransport, SecretResolver
+from .provider_runtime import JsonTransport
 from .providers import ProviderReadError
 
 
@@ -45,8 +45,7 @@ class PlaidWebhookVerifier:
     """Verify the ``Plaid-Verification`` ES256 JWT against Plaid's JWK API."""
 
     client_id: str
-    client_secret_ref: str
-    secret_resolver: SecretResolver
+    client_secret: str
     transport: JsonTransport
     base_url: str = "https://production.plaid.com"
     max_age_seconds: int = 300
@@ -79,7 +78,7 @@ class PlaidWebhookVerifier:
         self._verify_es256(f"{parts[0]}.{parts[1]}".encode(), signature, key)
 
     def _verification_key(self, key_id: str) -> Mapping[str, object]:
-        if not self.client_id or not self.client_secret_ref.startswith("secret://"):
+        if not self.client_id or not self.client_secret or self.client_secret.startswith("secret://"):
             raise PlaidWebhookError("Plaid webhook verifier configuration is invalid")
         now = time.monotonic()
         with self._cache_lock:
@@ -108,12 +107,11 @@ class PlaidWebhookVerifier:
                 raise PlaidWebhookError("Plaid webhook verification key is unavailable")
             return self._verification_key(key_id)
         try:
-            secret = self.secret_resolver.resolve(self.client_secret_ref)
             response = self.transport.request(
                 "POST",
                 f"{self.base_url.rstrip('/')}/webhook_verification_key/get",
                 {},
-                {"client_id": self.client_id, "secret": secret, "key_id": key_id},
+                {"client_id": self.client_id, "secret": self.client_secret, "key_id": key_id},
             )
             if response.status_code >= 400:
                 if 400 <= response.status_code < 500:

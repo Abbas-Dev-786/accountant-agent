@@ -124,14 +124,27 @@ const providerCards = [
 
 const apiBaseUrl = (process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000").replace(/\/$/, "");
 
+function apiErrorDetail(body: unknown): string | null {
+  if (!body || typeof body !== "object" || !("detail" in body)) return null;
+  const detail = (body as { detail?: unknown }).detail;
+  if (typeof detail === "string" && detail) return detail;
+  if (detail === undefined || detail === null) return null;
+  try {
+    const serialized = JSON.stringify(detail);
+    return serialized && serialized !== "{}" ? serialized : null;
+  } catch {
+    return null;
+  }
+}
+
 async function api<T>(path: string, token: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   headers.set("Authorization", `Bearer ${token}`);
   if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
   const response = await fetch(`${apiBaseUrl}${path}`, { ...init, cache: "no-store", headers });
   if (!response.ok) {
-    const body = (await response.json().catch(() => null)) as { detail?: string } | null;
-    throw new Error(body?.detail || `Request failed (${response.status})`);
+    const body = await response.json().catch(() => null);
+    throw new Error(apiErrorDetail(body) || `Request failed (${response.status})`);
   }
   return response.json() as Promise<T>;
 }
@@ -211,8 +224,15 @@ export default function Home() {
   const [period, setPeriod] = useState(previousMonthRange);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
+  const [streamError, setStreamError] = useState("");
   const [busy, setBusy] = useState(false);
   const eventCursorRef = useRef(0);
+  const organizationIdRef = useRef("");
+  const runIdRef = useRef<string | null>(null);
+  const handledSessionTokenRef = useRef<string | null>(null);
+  const handledXeroRedirectRef = useRef(false);
+  const [workspaceSessionToken, setWorkspaceSessionToken] = useState<string | null>(null);
+  const [workspaceReloadNonce, setWorkspaceReloadNonce] = useState(0);
 
   const selectedOrganization = useMemo(
     () => workspace?.organizations.find((organization) => organization.id === organizationId) || null,
@@ -263,28 +283,69 @@ export default function Home() {
     }
   }
 
-  async function loadWorkspace(nextSession: Session) {
+  function consumeXeroRedirect(nextWorkspace: Workspace): string | null {
+    if (handledXeroRedirectRef.current || typeof window === "undefined") return null;
+    const url = new URL(window.location.href);
+    const status = url.searchParams.get("xero");
+    if (!status) return null;
+    handledXeroRedirectRef.current = true;
+    const callbackOrganizationId = url.searchParams.get("organization_id");
+    const selectedCallbackOrganization = nextWorkspace.organizations.find(
+      (organization) => organization.id === callbackOrganizationId,
+    );
+    if (status === "authorized") {
+      setError("");
+      setMessage("Xero authorization completed. Connection status has been refreshed.");
+    } else if (status === "error") {
+      setMessage("");
+      setError("Xero authorization could not be completed. No connection was created.");
+    } else {
+      setMessage("");
+      setError("Xero authorization returned an invalid callback status.");
+    }
+    url.searchParams.delete("xero");
+    url.searchParams.delete("organization_id");
+    window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
+    return selectedCallbackOrganization?.id || null;
+  }
+
+  async function loadWorkspace(nextSession: Session, forceOrganizationReload = false) {
     const nextWorkspace = await api<Workspace>("/api/v1/me", nextSession.access_token);
     setWorkspace(nextWorkspace);
+    const callbackOrganizationId = consumeXeroRedirect(nextWorkspace);
     const nextOrganizationId =
-      nextWorkspace.organizations.find((organization) => organization.id === organizationId)?.id ||
+      callbackOrganizationId ||
+      nextWorkspace.organizations.find((organization) => organization.id === organizationIdRef.current)?.id ||
       nextWorkspace.organizations[0]?.id ||
       "";
+    organizationIdRef.current = nextOrganizationId;
     setOrganizationId(nextOrganizationId);
-    await Promise.all([
-      loadConnections(nextSession.access_token, nextOrganizationId),
-      loadMapping(nextSession.access_token, nextOrganizationId),
-      loadRuns(nextSession.access_token, nextOrganizationId),
-    ]);
+    if (forceOrganizationReload) setWorkspaceReloadNonce((current) => current + 1);
+  }
+
+  async function loadRunEvents(token: string, runId: string) {
+    const events: CloseEvent[] = [];
+    let after = 0;
+    while (true) {
+      const page = await api<CloseEvent[]>(
+        `/api/v1/close-runs/${encodeURIComponent(runId)}/events?after=${after}&limit=500`, token,
+      );
+      events.push(...page);
+      if (page.length < 500) return events;
+      const nextAfter = page[page.length - 1].id;
+      if (nextAfter <= after) throw new Error("Close-event replay cursor did not advance");
+      after = nextAfter;
+    }
   }
 
   async function loadRunDetails(token: string, runId: string) {
     const [nextRun, nextTasks, nextEvents, nextReview] = await Promise.all([
       api<CloseRun>(`/api/v1/close-runs/${encodeURIComponent(runId)}`, token),
       api<CloseTask[]>(`/api/v1/close-runs/${encodeURIComponent(runId)}/tasks`, token),
-      api<CloseEvent[]>(`/api/v1/close-runs/${encodeURIComponent(runId)}/events`, token),
+      loadRunEvents(token, runId),
       api<ReviewData>(`/api/v1/close-runs/${encodeURIComponent(runId)}/review`, token),
     ]);
+    runIdRef.current = nextRun.id;
     setRun(nextRun);
     setRuns((current) => [nextRun, ...current.filter((item) => item.id !== nextRun.id)]);
     setTasks(nextTasks);
@@ -297,6 +358,7 @@ export default function Home() {
     if (!nextOrganizationId) {
       setRuns([]); setRun(null); setTasks([]); setEvents([]); setReview(null);
       eventCursorRef.current = 0;
+      runIdRef.current = null;
       return;
     }
     const nextRuns = await api<CloseRun[]>(
@@ -308,6 +370,7 @@ export default function Home() {
     else {
       setRun(null); setTasks([]); setEvents([]); setReview(null);
       eventCursorRef.current = 0;
+      runIdRef.current = null;
     }
   }
 
@@ -315,53 +378,62 @@ export default function Home() {
     const client = supabaseBrowserClient();
     if (!client) return;
     let active = true;
-    void client.auth.getSession().then(({ data, error: authError }) => {
+    const applySession = async (nextSession: Session | null) => {
       if (!active) return;
-      if (authError) setError(authError.message);
-      setSession(data.session);
-      if (data.session) {
-        void loadWorkspace(data.session).catch((loadError: unknown) => {
-          if (active) setError(loadError instanceof Error ? loadError.message : "Could not load workspace");
-        });
-      }
-    });
-    const { data: listener } = client.auth.onAuthStateChange((_event, nextSession) => {
-      if (!active) return;
-      setSession(nextSession);
       if (!nextSession) {
+        handledSessionTokenRef.current = null;
+        setWorkspaceSessionToken(null);
+        organizationIdRef.current = "";
+        setSession(null);
         setWorkspace(null);
         setConnections([]);
         setRuns([]);
         setRun(null);
+        runIdRef.current = null;
         setTasks([]);
         setEvents([]);
         setMapping(null);
         setReview(null);
         return;
       }
-      void loadWorkspace(nextSession).catch((loadError: unknown) => {
+      setSession(nextSession);
+      if (handledSessionTokenRef.current === nextSession.access_token) return;
+      handledSessionTokenRef.current = nextSession.access_token;
+      try {
+        await loadWorkspace(nextSession);
+        if (active) setWorkspaceSessionToken(nextSession.access_token);
+      } catch (loadError) {
         if (active) setError(loadError instanceof Error ? loadError.message : "Could not load workspace");
-      });
+      }
+    };
+    void client.auth.getSession().then(({ data, error: authError }) => {
+      if (!active) return;
+      if (authError) setError(authError.message);
+      void applySession(data.session);
+    });
+    const { data: listener } = client.auth.onAuthStateChange((_event, nextSession) => {
+      void applySession(nextSession);
     });
     return () => {
       active = false;
       listener.subscription.unsubscribe();
     };
     // The client is stable. Re-establishing this listener for every workspace
-    // refresh would create duplicate auth notifications.
+    // refresh would create duplicate auth notifications. Refs keep this
+    // mount-only listener current without capturing an old organization.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
-    if (!session || !organizationId) return;
+    if (!session || !organizationId || workspaceSessionToken !== session.access_token) return;
     void Promise.all([
       loadConnections(session.access_token, organizationId),
       loadMapping(session.access_token, organizationId),
-      loadRuns(session.access_token, organizationId),
+      loadRuns(session.access_token, organizationId, runIdRef.current || undefined),
     ]).catch((loadError: unknown) => {
       setError(loadError instanceof Error ? loadError.message : "Could not load connections");
     });
-  }, [organizationId, session]);
+  }, [organizationId, session?.access_token, workspaceSessionToken, workspaceReloadNonce]);
 
   useEffect(() => {
     if (!session || !run?.id) return;
@@ -386,12 +458,13 @@ export default function Home() {
           });
           if (!response.ok || !response.body) throw new Error(`Live progress unavailable (${response.status})`);
           reconnectAttempt = 0;
+          setStreamError("");
           const reader = response.body.getReader();
           const decoder = new TextDecoder();
           let buffer = "";
           while (active) {
             const chunk = await reader.read();
-            if (chunk.done) return;
+            if (chunk.done) break;
             buffer += decoder.decode(chunk.value, { stream: true });
             const frames = buffer.split("\n\n");
             buffer = frames.pop() || "";
@@ -404,10 +477,14 @@ export default function Home() {
               refreshDetails();
             }
           }
+          if (active) {
+            reconnectAttempt += 1;
+            await new Promise((resolve) => setTimeout(resolve, Math.min(10_000, 500 * (2 ** Math.min(reconnectAttempt, 5)))));
+          }
         } catch (streamError) {
           if (!active || (streamError instanceof DOMException && streamError.name === "AbortError")) return;
           reconnectAttempt += 1;
-          setError(streamError instanceof Error ? streamError.message : "Live progress stream disconnected");
+          setStreamError(streamError instanceof Error ? streamError.message : "Live progress stream disconnected");
           await new Promise((resolve) => setTimeout(resolve, Math.min(10_000, 500 * (2 ** Math.min(reconnectAttempt, 5)))));
         }
       }
@@ -445,7 +522,7 @@ export default function Home() {
         method: "POST",
         body: JSON.stringify({ organization_id: organizationSlug, name: organizationName }),
       });
-      await loadWorkspace(session);
+      await loadWorkspace(session, true);
       setMessage("US organization is ready. Connect the approved Xero tenant when production credentials are configured.");
     } catch (bootstrapError) {
       setError(bootstrapError instanceof Error ? bootstrapError.message : "Could not bootstrap the organization");
@@ -475,6 +552,19 @@ export default function Home() {
       setMessage("Close run created. It will wait safely until verified provider data is available.");
     } catch (runError) {
       setError(runError instanceof Error ? runError.message : "Could not create close run");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function selectRun(nextRunId: string) {
+    if (!session || !nextRunId) return;
+    setBusy(true);
+    setError("");
+    try {
+      await loadRunDetails(session.access_token, nextRunId);
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : "Could not load the selected close run");
     } finally {
       setBusy(false);
     }
@@ -755,7 +845,7 @@ export default function Home() {
           <label>Period end<input type="date" value={period.end} onChange={(event) => setPeriod({ ...period, end: event.target.value })} /></label>
           <button onClick={createRun} disabled={busy || !mapping || period.end < period.start}>{busy ? "Working…" : "Prepare close package"}</button>
           {runs.length > 0 && <label>Existing close
-            <select value={run?.id || ""} onChange={(event) => { if (event.target.value && session) void loadRunDetails(session.access_token, event.target.value); }}>
+            <select value={run?.id || ""} onChange={(event) => void selectRun(event.target.value)} disabled={busy}>
               {runs.map((item) => <option key={item.id} value={item.id}>{item.period.start} to {item.period.end} · {readableStatus(item.status)}</option>)}
             </select>
           </label>}
@@ -763,6 +853,7 @@ export default function Home() {
       </header>
 
       {error && <p className="notice error">{error}</p>}
+      {streamError && <p className="notice error">{streamError}</p>}
       {message && <p className="notice good">{message}</p>}
 
       {!workspace?.organizations.length ? (
@@ -780,7 +871,7 @@ export default function Home() {
             <div><p className="eyebrow">ACTIVE ORGANIZATION</p><strong>{selectedOrganization?.name}</strong></div>
             <label>
               <span>Role: {selectedOrganization?.role}</span>
-              <select value={organizationId} onChange={(event) => setOrganizationId(event.target.value)}>
+              <select value={organizationId} onChange={(event) => { organizationIdRef.current = event.target.value; setOrganizationId(event.target.value); }}>
                 {workspace.organizations.map((organization) => <option key={organization.id} value={organization.id}>{organization.name}</option>)}
               </select>
             </label>

@@ -130,6 +130,12 @@ def _bank_transactions(facts: Sequence[SnapshotFact], mapping: Mapping[str, Mapp
         transaction_id = _text(fact.payload, "transaction_id", "id") or fact.provider_record_id
         amount = _amount(fact.payload, "amount")
         fee = _decimal(fact.payload.get("fee_amount", "0"), "fee_amount")
+        plaid_status = (_text(fact.payload, "status") or "posted").lower()
+        # Plaid's Transactions API uses a boolean rather than a status string
+        # for authorizations that have not posted.  Preserve text status for
+        # historic normalized records, but the provider boolean wins.
+        if fact.payload.get("pending") is True:
+            plaid_status = "pending"
         result.append(
             BankTransaction(
                 transaction_id=f"plaid:{transaction_id}",
@@ -137,7 +143,7 @@ def _bank_transactions(facts: Sequence[SnapshotFact], mapping: Mapping[str, Mapp
                 currency=_currency(fact.payload, fact.currency),
                 accounting_date=_date(fact.payload, fact.accounting_date),
                 source_evidence_ids=(_evidence_id(fact),),
-                status=(_text(fact.payload, "status") or "posted").lower(),
+                status=plaid_status,
                 description=_text(fact.payload, "name", "merchant_name", "description") or "",
                 fee_amount=fee,
             )
@@ -158,6 +164,11 @@ def _ledger_transactions(facts: Sequence[SnapshotFact]) -> tuple[LedgerTransacti
         if fact.provider != "xero":
             continue
         payload = fact.payload
+        xero_status = (_text(payload, "Status", "status") or "").upper()
+        if xero_status in {"DELETED", "VOIDED"}:
+            # Provider query filtering is not enough for historical frozen
+            # snapshots; never reconcile a voided/deleted Xero cash record.
+            continue
         record_type = (_text(payload, "Type", "type", "record_type") or "").lower()
         account_code = _xero_account_code(payload, accounts_by_id)
         explicit_amount = any(name in payload for name in ("amount", "Amount", "BankAmount", "Total", "TotalAmount"))

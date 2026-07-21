@@ -98,6 +98,19 @@ class EvidenceTests(unittest.TestCase):
         ).collect(scope())
         self.assertEqual({item.source_id for item in batch.items}, {"current-doc", "current-mail"})
 
+    def test_period_filter_uses_the_organization_timezone(self):
+        pacific_scope = EvidenceScope(
+            frozenset({"folder-close"}), "close@example.test", frozenset({"LABEL_CLOSE"}),
+            date(2026, 7, 1), date(2026, 7, 1), "America/Los_Angeles",
+        )
+        # This is July 1 in Los Angeles, even though its UTC calendar date is July 2.
+        observed = datetime(2026, 7, 2, 6, 30, tzinfo=timezone.utc)
+        batch = EvidenceCollector(
+            DriveClient([DriveSearchResult("doc-1", "folder-close", "current.pdf", "application/pdf", observed, "hash-current")]),
+            GmailEvidenceClient([]),
+        ).collect(pacific_scope)
+        self.assertEqual([item.source_id for item in batch.items], ["doc-1"])
+
 
 class GmailClient:
     def __init__(self, *, send_error=False, search_result=None):

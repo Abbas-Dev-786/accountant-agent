@@ -55,6 +55,33 @@ class PlaidWebhookTests(unittest.TestCase):
             self.verifier.verify(f"{header}.{claims}.{signature}", b'{"request_id":"evt-1"}')
         self.assertEqual(self.transport.calls, [])
 
+    def test_verification_key_is_cached_after_a_valid_lookup(self):
+        body = b'{"request_id":"evt-1"}'
+        header = token_part({"alg": "ES256", "kid": "key-1"})
+        claims = token_part({"iat": int(time.time()), "request_body_sha256": sha256(body).hexdigest()})
+        signature = base64.urlsafe_b64encode(b"a" * 64).decode().rstrip("=")
+        with patch.object(PlaidWebhookVerifier, "_verify_es256"):
+            self.verifier.verify(f"{header}.{claims}.{signature}", body)
+            self.verifier.verify(f"{header}.{claims}.{signature}", body)
+        self.assertEqual(len(self.transport.calls), 1)
+
+    def test_unknown_key_lookups_are_rate_limited(self):
+        verifier = PlaidWebhookVerifier(
+            "plaid-client",
+            "secret://plaid/production/client-secret",
+            StaticSecretResolver({"secret://plaid/production/client-secret": "plaid-secret"}),
+            self.transport,
+            max_key_fetches_per_minute=1,
+        )
+        body = b'{"request_id":"evt-1"}'
+        claims = token_part({"iat": int(time.time()), "request_body_sha256": sha256(body).hexdigest()})
+        signature = base64.urlsafe_b64encode(b"a" * 64).decode().rstrip("=")
+        with patch.object(PlaidWebhookVerifier, "_verify_es256"):
+            verifier.verify(f"{token_part({'alg': 'ES256', 'kid': 'key-1'})}.{claims}.{signature}", body)
+        with self.assertRaisesRegex(PlaidWebhookError, "rate limited"):
+            verifier.verify(f"{token_part({'alg': 'ES256', 'kid': 'key-2'})}.{claims}.{signature}", body)
+        self.assertEqual(len(self.transport.calls), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

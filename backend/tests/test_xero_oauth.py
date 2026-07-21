@@ -1,5 +1,6 @@
 import base64
 import unittest
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlsplit
 
@@ -10,6 +11,7 @@ class FakeSecrets:
     def __init__(self):
         self.values = {"secret://xero/demo/client-secret": "client-secret", "secret://xero/demo/refresh-token": "old-refresh"}
         self.stored = []
+        self.locked = []
 
     def resolve(self, secret_ref):
         value = self.values.get(secret_ref, "")
@@ -20,6 +22,11 @@ class FakeSecrets:
     def store(self, secret_ref, value):
         self.values[secret_ref] = value
         self.stored.append((secret_ref, value))
+
+    @contextmanager
+    def exclusive_lock(self, secret_ref):
+        self.locked.append(secret_ref)
+        yield
 
 
 class FakeTransport:
@@ -67,6 +74,7 @@ class XeroOAuthTests(unittest.TestCase):
         token = XeroOAuthClient(config(), secrets, transport).refresh()
         self.assertEqual(token.refresh_token, "refresh-3")
         self.assertEqual(transport.calls[0][2], {"grant_type": "refresh_token", "refresh_token": "old-refresh"})
+        self.assertEqual(secrets.locked, ["secret://xero/demo/refresh-token"])
 
     def test_access_token_refreshes_only_when_near_expiry(self):
         secrets = FakeSecrets()

@@ -1,5 +1,6 @@
 from datetime import date
 import unittest
+from urllib.parse import unquote_plus
 
 from app.evidence import EvidenceScope
 from app.provider_runtime import (
@@ -74,11 +75,19 @@ class RuntimeProviderTests(unittest.TestCase):
                 JsonResponse(200, {"Accounts": [{"AccountID": "account-1", "Code": "1000", "CurrencyCode": "USD"}]}, {}),
             ]
         )
-        xero = XeroProductionHttpClient("tenant-1", "secret://xero/access", resolver(), xero_transport)
+        xero = XeroProductionHttpClient(
+            "tenant-1", "secret://xero/access", resolver(), xero_transport,
+            period_start=date(2026, 7, 1), period_end=date(2026, 7, 31), page_size=250,
+        )
         xero_page = xero.get_page(1)
         self.assertEqual(xero_page.provider_environment, "production")
         self.assertEqual({item["record_type"] for item in xero_page.records}, {"bank_transaction", "payment", "account"})
         self.assertTrue(all("Invoices" not in call[1] for call in xero_transport.calls))
+        cash_urls = [unquote_plus(call[1]) for call in xero_transport.calls if "Accounts" not in call[1]]
+        self.assertTrue(all("Date >= DateTime(2026, 7, 1)" in url for url in cash_urls))
+        self.assertTrue(all("Date < DateTime(2026, 8, 1)" in url for url in cash_urls))
+        self.assertTrue(all('Status != "DELETED"' in url and 'Status != "VOIDED"' in url for url in cash_urls))
+        self.assertTrue(all("pageSize=250" in url for url in cash_urls))
         plaid_transport = FakeTransport(
             [JsonResponse(200, {"added": [], "modified": [], "removed": [], "next_cursor": "cursor-1", "has_more": False}, {})]
         )
@@ -147,7 +156,7 @@ class RuntimeProviderTests(unittest.TestCase):
                 JsonResponse(
                     200,
                     {
-                        "files": [{"id": "doc-1", "name": "close.pdf", "mimeType": "application/pdf", "modifiedTime": "2026-07-10T00:00:00Z", "parents": ["folder-1"], "md5Checksum": "hash-1"}],
+                        "files": [{"id": "doc-1", "name": "close.pdf", "mimeType": "application/pdf", "modifiedTime": "2026-07-10T00:00:00Z", "parents": ["out-of-scope-parent", "folder-1"], "md5Checksum": "hash-1"}],
                         "nextPageToken": "drive-page-2",
                     },
                     {},
@@ -160,7 +169,14 @@ class RuntimeProviderTests(unittest.TestCase):
             ]
         )
         drive = GoogleDriveHttpClient("secret://google/access", resolver(), drive_transport)
-        self.assertEqual([item.resource_id for item in drive.search_evidence(scope)], ["doc-1", "doc-2"])
+        drive_result = drive.search_evidence(scope)
+        self.assertEqual([item.resource_id for item in drive_result], ["doc-1", "doc-2"])
+        self.assertEqual(drive_result[0].folder_id, "folder-1")
+        self.assertIn("modifiedTime+%3E%3D+%272026-07-01T00%3A00%3A00Z%27", drive_transport.calls[0][1])
+        self.assertIn("modifiedTime+%3C+%272026-08-01T00%3A00%3A00Z%27", drive_transport.calls[0][1])
+        self.assertIn("supportsAllDrives=true", drive_transport.calls[0][1])
+        self.assertIn("includeItemsFromAllDrives=true", drive_transport.calls[0][1])
+        self.assertIn("corpora=allDrives", drive_transport.calls[0][1])
         self.assertIn("pageToken=drive-page-2", drive_transport.calls[1][1])
         gmail_transport = FakeTransport(
             [
@@ -179,6 +195,43 @@ class RuntimeProviderTests(unittest.TestCase):
         self.assertIn("labelIds=Label_5", gmail_transport.calls[1][1])
         self.assertIn("before%3A2026-08-01", gmail_transport.calls[1][1])
         self.assertIn("pageToken=gmail-page-2", gmail_transport.calls[2][1])
+
+    def test_gmail_url_path_segments_are_percent_encoded(self):
+        scope = EvidenceScope(
+            frozenset({"folder-1"}),
+            "close+ops@example.test",
+            frozenset({"LABEL_CLOSE"}),
+            date(2026, 7, 1),
+            date(2026, 7, 31),
+        )
+        transport = FakeTransport(
+            [
+                JsonResponse(200, {"labels": [{"id": "Label_5", "name": "LABEL_CLOSE"}]}, {}),
+                JsonResponse(200, {"messages": [{"id": "message/1?part"}]}, {}),
+                JsonResponse(200, {"id": "message/1?part", "threadId": "thread-1", "internalDate": "1783641600000", "labelIds": ["Label_5"], "payload": {"headers": []}}, {}),
+            ]
+        )
+        GmailHttpClient("secret://google/access", resolver(), transport).search_evidence(scope)
+        self.assertIn("close%2Bops%40example.test/messages", transport.calls[1][1])
+        self.assertIn("message%2F1%3Fpart", transport.calls[2][1])
+
+    def test_gmail_content_hash_ignores_mutable_labels(self):
+        payload = {
+            "id": "msg-1", "threadId": "thread-1", "internalDate": "1783641600000",
+            "payload": {"headers": [{"name": "From", "value": "sender@example.test"}, {"name": "Subject", "value": "Support"}]},
+        }
+        scope = EvidenceScope(frozenset({"folder-1"}), "mailbox@example.test", frozenset({"LABEL_CLOSE"}), date(2026, 7, 1), date(2026, 7, 31))
+        def client_for(labels):
+            return GmailHttpClient(
+                "secret://google/access", resolver(), FakeTransport([
+                    JsonResponse(200, {"labels": [{"id": "Label_5", "name": "LABEL_CLOSE"}]}, {}),
+                    JsonResponse(200, {"messages": [{"id": "msg-1"}]}, {}),
+                    JsonResponse(200, {**payload, "labelIds": labels}, {}),
+                ]),
+            )
+        first = client_for(["Label_5"]).search_evidence(scope)[0]
+        second = client_for(["Label_5", "Label_OTHER"]).search_evidence(scope)[0]
+        self.assertEqual(first.content_hash, second.content_hash)
 
     def test_secret_references_cannot_be_plaintext(self):
         with self.assertRaises(RuntimeConfigError):

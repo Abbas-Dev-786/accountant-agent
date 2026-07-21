@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Mapping, Protocol
@@ -30,6 +31,9 @@ class SecretStore(Protocol):
         ...
 
     def store(self, secret_ref: str, value: str) -> None:
+        ...
+
+    def delete(self, secret_ref: str) -> None:
         ...
 
 
@@ -234,13 +238,18 @@ class XeroOAuthClient:
     def refresh(self) -> XeroToken:
         if not self.config.refresh_token_secret_ref:
             raise XeroOAuthError("Xero refresh requires a connected tenant credential")
-        refresh_token = self.secrets.resolve(self.config.refresh_token_secret_ref)
-        if not refresh_token or refresh_token.startswith("replace-"):
-            raise XeroOAuthError("Xero refresh token is unavailable")
-        token = self._token({"grant_type": "refresh_token", "refresh_token": refresh_token})
-        self._store_refresh_token(token.refresh_token)
-        self._cache(token)
-        return token
+        exclusive_lock = getattr(self.secrets, "exclusive_lock", None)
+        lock = exclusive_lock(self.config.refresh_token_secret_ref) if callable(exclusive_lock) else nullcontext()
+        with lock:
+            # Xero refresh tokens are single-use. Re-read only after taking the
+            # cross-worker lock so a waiter exchanges the newly rotated token.
+            refresh_token = self.secrets.resolve(self.config.refresh_token_secret_ref)
+            if not refresh_token or refresh_token.startswith("replace-"):
+                raise XeroOAuthError("Xero refresh token is unavailable")
+            token = self._token({"grant_type": "refresh_token", "refresh_token": refresh_token})
+            self._store_refresh_token(token.refresh_token)
+            self._cache(token)
+            return token
 
     def access_token(self, *, now: datetime | None = None, refresh_skew_seconds: int = 60) -> str:
         """Return a cached access token or refresh it before expiry."""

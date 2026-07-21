@@ -7,8 +7,10 @@ import binascii
 import hmac
 import json
 import time
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from hashlib import sha256
+from threading import Event, Lock
 from typing import Mapping
 
 from .provider_runtime import JsonTransport, SecretResolver
@@ -48,6 +50,17 @@ class PlaidWebhookVerifier:
     transport: JsonTransport
     base_url: str = "https://production.plaid.com"
     max_age_seconds: int = 300
+    verification_key_ttl_seconds: int = 3600
+    max_key_fetches_per_minute: int = 30
+    _key_cache: dict[str, tuple[float, Mapping[str, object]]] = field(default_factory=dict, init=False, repr=False)
+    _negative_key_cache: dict[str, float] = field(default_factory=dict, init=False, repr=False)
+    _key_fetches: deque[float] = field(default_factory=deque, init=False, repr=False)
+    _inflight_keys: dict[str, Event] = field(default_factory=dict, init=False, repr=False)
+    _cache_lock: Lock = field(default_factory=Lock, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.max_age_seconds < 1 or self.verification_key_ttl_seconds < 1 or self.max_key_fetches_per_minute < 1:
+            raise PlaidWebhookError("Plaid webhook verifier limits are invalid")
 
     def verify(self, signed_header: str, body: bytes) -> None:
         parts = signed_header.split(".")
@@ -55,29 +68,69 @@ class PlaidWebhookVerifier:
             raise PlaidWebhookError("Plaid webhook signature is invalid")
         header = _base64url_json(parts[0], "header")
         key_id = header.get("kid")
-        if header.get("alg") != "ES256" or not isinstance(key_id, str) or not key_id:
+        if header.get("alg") != "ES256" or not isinstance(key_id, str) or not 1 <= len(key_id) <= 256:
             raise PlaidWebhookError("Plaid webhook signature algorithm or key id is invalid")
         claims = _base64url_json(parts[1], "claims")
         self._validate_claims(claims, body)
+        signature = _base64url_bytes(parts[2], "signature")
+        if len(signature) != 64:
+            raise PlaidWebhookError("Plaid webhook signature is invalid")
         key = self._verification_key(key_id)
-        self._verify_es256(f"{parts[0]}.{parts[1]}".encode(), _base64url_bytes(parts[2], "signature"), key)
+        self._verify_es256(f"{parts[0]}.{parts[1]}".encode(), signature, key)
 
     def _verification_key(self, key_id: str) -> Mapping[str, object]:
         if not self.client_id or not self.client_secret_ref.startswith("secret://"):
             raise PlaidWebhookError("Plaid webhook verifier configuration is invalid")
-        secret = self.secret_resolver.resolve(self.client_secret_ref)
-        response = self.transport.request(
-            "POST",
-            f"{self.base_url.rstrip('/')}/webhook_verification_key/get",
-            {},
-            {"client_id": self.client_id, "secret": secret, "key_id": key_id},
-        )
-        if response.status_code >= 400:
-            raise PlaidWebhookError("Plaid webhook verification key is unavailable")
-        key = response.body.get("key")
-        if not isinstance(key, Mapping):
-            raise PlaidWebhookError("Plaid webhook verification key is invalid")
-        return key
+        now = time.monotonic()
+        with self._cache_lock:
+            cached = self._key_cache.get(key_id)
+            if cached and cached[0] > now:
+                return cached[1]
+            if cached:
+                self._key_cache.pop(key_id, None)
+            if self._negative_key_cache.get(key_id, 0) > now:
+                raise PlaidWebhookError("Plaid webhook signature is invalid")
+            self._negative_key_cache.pop(key_id, None)
+            while self._key_fetches and self._key_fetches[0] <= now - 60:
+                self._key_fetches.popleft()
+            wait_for = self._inflight_keys.get(key_id)
+            if wait_for is None:
+                if len(self._key_fetches) >= self.max_key_fetches_per_minute:
+                    raise PlaidWebhookError("Plaid webhook verification is temporarily rate limited")
+                wait_for = Event()
+                self._inflight_keys[key_id] = wait_for
+                self._key_fetches.append(now)
+                fetch_key = True
+            else:
+                fetch_key = False
+        if not fetch_key:
+            if not wait_for.wait(15):
+                raise PlaidWebhookError("Plaid webhook verification key is unavailable")
+            return self._verification_key(key_id)
+        try:
+            secret = self.secret_resolver.resolve(self.client_secret_ref)
+            response = self.transport.request(
+                "POST",
+                f"{self.base_url.rstrip('/')}/webhook_verification_key/get",
+                {},
+                {"client_id": self.client_id, "secret": secret, "key_id": key_id},
+            )
+            if response.status_code >= 400:
+                if 400 <= response.status_code < 500:
+                    with self._cache_lock:
+                        self._negative_key_cache[key_id] = time.monotonic() + min(60, self.verification_key_ttl_seconds)
+                raise PlaidWebhookError("Plaid webhook verification key is unavailable")
+            key = response.body.get("key")
+            if not isinstance(key, Mapping):
+                raise PlaidWebhookError("Plaid webhook verification key is invalid")
+            with self._cache_lock:
+                self._key_cache[key_id] = (time.monotonic() + self.verification_key_ttl_seconds, key)
+            return key
+        finally:
+            with self._cache_lock:
+                completed = self._inflight_keys.pop(key_id, None)
+                if completed is not None:
+                    completed.set()
 
     def _validate_claims(self, claims: Mapping[str, object], body: bytes) -> None:
         issued_at = claims.get("iat")

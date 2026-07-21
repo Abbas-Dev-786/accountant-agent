@@ -82,6 +82,24 @@ class CloseExecutionTests(unittest.TestCase):
         self.assertEqual({line.account_code for line in proposal.lines}, {"1000", "2000"})
         self.assertEqual(sum((line.debit for line in proposal.lines), Decimal("0")), sum((line.credit for line in proposal.lines), Decimal("0")))
 
+    def test_plaid_pending_boolean_is_never_reconciled_as_posted(self):
+        facts = (
+            SnapshotFact("plaid:t-1:v1", "plaid", "t-1", {"transaction_id": "t-1", "account_id": "account-1", "amount": "12.50", "date": "2026-07-02", "iso_currency_code": "USD", "pending": True}, "2026-07-02", "USD"),
+            SnapshotFact("xero:x-1:v1", "xero", "x-1", {"BankTransactionID": "x-1", "Amount": "12.50", "Date": "/Date(1782950400000+0000)/", "CurrencyCode": "USD", "BankAccount": {"Code": "1000"}, "Type": "SPEND"}, "2026-07-02", "USD"),
+        )
+        execution = derive_close_execution(facts, configuration())
+        self.assertEqual(execution.reconciliation.matches, ())
+        self.assertEqual([item.control_code for item in execution.reconciliation.exceptions], ["pending_transaction", "unmatched_ledger"])
+
+    def test_voided_xero_cash_record_cannot_match_a_live_bank_transaction(self):
+        facts = (
+            SnapshotFact("plaid:t-1:v1", "plaid", "t-1", {"transaction_id": "t-1", "account_id": "account-1", "amount": "12.50", "date": "2026-07-02", "iso_currency_code": "USD"}, "2026-07-02", "USD"),
+            SnapshotFact("xero:x-1:v1", "xero", "x-1", {"BankTransactionID": "x-1", "Amount": "12.50", "Date": "/Date(1782950400000+0000)/", "CurrencyCode": "USD", "BankAccount": {"Code": "1000"}, "Type": "SPEND", "Status": "VOIDED"}, "2026-07-02", "USD"),
+        )
+        execution = derive_close_execution(facts, configuration())
+        self.assertEqual(execution.reconciliation.matches, ())
+        self.assertEqual([item.control_code for item in execution.reconciliation.exceptions], ["unmatched_bank"])
+
 
 if __name__ == "__main__":
     unittest.main()

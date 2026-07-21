@@ -6,6 +6,7 @@ import logging
 import os
 import asyncio
 import json
+import threading
 from hashlib import sha256
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -143,6 +144,9 @@ plaid_link_client: PlaidLinkClient | None = None
 xero_oauth_sessions: OAuthSessionStore = InMemoryOAuthSessionStore()
 auth_verifier: AuthVerifier | None = None
 workflow_store: WorkflowStore | None = None
+plaid_webhook_verifier: PlaidWebhookVerifier | None = None
+_plaid_webhook_verifier_lock = threading.Lock()
+_MAX_PLAID_WEBHOOK_BYTES = 1_048_576
 
 
 def configure_xero_oauth(client: XeroOAuthClient | None) -> None:
@@ -179,6 +183,46 @@ def configure_workflow_store(store: WorkflowStore | None) -> None:
     """Inject the durable workflow store during startup/tests."""
     global workflow_store
     workflow_store = store
+
+
+def configure_plaid_webhook_verifier(verifier: PlaidWebhookVerifier | None) -> None:
+    """Inject the shared Plaid verifier for startup/tests."""
+    global plaid_webhook_verifier
+    plaid_webhook_verifier = verifier
+
+
+def require_plaid_webhook_verifier() -> PlaidWebhookVerifier:
+    global plaid_webhook_verifier
+    if plaid_webhook_verifier is not None:
+        return plaid_webhook_verifier
+    with _plaid_webhook_verifier_lock:
+        if plaid_webhook_verifier is None:
+            config = PlaidLinkConfig.from_environment()
+            plaid_webhook_verifier = PlaidWebhookVerifier(
+                client_id=config.client_id,
+                client_secret_ref=config.client_secret_ref,
+                secret_resolver=secret_store_from_environment(),
+                transport=UrllibJsonTransport(),
+            )
+    return plaid_webhook_verifier
+
+
+async def read_limited_request_body(request: Request, *, maximum_bytes: int) -> bytes:
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > maximum_bytes:
+                raise HTTPException(status_code=413, detail="Plaid webhook payload is too large")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Plaid webhook Content-Length is invalid") from exc
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > maximum_bytes:
+            raise HTTPException(status_code=413, detail="Plaid webhook payload is too large")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _build_oauth_session_store() -> OAuthSessionStore:
@@ -281,6 +325,19 @@ def _oauth_callback_error(provider: str, status_code: int, organization_id: str 
             query["organization_id"] = organization_id
         return RedirectResponse(f"{web_app_url}/?{urlencode(query)}", status_code=303)
     return JSONResponse(status_code=status_code, content={"detail": f"{provider} authorization could not be completed"})
+
+
+def _discard_xero_refresh_token(refresh_token_secret_ref: str) -> None:
+    """Compensate for a post-exchange registration failure without retaining a live credential."""
+    if xero_oauth_client is None:
+        return
+    try:
+        xero_oauth_client.secrets.delete(refresh_token_secret_ref)
+    except Exception:
+        # The user must still receive the generic OAuth failure response.  Do
+        # not include a Vault/provider error in that redirect, but make an
+        # incomplete compensation visible to operators.
+        logger.exception("Xero OAuth refresh-token cleanup failed after registration failure")
 
 
 app = FastAPI(title="AccountingOS API", version="0.2.0", lifespan=lifespan)
@@ -642,7 +699,7 @@ async def stream_close_run_events(
     run = await asyncio.to_thread(store.get_close_run, run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="close run not found")
-    require_organization_role(run.organization_id, user)
+    await asyncio.to_thread(require_organization_role, run.organization_id, user)
     if after < 0:
         raise HTTPException(status_code=422, detail="event cursor must be non-negative")
 
@@ -662,10 +719,22 @@ async def stream_close_run_events(
                 idle_cycles += 1
                 current_run = await asyncio.to_thread(store.get_close_run, run_id)
                 if current_run is None or current_run.state in terminal_states:
+                    # A worker can commit its terminal state between the empty
+                    # event read and this state read. Replay once more before
+                    # closing the stream so that final task events are never
+                    # silently lost.
+                    final_batch = await asyncio.to_thread(store.events_for_run, run_id, after_event_id=cursor, limit=100)
+                    if final_batch:
+                        for event in final_batch:
+                            cursor = event.event_id
+                            payload = serialize_task_event(event)
+                            yield f"id: {event.event_id}\nevent: close_progress\ndata: {json.dumps(payload, default=str)}\n\n"
+                        continue
                     return
-                if idle_cycles % 8 == 0:
-                    yield ": keepalive\n\n"
-                await asyncio.sleep(min(10, 0.5 * (1.5 ** min(idle_cycles, 7))))
+                # Send at least one frame every five seconds. Many reverse
+                # proxies drop quiet SSE responses after roughly one minute.
+                yield ": keepalive\n\n"
+                await asyncio.sleep(min(5, 0.5 * (1.5 ** min(idle_cycles, 5))))
 
     return StreamingResponse(
         event_stream(), media_type="text/event-stream",
@@ -788,7 +857,7 @@ async def receive_plaid_webhook(
     signature = (plaid_verification or "").strip()
     if not signature:
         raise HTTPException(status_code=400, detail="Plaid-Verification is required")
-    payload = await request.body()
+    payload = await read_limited_request_body(request, maximum_bytes=_MAX_PLAID_WEBHOOK_BYTES)
     try:
         decoded = json.loads(payload)
     except json.JSONDecodeError as exc:
@@ -799,19 +868,13 @@ async def receive_plaid_webhook(
     if not isinstance(event_id, str) or not event_id:
         raise HTTPException(status_code=400, detail="Plaid webhook request_id is required")
     try:
-        config = PlaidLinkConfig.from_environment()
-        secrets = secret_store_from_environment()
         await asyncio.to_thread(
-            PlaidWebhookVerifier(
-                client_id=config.client_id,
-                client_secret_ref=config.client_secret_ref,
-                secret_resolver=secrets,
-                transport=UrllibJsonTransport(),
-            ).verify,
+            require_plaid_webhook_verifier().verify,
             signature,
             payload,
         )
-        accepted = require_store().record_webhook_receipt(
+        accepted = await asyncio.to_thread(
+            require_store().record_webhook_receipt,
             provider="plaid",
             provider_event_id=event_id,
             signature_verified=True,
@@ -967,13 +1030,16 @@ def xero_callback(
         logger.warning("Xero OAuth callback validation failed for organization %s: %s", organization_id, exc)
         return _oauth_callback_error("xero", 400, organization_id)
     if token.scope is not None and frozenset(token.scope.split()) != frozenset(xero_oauth_client.config.scopes):
+        _discard_xero_refresh_token(refresh_ref)
         return _oauth_callback_error("xero", 502, organization_id)
     try:
         registered_tenants = _register_xero_connection(organization_id, refresh_ref)
     except (XeroOAuthError, PolicyError) as exc:
         logger.warning("Xero tenant registration failed after OAuth: %s", exc)
+        _discard_xero_refresh_token(refresh_ref)
         return _oauth_callback_error("xero", 502, organization_id)
     if registered_tenants == 0:
+        _discard_xero_refresh_token(refresh_ref)
         return _oauth_callback_error("xero", 502, organization_id)
     payload = {
         "status": "authorized",

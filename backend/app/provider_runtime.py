@@ -11,11 +11,11 @@ import base64
 import json
 import re
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from hashlib import sha256
-from typing import Callable, Mapping, Protocol, Sequence
-from urllib.parse import urlencode, urljoin
+from typing import Callable, ClassVar, Mapping, Protocol, Sequence
+from urllib.parse import quote, urlencode, urljoin
 from urllib.request import Request, urlopen
 
 from .actions import XeroDraftRecord, XeroDraftRequest
@@ -138,6 +138,7 @@ class XeroDemoHttpClient(XeroDemoClient):
         return XeroPage(page, records, next_page, self.tenant_id, "demo", _request_id(response.headers))
 
 
+@dataclass
 class XeroProductionHttpClient(XeroDemoHttpClient):
     """Read-only Xero Accounting API client for the US production boundary.
 
@@ -149,7 +150,7 @@ class XeroProductionHttpClient(XeroDemoHttpClient):
     # Reconciliation needs settled cash activity, not invoices.  Keep these
     # resource contracts explicit so a new Xero scope cannot accidentally be
     # requested without its corresponding source read.
-    cash_resource_specs: tuple[tuple[str, str, str], ...] = (
+    cash_resource_specs: ClassVar[tuple[tuple[str, str, str], ...]] = (
         ("/api.xro/2.0/BankTransactions", "BankTransactions", "bank_transaction"),
         ("/api.xro/2.0/Payments", "Payments", "payment"),
         ("/api.xro/2.0/ManualJournals", "ManualJournals", "manual_journal"),
@@ -158,6 +159,29 @@ class XeroProductionHttpClient(XeroDemoHttpClient):
         # currency and AccountType needed to project those records safely.
         ("/api.xro/2.0/Accounts", "Accounts", "account"),
     )
+    period_start: date | None = None
+    period_end: date | None = None
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if (self.period_start is None) != (self.period_end is None):
+            raise RuntimeConfigError("Xero production period bounds must be supplied together")
+        if self.period_start is not None and self.period_end is not None and self.period_end < self.period_start:
+            raise RuntimeConfigError("Xero production period is invalid")
+
+    def _cash_where_clause(self) -> str:
+        if self.period_start is None or self.period_end is None:
+            raise ProviderReadError("Xero production reads require close-period bounds")
+        start = self.period_start
+        end_exclusive = self.period_end + timedelta(days=1)
+        # Every cash endpoint is limited to the frozen close period.  The
+        # projection also rejects deleted/voided records because historic
+        # snapshots may have been created before this provider guard existed.
+        return (
+            f"Date >= DateTime({start.year}, {start.month}, {start.day})"
+            f" && Date < DateTime({end_exclusive.year}, {end_exclusive.month}, {end_exclusive.day})"
+            ' && Status != "DELETED" && Status != "VOIDED"'
+        )
 
     def get_page(self, page: int) -> XeroPage:
         if page < 1:
@@ -168,9 +192,16 @@ class XeroProductionHttpClient(XeroDemoHttpClient):
         has_more = False
         for resource_path, records_key, record_type in self.cash_resource_specs:
             url = urljoin(self.base_url.rstrip("/") + "/", resource_path.lstrip("/"))
+            parameters: dict[str, object] = {"page": page}
+            if record_type != "account":
+                parameters["where"] = self._cash_where_clause()
+                # Xero defaults to 100 records.  The pagination continuation
+                # test below must use the exact requested size, otherwise a
+                # configured size above 100 can stop after page one.
+                parameters["pageSize"] = self.page_size
             response = self.transport.request(
                 "GET",
-                f"{url}?{urlencode({'page': page})}",
+                f"{url}?{urlencode(parameters)}",
                 {"Authorization": f"Bearer {token}", "Xero-tenant-id": self.tenant_id},
             )
             if response.status_code >= 400:
@@ -408,13 +439,22 @@ class GoogleDriveHttpClient(DriveEvidenceClient):
     def search_evidence(self, scope: EvidenceScope) -> Sequence[DriveSearchResult]:
         token = self.secret_resolver.resolve(self.access_token_secret_ref)
         folder_query = " or ".join(f"'{_drive_folder_id(folder_id)}' in parents" for folder_id in sorted(scope.drive_folder_ids))
-        query = f"({folder_query}) and trashed = false"
+        period_start, period_end = scope.utc_period_bounds()
+        drive_start = period_start.isoformat(timespec="seconds").replace("+00:00", "Z")
+        drive_end = period_end.isoformat(timespec="seconds").replace("+00:00", "Z")
+        query = (
+            f"({folder_query}) and trashed = false"
+            f" and modifiedTime >= '{drive_start}' and modifiedTime < '{drive_end}'"
+        )
         results: list[DriveSearchResult] = []
         page_token: str | None = None
         for _ in range(self.max_pages):
             parameters: dict[str, str] = {
                 "q": query,
                 "fields": "nextPageToken,files(id,name,mimeType,modifiedTime,parents,md5Checksum)",
+                "supportsAllDrives": "true",
+                "includeItemsFromAllDrives": "true",
+                "corpora": "allDrives",
             }
             if page_token:
                 parameters["pageToken"] = page_token
@@ -422,15 +462,23 @@ class GoogleDriveHttpClient(DriveEvidenceClient):
             response = self.transport.request("GET", url, {"Authorization": f"Bearer {token}"})
             if response.status_code >= 400:
                 raise ProviderReadError(f"Google Drive request failed with HTTP {response.status_code}")
+            if response.body.get("incompleteSearch") is True:
+                raise ProviderReadError("Google Drive all-drives search was incomplete")
             for item in _records(response.body, "files"):
                 resource_id = item.get("id")
                 parents = item.get("parents", [])
                 modified = item.get("modifiedTime")
                 if not isinstance(resource_id, str) or not isinstance(parents, list) or not parents or not isinstance(modified, str):
                     raise ProviderReadError("Google Drive result is missing scoped metadata")
+                scoped_parents = sorted(parent for parent in parents if isinstance(parent, str) and parent in scope.drive_folder_ids)
+                if not scoped_parents:
+                    raise ProviderReadError("Google Drive result is outside the configured folders")
                 parsed = datetime.fromisoformat(modified.replace("Z", "+00:00"))
                 metadata_hash = item.get("md5Checksum") or sha256(json.dumps(item, sort_keys=True, default=str).encode()).hexdigest()
-                results.append(DriveSearchResult(resource_id, str(parents[0]), str(item.get("name", "")), str(item.get("mimeType", "")), parsed, str(metadata_hash)))
+                # A Drive item may have multiple parents.  Preserve a parent
+                # that is actually in the configured scope rather than the
+                # provider's arbitrary first parent.
+                results.append(DriveSearchResult(resource_id, scoped_parents[0], str(item.get("name", "")), str(item.get("mimeType", "")), parsed, str(metadata_hash)))
             page_token = response.body.get("nextPageToken")
             if page_token is None:
                 return results
@@ -465,6 +513,7 @@ class GmailHttpClient(GmailEvidenceClient):
         # querying the following calendar day.
         end_exclusive = scope.end_date + timedelta(days=1)
         query = f"after:{scope.start_date.isoformat()} before:{end_exclusive.isoformat()}"
+        mailbox_path = quote(scope.gmail_mailbox, safe="")
         message_ids: set[str] = set()
         for label_id in configured_label_ids:
             page_token: str | None = None
@@ -472,7 +521,7 @@ class GmailHttpClient(GmailEvidenceClient):
                 parameters = {"q": query, "labelIds": str(label_id)}
                 if page_token:
                     parameters["pageToken"] = page_token
-                list_url = urljoin(self.base_url, f"{scope.gmail_mailbox}/messages") + "?" + urlencode(parameters)
+                list_url = urljoin(self.base_url, f"{mailbox_path}/messages") + "?" + urlencode(parameters)
                 response = self.transport.request("GET", list_url, {"Authorization": f"Bearer {token}"})
                 if response.status_code >= 400:
                     raise ProviderReadError(f"Gmail search failed with HTTP {response.status_code}")
@@ -491,7 +540,7 @@ class GmailHttpClient(GmailEvidenceClient):
         results: list[GmailSearchResult] = []
         id_to_name = {label_id: name for name, label_id in label_names.items()}
         for message_id in sorted(message_ids):
-            get_url = urljoin(self.base_url, f"{scope.gmail_mailbox}/messages/{message_id}") + "?" + urlencode({"format": "metadata"})
+            get_url = urljoin(self.base_url, f"{mailbox_path}/messages/{quote(message_id, safe='')}") + "?" + urlencode({"format": "metadata"})
             detail = self.transport.request("GET", get_url, {"Authorization": f"Bearer {token}"})
             if detail.status_code >= 400:
                 raise ProviderReadError(f"Gmail message fetch failed with HTTP {detail.status_code}")
@@ -523,7 +572,15 @@ class GmailHttpClient(GmailEvidenceClient):
                     observed,
                     headers.get("from", ""),
                     headers.get("subject", ""),
-                    sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest(),
+                    # Labels are mutable classification metadata. The immutable
+                    # Gmail message identity and headers must remain stable if
+                    # a controller later relabels the same evidence.
+                    sha256(json.dumps({
+                        "id": message_id,
+                        "thread_id": str(payload.get("threadId", "")),
+                        "internal_date": internal_ms,
+                        "headers": headers,
+                    }, sort_keys=True, default=str).encode()).hexdigest(),
                 )
             )
         return results

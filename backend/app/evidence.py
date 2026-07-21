@@ -8,11 +8,12 @@ checklists and later AI validation.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from enum import Enum
 from hashlib import sha256
 from typing import Mapping, Protocol, Sequence
 from uuid import uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .domain import PolicyError
 
@@ -28,6 +29,7 @@ class EvidenceScope:
     gmail_labels: frozenset[str]
     start_date: date
     end_date: date
+    accounting_timezone: str = "UTC"
 
     def __post_init__(self) -> None:
         if not self.drive_folder_ids:
@@ -36,6 +38,19 @@ class EvidenceScope:
             raise EvidencePolicyError("a Gmail evidence mailbox is required")
         if self.end_date < self.start_date:
             raise EvidencePolicyError("evidence date range is inverted")
+        try:
+            ZoneInfo(self.accounting_timezone)
+        except ZoneInfoNotFoundError as exc:
+            raise EvidencePolicyError("evidence accounting timezone is invalid") from exc
+
+    def local_date(self, observed_at: datetime) -> date:
+        return _iso(observed_at).astimezone(ZoneInfo(self.accounting_timezone)).date()
+
+    def utc_period_bounds(self) -> tuple[datetime, datetime]:
+        zone = ZoneInfo(self.accounting_timezone)
+        start = datetime.combine(self.start_date, time.min, tzinfo=zone).astimezone(timezone.utc)
+        end = datetime.combine(self.end_date + timedelta(days=1), time.min, tzinfo=zone).astimezone(timezone.utc)
+        return start, end
 
 
 @dataclass(frozen=True)
@@ -122,7 +137,7 @@ class EvidenceCollector:
             if result.folder_id not in scope.drive_folder_ids:
                 raise EvidencePolicyError("Drive search returned an out-of-scope folder")
             observed = _iso(result.modified_at)
-            if not scope.start_date <= observed.date() <= scope.end_date:
+            if not scope.start_date <= scope.local_date(observed) <= scope.end_date:
                 # Configured evidence folders commonly contain prior-period
                 # support. It is not a provider-scope violation; it simply is
                 # not evidence for this close period.
@@ -150,7 +165,7 @@ class EvidenceCollector:
                 # benign result from a broad/inconsistent provider search.
                 continue
             observed = _iso(result.internal_at)
-            if not scope.start_date <= observed.date() <= scope.end_date:
+            if not scope.start_date <= scope.local_date(observed) <= scope.end_date:
                 continue
             if not result.message_id or not result.content_hash:
                 raise EvidencePolicyError("Gmail evidence requires an id and content hash")

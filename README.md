@@ -157,6 +157,11 @@ cd backend
 .venv/bin/python -m app.production_preflight --env-file .env
 ```
 
+```powershell
+cd backend
+.venv\Scripts\python.exe -m app.production_preflight --env-file .env
+```
+
 Then start the web controller at `http://localhost:3000`:
 
 ```sh

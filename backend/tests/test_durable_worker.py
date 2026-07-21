@@ -1,16 +1,21 @@
 import unittest
 from datetime import datetime, timezone
+from threading import Event, Thread
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.domain import DeploymentConfig, SourceBatch, SourceRecordVersion
 from app.durable_worker import (
     DemoSourceSyncExecutor,
+    DurableReconciliationExecutor,
     DurableWorkflowWorker,
+    GmailRecoveryActionExecutor,
     GoogleEvidenceExecutor,
     ProductionSourceSyncExecutor,
     ReconciliationMappingGateExecutor,
     TaskBlocked,
 )
+from app.groq import GroqError
 from app.close_mapping import PersistedCloseMapping
 from app.providers import ProviderReadError
 from app.supabase_db import PersistedCloseRun, PersistedConnection, PersistedTask
@@ -21,6 +26,11 @@ class FakeStore:
         self.task = task
         self.completed = []
         self.blocked = []
+        self.retried = []
+        self.retry_state = "ready"
+        self.renewals = []
+        self.renewed = Event()
+        self.renew_result = True
 
     def claim_next_task(self, worker_id, *, lease_seconds=60):
         task, self.task = self.task, None
@@ -29,8 +39,17 @@ class FakeStore:
     def complete_task(self, task, worker_id):
         self.completed.append((task.task_id, worker_id))
 
+    def renew_task_lease(self, task, worker_id, *, lease_seconds=60):
+        self.renewals.append((task.task_id, worker_id, lease_seconds))
+        self.renewed.set()
+        return self.renew_result
+
     def block_task(self, task, worker_id, error):
         self.blocked.append((task.task_id, worker_id, error))
+
+    def retry_task(self, task, worker_id, error):
+        self.retried.append((task.task_id, worker_id, error))
+        return self.retry_state
 
 
 class SucceedingExecutor:
@@ -64,15 +83,101 @@ class DurableWorkerTests(unittest.TestCase):
         self.assertEqual(result.status, "blocked")
         self.assertEqual(store.blocked[0][2], "Xero Demo Company is not connected")
 
-    def test_worker_hides_unexpected_error_details(self):
+    def test_worker_retries_unexpected_errors_without_exposing_details(self):
         store = FakeStore(self.task)
         result = DurableWorkflowWorker(store, FailingExecutor(), worker_id="worker-1").process_once()
-        self.assertEqual(result.status, "blocked")
+        self.assertEqual(result.status, "retrying")
         self.assertNotIn("access token", result.error)
+        self.assertEqual(store.blocked, [])
+        self.assertEqual(store.retried[0][:2], ("task-1", "worker-1"))
+
+    def test_worker_reports_failed_when_the_retry_budget_is_exhausted(self):
+        store = FakeStore(self.task)
+        store.retry_state = "failed"
+        result = DurableWorkflowWorker(store, FailingExecutor(), worker_id="worker-1").process_once()
+        self.assertEqual(result.status, "failed")
+
+    def test_source_sync_is_a_noop_after_its_snapshot_is_committed(self):
+        run = SimpleNamespace(
+            run_id="run-1", organization_id="org-1", period_start="2026-07-01", period_end="2026-07-31",
+            state="synchronizing", snapshot_id="snapshot-1", deployment_mode="production", data_class="live",
+        )
+        store = SimpleNamespace(get_close_run=lambda _run_id: run)
+        task = PersistedTask("task-1", "run-1", "synchronize_sources", "running", 2, "worker-1", None, None)
+        ProductionSourceSyncExecutor(
+            store, DeploymentConfig("us-prod", "production", "live", "US", "USD", "controller"), env={},
+        ).execute(task)
 
     def test_worker_returns_idle_without_a_claim(self):
         result = DurableWorkflowWorker(FakeStore(), SucceedingExecutor(), worker_id="worker-1").process_once()
         self.assertEqual(result.status, "idle")
+
+    def test_worker_renews_lease_while_a_slow_task_runs(self):
+        class SlowExecutor:
+            def __init__(self):
+                self.started = Event()
+                self.release = Event()
+
+            def execute(self, task):
+                self.started.set()
+                self.release.wait(1)
+
+        store = FakeStore(self.task)
+        executor = SlowExecutor()
+        worker = DurableWorkflowWorker(store, executor, worker_id="worker-1", lease_seconds=1, heartbeat_interval_seconds=0.01)
+        results = []
+        thread = Thread(target=lambda: results.append(worker.process_once()))
+        thread.start()
+        self.assertTrue(executor.started.wait(1))
+        self.assertTrue(store.renewed.wait(1))
+        executor.release.set()
+        thread.join(1)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(results[0].status, "succeeded")
+        self.assertEqual(store.completed, [("task-1", "worker-1")])
+
+    def test_worker_does_not_complete_after_lease_ownership_is_lost(self):
+        class SlowExecutor:
+            def __init__(self):
+                self.started = Event()
+                self.release = Event()
+
+            def execute(self, task):
+                self.started.set()
+                self.release.wait(1)
+
+        store = FakeStore(self.task)
+        store.renew_result = False
+        executor = SlowExecutor()
+        worker = DurableWorkflowWorker(store, executor, worker_id="worker-1", lease_seconds=1, heartbeat_interval_seconds=0.01)
+        results = []
+        thread = Thread(target=lambda: results.append(worker.process_once()))
+        thread.start()
+        self.assertTrue(executor.started.wait(1))
+        self.assertTrue(store.renewed.wait(1))
+        executor.release.set()
+        thread.join(1)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(results[0].status, "lease_lost")
+        self.assertEqual(store.completed, [])
+        self.assertEqual(store.blocked, [])
+
+    def test_groq_unavailability_marks_exceptions_without_blocking_the_close(self):
+        class ExplanationStore:
+            def __init__(self):
+                self.unavailable = []
+
+            def unexplained_exceptions_for_run(self, run_id):
+                return ({"id": "exception-1", "facts": []},)
+
+            def mark_exception_explanation_unavailable(self, *, run_id, exception_id):
+                self.unavailable.append((run_id, exception_id))
+
+        store = ExplanationStore()
+        run = type("Run", (), {"run_id": "run-1"})()
+        with patch("app.durable_worker.GroqConfig.from_environment", side_effect=GroqError("unavailable")):
+            DurableReconciliationExecutor(store, env={})._explain_open_exceptions(run, {})
+        self.assertEqual(store.unavailable, [("run-1", "exception-1")])
 
     def test_reconciliation_mapping_gap_is_a_clear_workflow_blocker(self):
         task = PersistedTask("task-2", "run-1", "reconcile", "running", 1, "worker-1", None, None)
@@ -321,6 +426,28 @@ class DurableWorkerTests(unittest.TestCase):
                     PersistedTask("task-1", "run-1", "collect_evidence", "running", 1, "worker-1", None, None)
                 )
         oauth_client.return_value.refresh_access_token.assert_called_once()
+
+    def test_recovery_email_policy_denial_is_failed_not_outcome_unknown(self):
+        class RecoveryStore:
+            def __init__(self):
+                self.updates = []
+
+            def recovery_email_counts(self, **_kwargs):
+                return (0, 0)
+
+            def update_action_execution(self, **kwargs):
+                self.updates.append(kwargs)
+
+        action = {
+            "action_id": "action-1", "run_id": "run-1", "marker": "marker-1",
+            "recipient": "outside@example.test", "exception_id": "exception-1",
+            "control_code": "unmatched_bank", "remediation": "Provide a statement.",
+            "configuration": {"evidence": {"allowed_recipients": ["controller@example.test"]}},
+        }
+        store = RecoveryStore()
+        with self.assertRaisesRegex(TaskBlocked, "violates the approved evidence policy"):
+            GmailRecoveryActionExecutor(store)._send(action, object())
+        self.assertEqual(store.updates, [{"action_id": "action-1", "status": "failed"}])
 
 
 if __name__ == "__main__":

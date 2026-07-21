@@ -7,6 +7,7 @@ from app.connections import ConnectionHealth, ConnectionStatus
 from app.domain import CloseService, DeploymentConfig
 from app.evidence import EvidenceBatch, EvidenceItem, EvidenceScope
 from app.supabase_db import (
+    _ConnectionPool,
     PersistedTask,
     SupabaseConfigError,
     SupabaseDatabaseConfig,
@@ -77,6 +78,37 @@ class SupabaseConfigTests(unittest.TestCase):
                 }
             )
 
+    def test_pool_discards_a_connection_that_fails_a_liveness_probe(self):
+        class DeadConnection(FakeConnection):
+            closed = False
+
+            def __init__(self):
+                super().__init__()
+                self.discarded = False
+
+            def cursor(self):
+                class DeadCursor:
+                    def execute(self, *_args, **_kwargs):
+                        raise ConnectionError("connection reset")
+
+                    def fetchone(self):
+                        return None
+                return DeadCursor()
+
+            def close(self):
+                self.discarded = True
+
+        config = SupabaseDatabaseConfig("postgresql://postgres:secret@db.example/postgres?sslmode=require")
+        pool = _ConnectionPool(config)
+        dead = DeadConnection()
+        replacement = FakeConnection()
+        pool._idle.append(dead)
+        pool._created = 1
+        with patch("app.supabase_db._open_connection", return_value=replacement):
+            borrowed = pool.acquire()
+        self.assertIs(borrowed._connection, replacement)
+        self.assertTrue(dead.discarded)
+
 
 class SupabaseRepositoryTests(unittest.TestCase):
     def test_close_run_is_written_transactionally(self):
@@ -94,7 +126,63 @@ class SupabaseRepositoryTests(unittest.TestCase):
         self.assertEqual(claimed["id"], "task-1")
         self.assertEqual(claimed["attempt"], 1)
         self.assertIn("skip locked", connection.cursor_instance.executed[0][0].lower())
+        self.assertIn("for update of t skip locked", connection.cursor_instance.executed[0][0].lower())
         self.assertEqual(connection.commits, 1)
+
+    def test_workflow_store_renews_only_an_unexpired_owned_lease(self):
+        connection = FakeConnection([("task-1",)])
+        config = SupabaseDatabaseConfig("postgresql://postgres:secret@db.example/postgres?sslmode=require")
+        task = PersistedTask("task-1", "run-1", "sync", "running", 1, "worker-1", None, None)
+        with patch("app.supabase_db.connect", return_value=connection):
+            renewed = SupabaseWorkflowStore(config).renew_task_lease(task, "worker-1")
+        self.assertTrue(renewed)
+        query, params = connection.cursor_instance.executed[0]
+        self.assertIn("lease_expires_at > now()", query.lower())
+        self.assertEqual(params[1:], ("task-1", "worker-1"))
+
+    def test_retryable_task_failure_releases_the_task_within_its_attempt_budget(self):
+        connection = FakeConnection([("run-1", "reconcile", "ready", 1), ("org-1",)])
+        config = SupabaseDatabaseConfig("postgresql://postgres:secret@db.example/postgres?sslmode=require")
+        task = PersistedTask("task-1", "run-1", "reconcile", "running", 1, "worker-1", None, None)
+        with patch("app.supabase_db.connect", return_value=connection):
+            state = SupabaseWorkflowStore(config).retry_task(task, "worker-1", "safe retry message")
+        self.assertEqual(state, "ready")
+        query = connection.cursor_instance.executed[0][0].lower()
+        self.assertIn("when attempt < max_attempts then 'ready' else 'failed'", query)
+        self.assertIn("task_retry_scheduled", connection.cursor_instance.executed[2][1])
+
+    def test_snapshot_persistence_returns_the_existing_snapshot_without_new_records(self):
+        connection = FakeConnection([(
+            "run-1", "org-1", "2026-07-01", "2026-07-31", "synchronizing",
+            "production", "live", "snapshot-existing", None, "deployment-1",
+        )])
+        config = SupabaseDatabaseConfig("postgresql://postgres:secret@db.example/postgres?sslmode=require")
+        with patch("app.supabase_db.connect", return_value=connection):
+            run = SupabaseWorkflowStore(config).persist_source_snapshot(
+                run_id="run-1", batches=(), snapshot=object(), provider_identities={},
+            )
+        self.assertEqual(run.snapshot_id, "snapshot-existing")
+        self.assertEqual(len(connection.cursor_instance.executed), 1)
+
+    def test_recovery_email_rate_limit_counts_only_confirmed_sends(self):
+        connection = FakeConnection([(1, 0)])
+        config = SupabaseDatabaseConfig("postgresql://postgres:secret@db.example/postgres?sslmode=require")
+        with patch("app.supabase_db.connect", return_value=connection):
+            counts = SupabaseWorkflowStore(config).recovery_email_counts(
+                run_id="run-1", recipient="controller@example.test", excluding_action_id="action-1",
+            )
+        self.assertEqual(counts, (1, 0))
+        query = connection.cursor_instance.executed[0][0].lower()
+        self.assertIn("a.status in ('succeeded', 'reconciled')", query)
+
+    def test_unmatched_ledger_exceptions_are_not_sent_to_groq(self):
+        connection = FakeConnection([])
+        config = SupabaseDatabaseConfig("postgresql://postgres:secret@db.example/postgres?sslmode=require")
+        with patch("app.supabase_db.connect", return_value=connection):
+            exceptions = SupabaseWorkflowStore(config).unexplained_exceptions_for_run("run-1")
+        self.assertEqual(exceptions, ())
+        query = connection.cursor_instance.executed[0][0].lower()
+        self.assertIn("control_code <> 'unmatched_ledger'", query)
 
     def test_migration_keeps_financial_schemas_private_and_rls_enabled(self):
         migration = Path(__file__).parents[1] / ".." / "supabase" / "migrations"
@@ -245,7 +333,7 @@ class SupabaseRepositoryTests(unittest.TestCase):
         query = connection.cursor_instance.executed[1][0].lower()
         self.assertIn("t.state = 'running' and t.lease_expires_at < now()", query)
         self.assertIn("t.attempt < t.max_attempts", query)
-        self.assertIn("for update skip locked", query)
+        self.assertIn("for update of t skip locked", query)
 
     def test_durable_claim_terminalizes_expired_lease_after_max_attempts(self):
         config = SupabaseDatabaseConfig("postgresql://postgres:secret@db.example/postgres?sslmode=require")

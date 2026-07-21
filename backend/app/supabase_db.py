@@ -232,7 +232,29 @@ class _ConnectionPool:
 
     @staticmethod
     def _is_usable(connection: object) -> bool:
-        return not bool(getattr(connection, "closed", False))
+        if bool(getattr(connection, "closed", False)):
+            return False
+        try:
+            cursor = connection.cursor()
+            cursor.execute("select 1")
+            cursor.fetchone()
+            rollback = getattr(connection, "rollback", None)
+            if callable(rollback):
+                # The liveness probe must not return an idle connection that
+                # is still inside the transaction opened by SELECT 1.
+                rollback()
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _discard(connection: object) -> None:
+        close = getattr(connection, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
 
     def acquire(self) -> _PooledConnection:
         deadline = time.monotonic() + self.config.pool_wait_seconds
@@ -242,6 +264,7 @@ class _ConnectionPool:
                     connection = self._idle.pop()
                     if self._is_usable(connection):
                         return _PooledConnection(self, connection)
+                    self._discard(connection)
                     self._created -= 1
                 if self._created < self.config.pool_max_size:
                     self._created += 1
@@ -263,6 +286,7 @@ class _ConnectionPool:
             if self._is_usable(connection):
                 self._idle.append(connection)
             else:
+                self._discard(connection)
                 self._created -= 1
             self._condition.notify()
 
@@ -418,12 +442,12 @@ class SupabaseRepository:
         with transaction(self.connection) as cursor:
             cursor.execute(
                 """
-                select id, run_id, task_key, attempt
-                from workflow.tasks
-                where state = 'ready'
-                  and (lease_expires_at is null or lease_expires_at < now())
-                order by created_at
-                for update skip locked
+                select t.id, t.run_id, t.task_key, t.attempt
+                from workflow.tasks t
+                where t.state = 'ready'
+                  and (t.lease_expires_at is null or t.lease_expires_at < now())
+                order by t.created_at
+                for update of t skip locked
                 limit 1
                 """
             )
@@ -486,6 +510,21 @@ class SupabaseWorkflowStore:
                 )
                 rows = cursor.fetchall()
             return tuple(OrganizationSummary(str(row[0]), str(row[1]), str(row[2])) for row in rows)
+        finally:
+            self._close(connection)
+
+    def accounting_timezone_for_organization(self, organization_id: str) -> str:
+        connection = connect(self.config)
+        try:
+            with transaction(connection) as cursor:
+                cursor.execute(
+                    "select accounting_timezone from workflow.organizations where id = %s",
+                    (organization_id,),
+                )
+                row = cursor.fetchone()
+            if row is None or not isinstance(row[0], str) or not row[0]:
+                raise SupabaseConfigError("organization accounting timezone is unavailable")
+            return row[0]
         finally:
             self._close(connection)
 
@@ -782,13 +821,14 @@ class SupabaseWorkflowStore:
                         """
                         insert into workflow.reconciliation_exceptions
                             (id, run_id, organization_id, control_code, source_transaction_ids,
-                             evidence_ids, amount, currency, remediation, facts_json)
-                        values (%s, %s::uuid, %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s::jsonb)
+                             evidence_ids, amount, currency, remediation, facts_json, explanation_status)
+                        values (%s, %s::uuid, %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s::jsonb,
+                                case when %s = 'unmatched_ledger' then 'unavailable' else 'pending' end)
                         """,
                         (exception.exception_id, run_id, organization_id, exception.control_code,
                          dumps(list(exception.source_transaction_ids)), dumps(list(exception.evidence_ids)),
                          exception.amount, exception.currency, exception.remediation,
-                         dumps(list(execution.exception_facts.get(exception.exception_id, ()))),),
+                         dumps(list(execution.exception_facts.get(exception.exception_id, ()))), exception.control_code),
                     )
                 cursor.execute(
                     """
@@ -822,9 +862,10 @@ class SupabaseWorkflowStore:
             with transaction(connection) as cursor:
                 cursor.execute(
                     """
-                    select id, facts_json, amount, currency, source_transaction_ids, evidence_ids
+                    select id, facts_json, amount, currency, source_transaction_ids, evidence_ids, control_code
                     from workflow.reconciliation_exceptions
                     where run_id = %s::uuid and explanation_status = 'pending'
+                      and control_code <> 'unmatched_ledger'
                     order by created_at, id
                     """,
                     (run_id,),
@@ -833,8 +874,24 @@ class SupabaseWorkflowStore:
             return tuple({
                 "id": str(row[0]), "facts": list(row[1] or []), "amount": str(row[2]),
                 "currency": str(row[3]), "source_transaction_ids": list(row[4] or []),
-                "evidence_ids": list(row[5] or []),
+                "evidence_ids": list(row[5] or []), "control_code": str(row[6]),
             } for row in rows)
+        finally:
+            self._close(connection)
+
+    def mark_exception_explanation_unavailable(self, *, run_id: str, exception_id: str) -> None:
+        """Record an unavailable optional explanation without fabricating an AI audit call."""
+        connection = connect(self.config)
+        try:
+            with transaction(connection) as cursor:
+                cursor.execute(
+                    """
+                    update workflow.reconciliation_exceptions
+                    set explanation_status = 'unavailable', explanation_updated_at = now()
+                    where id = %s and run_id = %s::uuid and explanation_status = 'pending'
+                    """,
+                    (exception_id, run_id),
+                )
         finally:
             self._close(connection)
 
@@ -1351,7 +1408,7 @@ class SupabaseWorkflowStore:
                       and t.attempt < t.max_attempts
                       and r.state <> 'cancelled'
                     order by t.created_at, t.id
-                    for update skip locked
+                    for update of t skip locked
                     limit 1
                     """
                 )
@@ -1386,10 +1443,78 @@ class SupabaseWorkflowStore:
     def complete_task(self, task: PersistedTask, worker_id: str) -> None:
         self._finish_task(task, worker_id, state="succeeded", error=None)
 
+    def renew_task_lease(self, task: PersistedTask, worker_id: str, *, lease_seconds: int = 60) -> bool:
+        if not worker_id or not 1 <= lease_seconds <= 900:
+            raise SupabaseConfigError("worker id and lease duration are invalid")
+        connection = connect(self.config)
+        try:
+            with transaction(connection) as cursor:
+                cursor.execute(
+                    """
+                    update workflow.tasks
+                    set lease_expires_at = now() + (%s * interval '1 second'), updated_at = now()
+                    where id = %s::uuid and state = 'running' and lease_owner = %s
+                      and lease_expires_at > now()
+                    returning id::text
+                    """,
+                    (lease_seconds, task.task_id, worker_id),
+                )
+                return cursor.fetchone() is not None
+        finally:
+            self._close(connection)
+
     def block_task(self, task: PersistedTask, worker_id: str, error: str) -> None:
         if not error:
             raise SupabaseConfigError("a blocked task needs an error message")
         self._finish_task(task, worker_id, state="blocked", error=error)
+
+    def retry_task(self, task: PersistedTask, worker_id: str, error: str) -> str:
+        """Release an owned task for retry, or terminalize it at its attempt budget."""
+        if not error:
+            raise SupabaseConfigError("a retryable task failure needs an error message")
+        connection = connect(self.config)
+        try:
+            with transaction(connection) as cursor:
+                cursor.execute(
+                    """
+                    update workflow.tasks
+                    set state = case when attempt < max_attempts then 'ready' else 'failed' end,
+                        lease_owner = null, lease_expires_at = null,
+                        last_error = %s, updated_at = now()
+                    where id = %s::uuid and state = 'running' and lease_owner = %s
+                      and lease_expires_at > now()
+                    returning run_id::text, task_key, state, attempt
+                    """,
+                    (error, task.task_id, worker_id),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    raise SupabaseConfigError("task is not owned by this worker")
+                run_id, task_key, state, attempt = str(row[0]), str(row[1]), str(row[2]), int(row[3])
+                cursor.execute("select organization_id from workflow.close_runs where id = %s::uuid", (run_id,))
+                organization_row = cursor.fetchone()
+                if organization_row is None:
+                    raise SupabaseConfigError("task close run does not exist")
+                organization_id = str(organization_row[0])
+                self._record_task_event(
+                    cursor,
+                    organization_id=organization_id,
+                    run_id=run_id,
+                    task_id=task.task_id,
+                    event_type="task_retry_scheduled" if state == "ready" else "task_failed",
+                    payload={"task_key": task_key, "attempt": attempt, "error": error},
+                )
+                if state == "failed":
+                    cursor.execute(
+                        """
+                        update workflow.close_runs set state = 'blocked', updated_at = now()
+                        where id = %s::uuid and state not in ('approved', 'cancelled')
+                        """,
+                        (run_id,),
+                    )
+                return state
+        finally:
+            self._close(connection)
 
     def retry_run(self, run_id: str) -> PersistedCloseRun:
         connection = connect(self.config)
@@ -1965,7 +2090,7 @@ class SupabaseWorkflowStore:
                     join workflow.recovery_email_requests request on request.action_id = a.id
                     where a.run_id = %s::uuid
                       and a.provider = 'gmail' and a.operation = 'send_approved_request'
-                      and a.status <> 'failed'
+                      and a.status in ('succeeded', 'reconciled')
                     """,
                     (excluding_action_id, excluding_action_id, recipient, run_id),
                 )
@@ -1988,7 +2113,9 @@ class SupabaseWorkflowStore:
             with transaction(connection) as cursor:
                 cursor.execute(
                     """
-                    select organization_id, deployment_id, deployment_mode, data_class, state
+                    select id::text, organization_id, period_start::text, period_end::text,
+                           state, deployment_mode, data_class, snapshot_id::text, package_hash,
+                           deployment_id
                     from workflow.close_runs where id = %s::uuid for update
                     """,
                     (run_id,),
@@ -1996,8 +2123,11 @@ class SupabaseWorkflowStore:
                 run = cursor.fetchone()
                 if run is None:
                     raise SupabaseConfigError("close run does not exist")
-                organization_id, deployment_id, mode, data_class, state = (
-                    str(run[0]), str(run[1]), str(run[2]), str(run[3]), str(run[4])
+                existing_run = self._run_from_row(run[:9])
+                if existing_run.snapshot_id:
+                    return existing_run
+                organization_id, state, mode, data_class, deployment_id = (
+                    str(run[1]), str(run[4]), str(run[5]), str(run[6]), str(run[9])
                 )
                 if state != "synchronizing":
                     raise SupabaseConfigError("source snapshots require a synchronizing close run")
@@ -2404,6 +2534,7 @@ class SupabaseWorkflowStore:
                     set state = %s, lease_owner = null, lease_expires_at = null,
                         last_error = %s, updated_at = now()
                     where id = %s::uuid and state = 'running' and lease_owner = %s
+                      and lease_expires_at > now()
                     returning run_id::text, task_key
                     """,
                     (state, error, task.task_id, worker_id),

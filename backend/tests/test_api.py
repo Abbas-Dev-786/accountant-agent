@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -6,7 +7,10 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from app.main import app, configure_auth_verifier, configure_workflow_store, service
+from app.main import (
+    app, configure_auth_verifier, configure_plaid_webhook_verifier,
+    configure_workflow_store, service, stream_close_run_events,
+)
 from app.supabase_auth import AuthenticationError, SupabaseUser
 from app.supabase_db import OrganizationSummary, PersistedCloseRun, PersistedTask, PersistedTaskEvent
 
@@ -108,11 +112,13 @@ class ApiTests(unittest.TestCase):
         self.store = FakeWorkflowStore()
         configure_auth_verifier(FakeVerifier())
         configure_workflow_store(self.store)
+        configure_plaid_webhook_verifier(None)
         self.client = TestClient(app)
 
     def tearDown(self) -> None:
         configure_auth_verifier(None)
         configure_workflow_store(None)
+        configure_plaid_webhook_verifier(None)
 
     @staticmethod
     def _headers():
@@ -221,6 +227,45 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(first.json(), {"accepted": True})
         self.assertEqual(duplicate.status_code, 202)
         self.assertEqual(duplicate.json(), {"accepted": False})
+
+    def test_plaid_webhook_body_is_bounded_before_json_parsing(self) -> None:
+        response = self.client.post(
+            "/api/v1/webhooks/plaid",
+            content=b"x" * (1_048_576 + 1),
+            headers={"Plaid-Verification": "present"},
+        )
+        self.assertEqual(response.status_code, 413)
+
+    def test_sse_replays_events_committed_just_before_terminal_close(self) -> None:
+        run_id = "run-stream"
+        terminal_run = PersistedCloseRun(
+            run_id, "us-org", "2026-07-01", "2026-07-31", "awaiting_approval", "production", "live", None, None,
+        )
+        final_event = PersistedTaskEvent(
+            2, "us-org", run_id, "task-1", "task_completed", {}, datetime(2026, 7, 1, tzinfo=timezone.utc),
+        )
+
+        class StreamStore(FakeWorkflowStore):
+            def __init__(self):
+                super().__init__()
+                self.runs[run_id] = terminal_run
+                self.event_reads = 0
+
+            def events_for_run(self, _run_id, **kwargs):
+                self.event_reads += 1
+                return (final_event,) if self.event_reads == 2 else ()
+
+        stream_store = StreamStore()
+        configure_workflow_store(stream_store)
+
+        async def read_stream():
+            response = await stream_close_run_events(
+                run_id, SupabaseUser("controller-1", "controller@example.test", "https://demo.supabase.co/auth/v1"),
+            )
+            return [chunk async for chunk in response.body_iterator]
+
+        chunks = asyncio.run(read_stream())
+        self.assertTrue(any("id: 2" in chunk for chunk in chunks))
 
     def test_bootstrap_is_limited_to_the_configured_controller_and_one_us_organization(self) -> None:
         self.store.organizations = ()

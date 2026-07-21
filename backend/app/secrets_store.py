@@ -9,7 +9,9 @@ for deterministic unit tests.
 from __future__ import annotations
 
 import os
-from typing import Callable, Mapping
+import threading
+from contextlib import contextmanager
+from typing import Callable, Iterator, Mapping
 
 from .supabase_db import SupabaseConfigError, SupabaseDatabaseConfig, connect, transaction
 
@@ -62,6 +64,7 @@ class SupabaseVaultSecretStore:
     ) -> None:
         self.config = config
         self._connection_factory = connection_factory or connect
+        self._exclusive_lock_refs = threading.local()
 
     @staticmethod
     def _first_value(row: object) -> object | None:
@@ -93,6 +96,39 @@ class SupabaseVaultSecretStore:
             raise SecretStoreError("Supabase Vault secret is unavailable")
         return value
 
+    @contextmanager
+    def exclusive_lock(self, secret_ref: str) -> Iterator[None]:
+        """Hold a database-wide lock for a single-use provider credential.
+
+        Vault reads and writes use separate short transactions, so the lock
+        must be session-scoped and span the provider exchange between them.
+        """
+        _validate_reference(secret_ref)
+        held_refs = getattr(self._exclusive_lock_refs, "refs", set())
+        if secret_ref in held_refs:
+            yield
+            return
+        connection = self._open_connection()
+        cursor = None
+        try:
+            cursor = connection.cursor()
+            cursor.execute("select pg_advisory_lock(hashtextextended(%s, 0))", (secret_ref,))
+        except Exception as exc:
+            self._close_connection(connection)
+            raise SecretStoreError("provider credential lock is unavailable") from exc
+        self._exclusive_lock_refs.refs = {*held_refs, secret_ref}
+        try:
+            yield
+        finally:
+            self._exclusive_lock_refs.refs = held_refs
+            try:
+                cursor.execute("select pg_advisory_unlock(hashtextextended(%s, 0))", (secret_ref,))
+            except Exception:
+                # Losing this session also releases PostgreSQL advisory locks.
+                # Do not mask the provider result with a best-effort unlock.
+                pass
+            self._close_connection(connection)
+
     def store(self, secret_ref: str, value: str) -> None:
         _validate_reference(secret_ref)
         if not value:
@@ -102,7 +138,8 @@ class SupabaseVaultSecretStore:
             with transaction(connection) as cursor:
                 # Serialize competing OAuth refresh rotations for one opaque
                 # reference. A collision can only cause harmless contention.
-                cursor.execute("select pg_advisory_xact_lock(hashtextextended(%s, 0))", (secret_ref,))
+                if secret_ref not in getattr(self._exclusive_lock_refs, "refs", set()):
+                    cursor.execute("select pg_advisory_xact_lock(hashtextextended(%s, 0))", (secret_ref,))
                 cursor.execute("select id from vault.secrets where name = %s for update", (secret_ref,))
                 secret_id = self._first_value(cursor.fetchone())
                 if secret_id is None:

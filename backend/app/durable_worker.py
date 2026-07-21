@@ -13,6 +13,7 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from hashlib import sha256
+from threading import Event, Thread
 from typing import Mapping, Protocol
 
 from .actions import XeroDraftRequest
@@ -50,7 +51,13 @@ class DurableTaskStore(Protocol):
     def complete_task(self, task: PersistedTask, worker_id: str) -> None:
         ...
 
+    def renew_task_lease(self, task: PersistedTask, worker_id: str, *, lease_seconds: int = 60) -> bool:
+        ...
+
     def block_task(self, task: PersistedTask, worker_id: str, error: str) -> None:
+        ...
+
+    def retry_task(self, task: PersistedTask, worker_id: str, error: str) -> str:
         ...
 
 
@@ -70,9 +77,9 @@ class WorkerResult:
 class DurableWorkflowWorker:
     """Claim one task, execute it once, and persist a terminal result.
 
-    Unknown exceptions are intentionally reduced to a stable, non-sensitive
-    blocker. Provider payloads and credentials must never enter task events or
-    controller-visible errors.
+    Unexpected exceptions are reduced to stable, non-sensitive retry messages.
+    Explicit TaskBlocked failures remain controller-actionable blockers; neither
+    path exposes provider payloads or credentials in task events.
     """
 
     def __init__(
@@ -82,30 +89,101 @@ class DurableWorkflowWorker:
         *,
         worker_id: str,
         lease_seconds: int = 60,
+        heartbeat_interval_seconds: float | None = None,
     ) -> None:
         if not worker_id or lease_seconds < 1:
             raise ValueError("worker id and lease duration are required")
+        if heartbeat_interval_seconds is not None and heartbeat_interval_seconds <= 0:
+            raise ValueError("heartbeat interval must be positive")
         self.store = store
         self.executor = executor
         self.worker_id = worker_id
         self.lease_seconds = lease_seconds
+        self.heartbeat_interval_seconds = heartbeat_interval_seconds or max(0.25, min(30.0, lease_seconds / 3))
 
     def process_once(self) -> WorkerResult:
         task = self.store.claim_next_task(self.worker_id, lease_seconds=self.lease_seconds)
         if task is None:
             return WorkerResult(None, None, "idle")
+        heartbeat = _LeaseHeartbeat(
+            self.store,
+            task,
+            self.worker_id,
+            self.lease_seconds,
+            self.heartbeat_interval_seconds,
+        )
+        heartbeat.start()
+        blocked_error: str | None = None
+        retry_error: str | None = None
         try:
             self.executor.execute(task)
         except TaskBlocked as exc:
-            message = str(exc) or "task is blocked pending operator action"
-            self.store.block_task(task, self.worker_id, message)
-            return WorkerResult(task.task_id, task.task_key, "blocked", message)
+            blocked_error = str(exc) or "task is blocked pending operator action"
         except Exception:
-            message = "task execution failed; inspect the server-side provider and worker logs"
-            self.store.block_task(task, self.worker_id, message)
-            return WorkerResult(task.task_id, task.task_key, "blocked", message)
+            retry_error = "task execution failed; retrying within the persisted attempt budget"
+        finally:
+            heartbeat.stop()
+        if heartbeat.lease_lost:
+            return WorkerResult(
+                task.task_id,
+                task.task_key,
+                "lease_lost",
+                "task lease could not be renewed; the task was left for safe recovery",
+            )
+        if blocked_error:
+            self.store.block_task(task, self.worker_id, blocked_error)
+            return WorkerResult(task.task_id, task.task_key, "blocked", blocked_error)
+        if retry_error:
+            state = self.store.retry_task(task, self.worker_id, retry_error)
+            status = "retrying" if state == "ready" else "failed"
+            return WorkerResult(task.task_id, task.task_key, status, retry_error)
         self.store.complete_task(task, self.worker_id)
         return WorkerResult(task.task_id, task.task_key, "succeeded")
+
+
+class _LeaseHeartbeat:
+    """Renew a durable task lease while a synchronous executor is running."""
+
+    def __init__(
+        self,
+        store: DurableTaskStore,
+        task: PersistedTask,
+        worker_id: str,
+        lease_seconds: int,
+        interval_seconds: float,
+    ) -> None:
+        self.store = store
+        self.task = task
+        self.worker_id = worker_id
+        self.lease_seconds = lease_seconds
+        self.interval_seconds = interval_seconds
+        self._stop = Event()
+        self._thread = Thread(target=self._run, name=f"accountingos-lease-{task.task_id}", daemon=True)
+        self.lease_lost = False
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=self.interval_seconds + 1)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval_seconds):
+            try:
+                if not self.store.renew_task_lease(
+                    self.task,
+                    self.worker_id,
+                    lease_seconds=self.lease_seconds,
+                ):
+                    self.lease_lost = True
+                    return
+            except Exception:
+                # A database failure means ownership can no longer be proven.
+                # Do not let this worker commit a terminal state after the
+                # executor returns; recovery will reclaim the expired task.
+                self.lease_lost = True
+                return
 
 
 class RegisteredTaskExecutor:
@@ -233,6 +311,8 @@ class DemoSourceSyncExecutor:
         run = self.store.get_close_run(task.run_id)
         if run is None or run.state != "synchronizing":
             raise TaskBlocked("close run is not available for source synchronization")
+        if run.snapshot_id:
+            return
         try:
             xero_config = XeroOAuthConfig.from_environment(self.env)
             secrets = secret_store_from_environment(self.env)
@@ -319,6 +399,8 @@ class ProductionSourceSyncExecutor:
         run = self.store.get_close_run(task.run_id)
         if run is None or run.state != "synchronizing":
             raise TaskBlocked("close run is not available for source synchronization")
+        if run.snapshot_id:
+            return
         if (run.deployment_mode, run.data_class) != ("production", "live"):
             raise TaskBlocked("production worker refuses a non-live close run")
         try:
@@ -362,6 +444,8 @@ class ProductionSourceSyncExecutor:
                     secret_resolver=secrets,
                     transport=UrllibJsonTransport(),
                     oauth_client=xero_oauth,
+                    period_start=date.fromisoformat(run.period_start),
+                    period_end=date.fromisoformat(run.period_end),
                 ),
                 expected_tenant,
             )
@@ -443,6 +527,9 @@ class EvidenceStore(Protocol):
     def connection_secret_ref(self, organization_id: str, provider: str, provider_target: str) -> str | None:
         ...
 
+    def accounting_timezone_for_organization(self, organization_id: str) -> str:
+        ...
+
 
 class GoogleEvidenceExecutor:
     """Collect only configured Workspace evidence metadata for the close period."""
@@ -476,7 +563,16 @@ class GoogleEvidenceExecutor:
             GoogleOAuthClient(GoogleOAuthConfig.from_environment(self.env), secrets).refresh_access_token(
                 refresh_token_ref, access_token_ref
             )
-            scope = EvidenceScope(folders, mailbox, labels, date.fromisoformat(run.period_start), date.fromisoformat(run.period_end))
+            timezone_lookup = getattr(self.store, "accounting_timezone_for_organization", None)
+            accounting_timezone = timezone_lookup(run.organization_id) if callable(timezone_lookup) else "UTC"
+            scope = EvidenceScope(
+                folders,
+                mailbox,
+                labels,
+                date.fromisoformat(run.period_start),
+                date.fromisoformat(run.period_end),
+                accounting_timezone,
+            )
             transport = UrllibJsonTransport()
             batch = EvidenceCollector(
                 GoogleDriveHttpClient(access_token_ref, secrets, transport),
@@ -557,8 +653,17 @@ class DurableReconciliationExecutor:
             return
         try:
             service = GroundedExplanationService(GroqExplanationModel(GroqConfig.from_environment(self.env)))
-        except GroqError as exc:
-            raise TaskBlocked("grounded Groq explanations are required for open exceptions but are not configured") from exc
+        except GroqError:
+            # Explanations enrich a controller's review; an unavailable model
+            # must not convert every already-persisted reconciliation
+            # exception into a blocked close.  The underlying exception stays
+            # open and visibly records that no AI explanation was available.
+            for exception in exceptions:
+                self.store.mark_exception_explanation_unavailable(
+                    run_id=run_id,
+                    exception_id=str(exception["id"]),
+                )
+            return
         permitted_codes = frozenset(str(item) for item in configuration.get("permitted_journal_account_codes", []))
         for exception in exceptions:
             facts_raw = exception.get("facts", [])
@@ -568,7 +673,11 @@ class DurableReconciliationExecutor:
                 if isinstance(item, Mapping) and all(key in item for key in ("evidence_id", "field", "value"))
             )
             if not facts or len({item.evidence_id for item in facts}) != len(facts):
-                raise TaskBlocked("reconciliation exception has no valid bounded facts for grounded explanation")
+                self.store.mark_exception_explanation_unavailable(
+                    run_id=run_id,
+                    exception_id=str(exception["id"]),
+                )
+                continue
             supported_dates = frozenset(
                 date.fromisoformat(item.value)
                 for item in facts
@@ -609,7 +718,11 @@ class DurableReconciliationExecutor:
                     latency_ms=audit.latency_ms if audit else None, input_tokens=audit.token_count if audit else None,
                     output_tokens=audit.token_count if audit else None,
                 )
-                raise TaskBlocked("grounded Groq explanation could not be verified; inspect the exception and worker logs") from exc
+                # Leave the underlying exception open and its rejected
+                # explanation auditable, then continue with the remaining
+                # bounded explanations. One transient Groq failure must not
+                # stop an otherwise reviewable close package.
+                continue
 
     def _archive_close_package(self, run_id: str, organization_id: str) -> None:
         try:
@@ -830,7 +943,10 @@ class GmailRecoveryActionExecutor:
             self.store.update_action_execution(action_id=str(action["action_id"]), status="succeeded", provider_object_id=result.message_id)
         except TaskBlocked:
             raise
-        except (EvidencePolicyError, Exception) as exc:
+        except EvidencePolicyError as exc:
+            self.store.update_action_execution(action_id=str(action["action_id"]), status="failed")
+            raise TaskBlocked("Gmail recovery action violates the approved evidence policy") from exc
+        except Exception as exc:
             try:
                 recovered = client.search_sent_by_marker(str(action["marker"]))
             except Exception:

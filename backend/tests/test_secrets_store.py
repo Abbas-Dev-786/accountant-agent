@@ -95,6 +95,20 @@ class SupabaseVaultSecretStoreTests(unittest.TestCase):
         self.assertIn("vault.update_secret", rotated.cursor_instance.executed[-1][0].lower())
         self.assertTrue(rotated.closed)
 
+    def test_exclusive_lock_allows_the_guarded_vault_rotation_without_self_deadlock(self):
+        lock_connection = FakeConnection()
+        store_connection = FakeConnection([None])
+        connections = iter((lock_connection, store_connection))
+        store = SupabaseVaultSecretStore(self.config, connection_factory=lambda _: next(connections))
+        secret_ref = "secret://xero/production/connection-a/refresh-token"
+        with store.exclusive_lock(secret_ref):
+            store.store(secret_ref, "rotated-token")
+        lock_queries = "\n".join(query for query, _ in lock_connection.cursor_instance.executed).lower()
+        store_queries = "\n".join(query for query, _ in store_connection.cursor_instance.executed).lower()
+        self.assertIn("pg_advisory_lock", lock_queries)
+        self.assertIn("pg_advisory_unlock", lock_queries)
+        self.assertNotIn("pg_advisory_xact_lock", store_queries)
+
     def test_missing_secret_and_invalid_reference_fail_closed(self):
         store = SupabaseVaultSecretStore(self.config, connection_factory=lambda _: FakeConnection([None]))
         with self.assertRaises(SecretStoreError):

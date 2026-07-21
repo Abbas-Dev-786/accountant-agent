@@ -27,12 +27,17 @@ class FakeSecrets:
             "secret://xero/demo/client-secret": "client-secret",
             "secret://xero/demo/refresh-token": "old-refresh",
         }
+        self.deleted = []
 
     def resolve(self, ref):
         return self.values[ref]
 
     def store(self, ref, value):
         self.values[ref] = value
+
+    def delete(self, ref):
+        self.deleted.append(ref)
+        self.values.pop(ref, None)
 
 
 class FakeFormTransport:
@@ -131,6 +136,9 @@ class CallbackRegistrationTests(unittest.TestCase):
         callback = self._run_flow()
         self.assertEqual(callback.status_code, 502)
         self.assertEqual(connections.for_organization("demo-org"), ())
+        secrets = main.xero_oauth_client.secrets
+        self.assertEqual(len(secrets.deleted), 1)
+        self.assertNotIn(secrets.deleted[0], secrets.values)
 
     def test_allowlist_filters_registration_to_named_tenants(self):
         self._set_allowlist("tenant-bbb")

@@ -65,6 +65,11 @@ type CloseMapping = {
       gmail_labels: string[];
       allowed_recipients: string[];
       retention_policy_version: string;
+      checklist?: {
+        id: string;
+        version: number;
+        requirements: { requirement_id: string; description: string; required_tags: string[]; allowed_kinds: string[] }[];
+      };
     };
   };
   approved_by_subject: string;
@@ -76,6 +81,7 @@ type ReviewData = {
   mapping: CloseMapping | null;
   source_batches: { provider: string; environment: string; watermark: string; completed_at: string | null; complete: boolean; warnings: string[] }[];
   evidence_items: { id: string; provider: string; source_id: string; observed_at: string | null; kind: string; scope_reference: string; tags: string[] }[];
+  evidence_checklist: { id: string; version: number; evidence_batch_id: string; ready: boolean; satisfied: string[]; missing: { requirement_id: string; description: string }[]; evaluated_at: string | null } | null;
   review_package: { id: string; package_hash: string; status: string; summary: Record<string, unknown>; frozen_at: string | null } | null;
   journal_proposals: { id: string; date: string; narration: string; proposal_hash: string; status: string; lines: { account_code: string; debit: string; credit: string; evidence_ids: string[] }[] }[];
   reconciliation_matches: { id: string; kind: string; amount: string; currency: string; bank_transaction_ids: string[]; ledger_transaction_ids: string[]; evidence_ids: string[] }[];
@@ -99,6 +105,9 @@ type MappingForm = {
   gmailLabels: string;
   allowedRecipients: string;
   retentionPolicyVersion: string;
+  checklistId: string;
+  checklistVersion: string;
+  checklistRequirements: string;
 };
 
 type PlaidHandler = { open: () => void };
@@ -177,11 +186,26 @@ function csv(value: string): string[] {
   return value.split(",").map((item) => item.trim()).filter(Boolean);
 }
 
+function checklistRequirements(value: string): unknown[] {
+  const parsed: unknown = JSON.parse(value);
+  if (!Array.isArray(parsed) || parsed.length === 0) {
+    throw new Error("Evidence checklist requirements must be a non-empty JSON array.");
+  }
+  return parsed;
+}
+
 function blankMappingForm(): MappingForm {
   return {
     xeroTenantId: "", bankAccounts: {}, dateWindowDays: "3", feeTolerance: "0", materialityThreshold: "0",
     pendingPolicy: "exception", maxAggregateSize: "10", journalCodes: "", journalAdjustmentCode: "", driveFolderIds: "", gmailMailbox: "",
     gmailLabels: "", allowedRecipients: "", retentionPolicyVersion: "v1",
+    checklistId: "close-evidence-v1", checklistVersion: "1",
+    checklistRequirements: JSON.stringify([{
+      requirement_id: "scoped-evidence",
+      description: "At least one scoped close evidence item is required.",
+      required_tags: [],
+      allowed_kinds: ["document", "email"],
+    }], null, 2),
   };
 }
 
@@ -218,6 +242,7 @@ export default function Home() {
   const [mappingForm, setMappingForm] = useState<MappingForm>(blankMappingForm);
   const [exceptionNotes, setExceptionNotes] = useState<Record<string, string>>({});
   const [recoveryRecipient, setRecoveryRecipient] = useState("");
+  const [reviewComment, setReviewComment] = useState("");
   const [email, setEmail] = useState("");
   const [organizationName, setOrganizationName] = useState("");
   const [organizationSlug, setOrganizationSlug] = useState("");
@@ -230,7 +255,7 @@ export default function Home() {
   const organizationIdRef = useRef("");
   const runIdRef = useRef<string | null>(null);
   const handledSessionTokenRef = useRef<string | null>(null);
-  const handledXeroRedirectRef = useRef(false);
+  const handledProviderRedirectRef = useRef(false);
   const [workspaceSessionToken, setWorkspaceSessionToken] = useState<string | null>(null);
   const [workspaceReloadNonce, setWorkspaceReloadNonce] = useState(0);
 
@@ -279,31 +304,44 @@ export default function Home() {
         gmailLabels: config.evidence.gmail_labels.join(", "),
         allowedRecipients: config.evidence.allowed_recipients.join(", "),
         retentionPolicyVersion: config.evidence.retention_policy_version,
+        checklistId: config.evidence.checklist?.id || "close-evidence-v1",
+        checklistVersion: String(config.evidence.checklist?.version || 1),
+        checklistRequirements: JSON.stringify(
+          config.evidence.checklist?.requirements || [{
+            requirement_id: "scoped-evidence",
+            description: "At least one scoped close evidence item is required.",
+            required_tags: [],
+            allowed_kinds: ["document", "email"],
+          }],
+          null,
+          2,
+        ),
       });
     }
   }
 
-  function consumeXeroRedirect(nextWorkspace: Workspace): string | null {
-    if (handledXeroRedirectRef.current || typeof window === "undefined") return null;
+  function consumeProviderRedirect(nextWorkspace: Workspace): string | null {
+    if (handledProviderRedirectRef.current || typeof window === "undefined") return null;
     const url = new URL(window.location.href);
-    const status = url.searchParams.get("xero");
-    if (!status) return null;
-    handledXeroRedirectRef.current = true;
+    const provider = (["xero", "google"] as const).find((name) => url.searchParams.has(name));
+    if (!provider) return null;
+    const status = url.searchParams.get(provider);
+    handledProviderRedirectRef.current = true;
     const callbackOrganizationId = url.searchParams.get("organization_id");
     const selectedCallbackOrganization = nextWorkspace.organizations.find(
       (organization) => organization.id === callbackOrganizationId,
     );
     if (status === "authorized") {
       setError("");
-      setMessage("Xero authorization completed. Connection status has been refreshed.");
+      setMessage(`${provider === "xero" ? "Xero" : "Google Workspace"} authorization completed. Connection status has been refreshed.`);
     } else if (status === "error") {
       setMessage("");
-      setError("Xero authorization could not be completed. No connection was created.");
+      setError(`${provider === "xero" ? "Xero" : "Google Workspace"} authorization could not be completed. No connection was created.`);
     } else {
       setMessage("");
-      setError("Xero authorization returned an invalid callback status.");
+      setError(`${provider === "xero" ? "Xero" : "Google Workspace"} authorization returned an invalid callback status.`);
     }
-    url.searchParams.delete("xero");
+    url.searchParams.delete(provider);
     url.searchParams.delete("organization_id");
     window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
     return selectedCallbackOrganization?.id || null;
@@ -312,7 +350,7 @@ export default function Home() {
   async function loadWorkspace(nextSession: Session, forceOrganizationReload = false) {
     const nextWorkspace = await api<Workspace>("/api/v1/me", nextSession.access_token);
     setWorkspace(nextWorkspace);
-    const callbackOrganizationId = consumeXeroRedirect(nextWorkspace);
+    const callbackOrganizationId = consumeProviderRedirect(nextWorkspace);
     const nextOrganizationId =
       callbackOrganizationId ||
       nextWorkspace.organizations.find((organization) => organization.id === organizationIdRef.current)?.id ||
@@ -660,6 +698,13 @@ export default function Home() {
     event.preventDefault();
     if (!session || !selectedOrganization) return;
     const plaidAccounts = connections.filter((connection) => connection.provider === "plaid" && connection.status === "healthy");
+    let requirements: unknown[];
+    try {
+      requirements = checklistRequirements(mappingForm.checklistRequirements);
+    } catch (parseError) {
+      setError(parseError instanceof Error ? parseError.message : "Evidence checklist JSON is invalid.");
+      return;
+    }
     setBusy(true);
     setError("");
     setMessage("");
@@ -690,6 +735,11 @@ export default function Home() {
               gmail_labels: csv(mappingForm.gmailLabels),
               allowed_recipients: csv(mappingForm.allowedRecipients),
               retention_policy_version: mappingForm.retentionPolicyVersion,
+              checklist: {
+                id: mappingForm.checklistId.trim(),
+                version: Number(mappingForm.checklistVersion),
+                requirements,
+              },
             },
           }),
         },
@@ -731,12 +781,35 @@ export default function Home() {
     try {
       await api<CloseRun>(`/api/v1/close-runs/${run.id}/approvals`, session.access_token, {
         method: "POST",
-        body: JSON.stringify({ package_hash: run.package_hash }),
+        body: JSON.stringify({ package_hash: run.package_hash, decision: "approved", comment: reviewComment.trim() || null }),
       });
       await loadRunDetails(session.access_token, run.id);
       setMessage("The frozen package was approved. Any allowed external action remains worker-controlled.");
     } catch (approvalError) {
       setError(approvalError instanceof Error ? approvalError.message : "Could not approve the review package");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function requestPackageChanges() {
+    if (!session || !run?.package_hash) return;
+    const comment = reviewComment.trim();
+    if (comment.length < 3) {
+      setError("Add a brief comment describing the requested changes.");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      await api<CloseRun>(`/api/v1/close-runs/${run.id}/approvals`, session.access_token, {
+        method: "POST",
+        body: JSON.stringify({ package_hash: run.package_hash, decision: "changes_requested", comment }),
+      });
+      await loadRunDetails(session.access_token, run.id);
+      setMessage("Changes were requested against the frozen package. Create a new close run after updating the mapping or source data.");
+    } catch (approvalError) {
+      setError(approvalError instanceof Error ? approvalError.message : "Could not request changes to the review package");
     } finally {
       setBusy(false);
     }
@@ -911,7 +984,11 @@ export default function Home() {
               {run && <div className="run-actions">
                 {run.status === "blocked" && <button className="secondary" onClick={() => changeRun("retry")} disabled={busy}>Retry blocked work</button>}
                 {["synchronizing", "running", "blocked"].includes(run.status) && <button className="secondary" onClick={() => changeRun("cancel")} disabled={busy}>Cancel run</button>}
-                {run.status === "awaiting_approval" && selectedOrganization?.role === "controller" && <button className="secondary" onClick={approvePackage} disabled={busy}>Approve frozen package</button>}
+                {run.status === "awaiting_approval" && selectedOrganization?.role === "controller" && <div className="approval-actions">
+                  <input value={reviewComment} onChange={(event) => setReviewComment(event.target.value)} placeholder="Approval note, or required change request" maxLength={2000} />
+                  <button className="secondary" onClick={approvePackage} disabled={busy}>Approve frozen package</button>
+                  <button className="secondary" onClick={requestPackageChanges} disabled={busy}>Request changes</button>
+                </div>}
               </div>}
             </article>
 
@@ -965,6 +1042,12 @@ export default function Home() {
                     <label>Allowed recipients<input value={mappingForm.allowedRecipients} onChange={(event) => setMappingForm({ ...mappingForm, allowedRecipients: event.target.value })} placeholder="controller@example.com" required /></label>
                     <label>Retention policy version<input value={mappingForm.retentionPolicyVersion} onChange={(event) => setMappingForm({ ...mappingForm, retentionPolicyVersion: event.target.value })} required /></label>
                   </div>
+                  <div className="evidence-checklist-fields">
+                    <label>Evidence checklist ID<input value={mappingForm.checklistId} onChange={(event) => setMappingForm({ ...mappingForm, checklistId: event.target.value })} required /></label>
+                    <label>Checklist version<input type="number" min="1" value={mappingForm.checklistVersion} onChange={(event) => setMappingForm({ ...mappingForm, checklistVersion: event.target.value })} required /></label>
+                    <label>Checklist requirements (JSON array)<textarea value={mappingForm.checklistRequirements} onChange={(event) => setMappingForm({ ...mappingForm, checklistRequirements: event.target.value })} spellCheck={false} required /></label>
+                    <p className="card-copy">Each requirement needs <code>requirement_id</code>, <code>description</code>, <code>required_tags</code>, and <code>allowed_kinds</code>. The worker blocks an empty or incomplete checklist.</p>
+                  </div>
                   <button type="submit" disabled={busy || !connections.some((connection) => connection.provider === "xero" && connection.status === "healthy") || !connections.some((connection) => connection.provider === "plaid" && connection.status === "healthy")}>{mapping ? `Save new version (current v${mapping.version})` : "Approve close mapping"}</button>
                 </form>
               ) : (
@@ -994,11 +1077,12 @@ export default function Home() {
                 <p><span>Snapshot</span><code>{review.snapshot_id || "Not committed yet"}</code></p>
                 <p><span>Mapping</span>{review.mapping ? `Version ${review.mapping.version}` : "Not configured"}</p>
                 <p><span>Evidence items</span>{review.evidence_items.length}</p>
+                <p><span>Evidence checklist</span>{review.evidence_checklist ? `${review.evidence_checklist.ready ? "ready" : "missing"} · v${review.evidence_checklist.version}` : "Not evaluated"}</p>
                 <p><span>Journal proposals</span>{review.journal_proposals.length}</p>
               </div>
               <div className="review-columns">
                 <section><h3>Source batches</h3>{review.source_batches.length ? <ul className="review-list">{review.source_batches.map((batch) => <li key={`${batch.provider}-${batch.watermark}`}><span><strong>{batch.provider}</strong><small>{batch.environment} · {batch.complete ? "complete" : "incomplete"}</small></span><code>{batch.watermark}</code></li>)}</ul> : <p className="empty-state">No frozen source batch yet.</p>}</section>
-                <section><h3>Evidence</h3>{review.evidence_items.length ? <ul className="review-list">{review.evidence_items.slice(0, 8).map((item) => <li key={item.id}><span><strong>{item.kind}</strong><small>{item.provider} · {item.scope_reference}</small></span><code>{item.source_id}</code></li>)}</ul> : <p className="empty-state">No scoped evidence collected yet.</p>}</section>
+                <section><h3>Evidence</h3>{review.evidence_checklist && <p className={review.evidence_checklist.ready ? "good" : "warn"}>Checklist v{review.evidence_checklist.version}: {review.evidence_checklist.ready ? "complete" : `missing ${review.evidence_checklist.missing.map((item) => item.requirement_id).join(", ")}`}</p>}{review.evidence_items.length ? <ul className="review-list">{review.evidence_items.slice(0, 8).map((item) => <li key={item.id}><span><strong>{item.kind}</strong><small>{item.provider} · {item.scope_reference}</small></span><code>{item.source_id}</code></li>)}</ul> : <p className="empty-state">No scoped evidence collected yet.</p>}</section>
               </div>
               <section className="reconciliation-panel"><h3>Reconciliation</h3>
                 {review.reconciliation_matches.length ? <ul className="review-list">{review.reconciliation_matches.map((match) => <li key={match.id}><span><strong>{match.kind} match · {match.amount} {match.currency}</strong><small>{match.bank_transaction_ids.join(", ")} ↔ {match.ledger_transaction_ids.join(", ")}</small></span><code>{match.evidence_ids.length} sources</code></li>)}</ul> : <p className="empty-state">No persisted reconciliation matches yet.</p>}

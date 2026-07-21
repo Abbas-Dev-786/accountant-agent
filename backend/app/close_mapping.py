@@ -80,12 +80,43 @@ class MatchingRules:
 
 
 @dataclass(frozen=True)
+class EvidenceChecklistRequirement:
+    requirement_id: str
+    description: str
+    required_tags: tuple[str, ...] = ()
+    allowed_kinds: tuple[str, ...] = ("document", "email")
+
+    def __post_init__(self) -> None:
+        requirement_id = _clean(self.requirement_id, "evidence checklist requirement ID", max_length=120)
+        description = _clean(self.description, "evidence checklist requirement description", max_length=500)
+        tags = tuple(dict.fromkeys(_clean(value, "evidence checklist tag", max_length=160) for value in self.required_tags))
+        kinds = tuple(dict.fromkeys(_clean(value, "evidence checklist kind", max_length=40) for value in self.allowed_kinds))
+        if not kinds or any(value not in {"document", "email", "attachment"} for value in kinds):
+            raise PolicyError("evidence checklist kinds must be document, email, or attachment")
+        object.__setattr__(self, "requirement_id", requirement_id)
+        object.__setattr__(self, "description", description)
+        object.__setattr__(self, "required_tags", tags)
+        object.__setattr__(self, "allowed_kinds", kinds)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "requirement_id": self.requirement_id,
+            "description": self.description,
+            "required_tags": list(self.required_tags),
+            "allowed_kinds": list(self.allowed_kinds),
+        }
+
+
+@dataclass(frozen=True)
 class EvidenceConfiguration:
     drive_folder_ids: tuple[str, ...]
     gmail_mailbox: str
     gmail_labels: tuple[str, ...]
     allowed_recipients: tuple[str, ...]
     retention_policy_version: str
+    checklist_id: str = "close-evidence-v1"
+    checklist_version: int = 1
+    checklist_requirements: tuple[EvidenceChecklistRequirement, ...] = ()
 
     def __post_init__(self) -> None:
         folders = tuple(dict.fromkeys(_clean(value, "Drive folder ID") for value in self.drive_folder_ids))
@@ -97,11 +128,27 @@ class EvidenceConfiguration:
             raise PolicyError("Gmail mailbox must be an email address")
         if any("@" not in value for value in recipients):
             raise PolicyError("allowed recipients must be email addresses")
+        checklist_id = _clean(self.checklist_id, "evidence checklist ID", max_length=120)
+        if self.checklist_version < 1:
+            raise PolicyError("evidence checklist version must be positive")
+        requirements = tuple(self.checklist_requirements)
+        if not requirements:
+            requirements = (
+                EvidenceChecklistRequirement(
+                    "scoped-evidence",
+                    "At least one scoped close evidence item is required.",
+                ),
+            )
+        requirement_ids = [item.requirement_id for item in requirements]
+        if len(requirement_ids) != len(set(requirement_ids)):
+            raise PolicyError("evidence checklist requirement IDs must be unique")
         object.__setattr__(self, "drive_folder_ids", folders)
         object.__setattr__(self, "gmail_labels", labels)
         object.__setattr__(self, "allowed_recipients", recipients)
         object.__setattr__(self, "gmail_mailbox", _clean(self.gmail_mailbox, "Gmail mailbox"))
         object.__setattr__(self, "retention_policy_version", _clean(self.retention_policy_version, "retention policy version"))
+        object.__setattr__(self, "checklist_id", checklist_id)
+        object.__setattr__(self, "checklist_requirements", requirements)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -110,6 +157,11 @@ class EvidenceConfiguration:
             "gmail_labels": list(self.gmail_labels),
             "allowed_recipients": list(self.allowed_recipients),
             "retention_policy_version": self.retention_policy_version,
+            "checklist": {
+                "id": self.checklist_id,
+                "version": self.checklist_version,
+                "requirements": [item.as_dict() for item in self.checklist_requirements],
+            },
         }
 
 
@@ -194,6 +246,24 @@ def draft_from_mapping(value: Mapping[str, object]) -> CloseMappingDraft:
         recipients = evidence["allowed_recipients"]
         if any(not isinstance(items, Sequence) or isinstance(items, (str, bytes)) for items in (journal_codes, folders, labels, recipients)):
             raise TypeError
+        checklist = evidence.get("checklist", {})
+        if not isinstance(checklist, Mapping):
+            raise TypeError
+        raw_requirements = checklist.get("requirements", ())
+        if not isinstance(raw_requirements, Sequence) or isinstance(raw_requirements, (str, bytes)):
+            raise TypeError
+        requirements = tuple(
+            EvidenceChecklistRequirement(
+                str(item["requirement_id"]),
+                str(item["description"]),
+                tuple(str(tag) for tag in item.get("required_tags", ())),
+                tuple(str(kind) for kind in item.get("allowed_kinds", ("document", "email"))),
+            )
+            for item in raw_requirements
+            if isinstance(item, Mapping)
+        )
+        if len(requirements) != len(raw_requirements):
+            raise TypeError
         return CloseMappingDraft(
             str(value["xero_tenant_id"]),
             bank_mappings,
@@ -211,6 +281,9 @@ def draft_from_mapping(value: Mapping[str, object]) -> CloseMappingDraft:
                 tuple(str(item) for item in labels),
                 tuple(str(item) for item in recipients),
                 str(evidence["retention_policy_version"]),
+                str(checklist.get("id", "close-evidence-v1")),
+                int(checklist.get("version", 1)),
+                requirements,
             ),
             str(value["journal_adjustment_account_code"])
             if value.get("journal_adjustment_account_code") is not None

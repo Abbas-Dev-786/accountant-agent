@@ -196,7 +196,7 @@ class PlaidIngestionAdapter:
         staged_records = dict(self.state.records)
         cursor = original_cursor
         seen_request_ids: set[str] = set()
-        removed_ids: list[str] = []
+        removed_records: list[tuple[str, Mapping[str, object]]] = []
         removed_id_set: set[str] = set()
 
         for _ in range(self.max_pages):
@@ -229,8 +229,16 @@ class PlaidIngestionAdapter:
                 if record_id in removed_id_set:
                     raise ProviderReadError("Plaid sync returned a duplicate removed transaction")
                 removed_id_set.add(record_id)
-                staged_records.pop(record_id, None)
-                removed_ids.append(record_id)
+                prior = staged_records.pop(record_id, None)
+                tombstone = dict(removed) if isinstance(removed, Mapping) else {"transaction_id": record_id}
+                tombstone["transaction_id"] = str(tombstone.get("transaction_id") or record_id)
+                tombstone["removed"] = True
+                if not isinstance(tombstone.get("account_id"), str) or not str(tombstone["account_id"]):
+                    prior_account_id = prior.get("account_id") if isinstance(prior, Mapping) else None
+                    if not isinstance(prior_account_id, str) or not prior_account_id:
+                        raise ProviderReadError("Plaid removed transaction is missing the previously synced account id")
+                    tombstone["account_id"] = prior_account_id
+                removed_records.append((record_id, tombstone))
 
             if not page.has_more:
                 if not page.next_cursor:
@@ -245,10 +253,10 @@ class PlaidIngestionAdapter:
                     normalize_provider_record(
                         "plaid",
                         record_id,
-                        {"transaction_id": record_id, "removed": True},
+                        record,
                         fallback_observed_at=started_at,
                     )
-                    for record_id in removed_ids
+                    for record_id, record in removed_records
                 )
                 # Commit the staged store only after every page and every
                 # normalized version has succeeded.  A failed retry therefore

@@ -117,7 +117,13 @@ def _mapping_by_plaid_account(configuration: Mapping[str, object]) -> Mapping[st
     return result
 
 
-def _bank_transactions(facts: Sequence[SnapshotFact], mapping: Mapping[str, Mapping[str, object]]) -> tuple[BankTransaction, ...]:
+def _bank_transactions(
+    facts: Sequence[SnapshotFact],
+    mapping: Mapping[str, Mapping[str, object]],
+    *,
+    period_start: date | None = None,
+    period_end: date | None = None,
+) -> tuple[BankTransaction, ...]:
     result: list[BankTransaction] = []
     for fact in facts:
         if fact.provider != "plaid" or fact.payload.get("removed") is True:
@@ -136,12 +142,15 @@ def _bank_transactions(facts: Sequence[SnapshotFact], mapping: Mapping[str, Mapp
         # historic normalized records, but the provider boolean wins.
         if fact.payload.get("pending") is True:
             plaid_status = "pending"
+        accounting_date = _date(fact.payload, fact.accounting_date)
+        if period_start is not None and period_end is not None and not period_start <= accounting_date <= period_end:
+            continue
         result.append(
             BankTransaction(
                 transaction_id=f"plaid:{transaction_id}",
                 amount=amount,
                 currency=_currency(fact.payload, fact.currency),
-                accounting_date=_date(fact.payload, fact.accounting_date),
+                accounting_date=accounting_date,
                 source_evidence_ids=(_evidence_id(fact),),
                 status=plaid_status,
                 description=_text(fact.payload, "name", "merchant_name", "description") or "",
@@ -151,7 +160,12 @@ def _bank_transactions(facts: Sequence[SnapshotFact], mapping: Mapping[str, Mapp
     return tuple(result)
 
 
-def _ledger_transactions(facts: Sequence[SnapshotFact]) -> tuple[LedgerTransaction, ...]:
+def _ledger_transactions(
+    facts: Sequence[SnapshotFact],
+    *,
+    period_start: date | None = None,
+    period_end: date | None = None,
+) -> tuple[LedgerTransaction, ...]:
     """Project only explicit Xero cash/bank transaction shapes.
 
     Invoices are intentionally not treated as settled cash. A source snapshot
@@ -182,12 +196,15 @@ def _ledger_transactions(facts: Sequence[SnapshotFact]) -> tuple[LedgerTransacti
                 continue
             transaction_id = _text(payload, "BankTransactionID", "PaymentID", "JournalID", "id", "transaction_id") or fact.provider_record_id
             account = accounts_by_code.get(account_code or "", {})
+            accounting_date = _date(payload, fact.accounting_date)
+            if period_start is not None and period_end is not None and not period_start <= accounting_date <= period_end:
+                continue
             result.append(
                 LedgerTransaction(
                     transaction_id=f"xero:{transaction_id}",
                     amount=amount,
                     currency=_currency(payload, provider_currency(account) or fact.currency),
-                    accounting_date=_date(payload, fact.accounting_date),
+                    accounting_date=accounting_date,
                     source_evidence_ids=(_evidence_id(fact),),
                     account_code=account_code or "unmapped",
                     description=_text(payload, "Narration", "Reference", "description") or "",
@@ -311,47 +328,83 @@ def _entries(facts: Sequence[SnapshotFact]) -> tuple[tuple[AccountingEntry, ...]
     return tuple(result), tuple(dict.fromkeys(unsupported_facts))
 
 
+def _provider_reports(facts: Sequence[SnapshotFact]) -> Mapping[str, Mapping[str, object]]:
+    reports: dict[str, Mapping[str, object]] = {}
+    for fact in facts:
+        if fact.provider != "xero" or _text(fact.payload, "record_type") != "report":
+            continue
+        kind = _text(fact.payload, "report_kind")
+        payload = fact.payload.get("report_payload")
+        if kind not in {"trial_balance", "profit_and_loss", "balance_sheet"} or not isinstance(payload, Mapping):
+            raise CloseExecutionError("frozen Xero report record is malformed")
+        reports[kind] = payload
+    return reports
+
+
 def _report_payload(
     entries: Sequence[AccountingEntry],
     banks: Sequence[BankTransaction],
     ledgers: Sequence[LedgerTransaction],
     mapping: Mapping[str, Mapping[str, object]],
+    provider_reports: Mapping[str, Mapping[str, object]],
+    material_exception_count: int,
     unsupported_journal_facts: Sequence[str] = (),
 ) -> tuple[Mapping[str, object], str]:
     bank_total = sum((item.amount for item in banks), Decimal("0"))
     cash_codes = {str(item["xero_account_code"]) for item in mapping.values()}
     ledger_cash_total = sum((item.amount for item in ledgers if item.account_code in cash_codes), Decimal("0"))
-    if unsupported_journal_facts:
+    required_reports = {"trial_balance", "profit_and_loss", "balance_sheet"}
+    missing_reports = sorted(required_reports - set(provider_reports))
+    cash = {
+        "bank_total": str(bank_total),
+        "ledger_cash_total": str(ledger_cash_total),
+        "difference": str(bank_total - ledger_cash_total),
+        "evidence_ids": [item.source_evidence_ids[0] for item in banks],
+    }
+    if missing_reports:
         return (
             {
                 "status": "unavailable",
-                "reason": "frozen snapshot has Xero journal lines without account-type metadata",
-                "cash": {"bank_total": str(bank_total), "ledger_cash_total": str(ledger_cash_total)},
+                "reason": f"frozen snapshot is missing Xero reports: {', '.join(missing_reports)}",
+                "cash_reconciliation": cash,
             },
             "unavailable",
         )
-    if not entries:
-        return ({"status": "unavailable", "reason": "frozen snapshot has no supported Xero journal-line facts", "cash": {"bank_total": str(bank_total), "ledger_cash_total": str(ledger_cash_total)}}, "unavailable")
-    try:
-        reports: CloseReports = compute_reports(
-            entries,
-            entries,
-            bank_total=bank_total,
-            ledger_cash_total=ledger_cash_total,
-            cash_evidence_ids=tuple(item.source_evidence_ids[0] for item in banks),
-        )
-    except Exception as exc:
-        return ({"status": "exception", "reason": str(exc), "cash": {"bank_total": str(bank_total), "ledger_cash_total": str(ledger_cash_total)}}, "exception")
-    def trial_balance(balance):
-        return [{"account_code": item.account_code, "account_name": item.account_name, "debit": str(item.debit), "credit": str(item.credit), "evidence_ids": list(item.evidence_ids)} for item in balance.lines]
-    return ({
-        "status": "passed",
-        "unadjusted_trial_balance": trial_balance(reports.unadjusted_trial_balance),
-        "adjusted_trial_balance": trial_balance(reports.adjusted_trial_balance),
-        "profit_and_loss": dict((name, str(value)) for name, value in reports.profit_and_loss),
-        "balance_sheet": dict((name, str(value)) for name, value in reports.balance_sheet),
-        "cash_reconciliation": {"bank_total": str(reports.cash_reconciliation.bank_total), "ledger_cash_total": str(reports.cash_reconciliation.ledger_cash_total), "difference": str(reports.cash_reconciliation.difference), "evidence_ids": list(reports.cash_reconciliation.evidence_ids)},
-    }, "passed")
+    status = "passed" if bank_total == ledger_cash_total and material_exception_count == 0 else "exception"
+    reason = None
+    if material_exception_count:
+        reason = f"{material_exception_count} material reconciliation exception(s) remain open"
+    elif bank_total != ledger_cash_total:
+        reason = "cash reconciliation does not tie"
+    payload: dict[str, object] = {
+        "status": status,
+        "provider_reports": dict(provider_reports),
+        "cash_reconciliation": cash,
+        "material_exception_count": material_exception_count,
+    }
+    if reason:
+        payload["reason"] = reason
+    # Manual-journal line checks remain useful, but they are explicitly
+    # supplemental. The three provider reports above are the complete ledger
+    # source, rather than treating this application's manual journals as a GL.
+    if unsupported_journal_facts:
+        payload["manual_journal_metadata_warnings"] = list(unsupported_journal_facts)
+    if entries:
+        try:
+            local_controls: CloseReports = compute_reports(
+                entries,
+                entries,
+                bank_total=bank_total,
+                ledger_cash_total=ledger_cash_total,
+                cash_evidence_ids=tuple(item.source_evidence_ids[0] for item in banks),
+            )
+            payload["manual_journal_control_totals"] = {
+                "debits": str(local_controls.unadjusted_trial_balance.total_debit),
+                "credits": str(local_controls.unadjusted_trial_balance.total_credit),
+            }
+        except Exception as exc:
+            payload["manual_journal_control_warning"] = str(exc)
+    return payload, status
 
 
 def _proposal_for_exception(
@@ -409,6 +462,9 @@ def _proposal_for_exception(
 def derive_close_execution(
     facts: Sequence[SnapshotFact],
     configuration: Mapping[str, object],
+    *,
+    period_start: date | None = None,
+    period_end: date | None = None,
 ) -> DerivedCloseExecution:
     mapping = _mapping_by_plaid_account(configuration)
     rules = configuration.get("matching_rules")
@@ -421,12 +477,22 @@ def derive_close_execution(
         max_aggregate_size=max(2, int(rules.get("max_aggregate_size", 2))),
         fee_tolerance=_decimal(rules.get("fee_tolerance", "0"), "fee tolerance"),
     )
-    all_banks = _bank_transactions(facts, mapping)
-    # "Exclude" means exclude pending transactions from close controls; it
-    # never means silently treating them as posted/matched.
-    banks = tuple(item for item in all_banks if not (pending_policy == "exclude" and item.status == "pending"))
-    ledgers = _ledger_transactions(facts)
+    if (period_start is None) != (period_end is None) or (period_start and period_end and period_end < period_start):
+        raise CloseExecutionError("close period bounds are invalid")
+    all_banks = _bank_transactions(facts, mapping, period_start=period_start, period_end=period_end)
+    # Pending records are always retained. An exclusion is persisted as an
+    # explicit ignored policy exception rather than removed from review.
+    banks = all_banks
+    ledgers = _ledger_transactions(facts, period_start=period_start, period_end=period_end)
     raw_reconciliation = reconcile(banks, ledgers, config)
+    materiality_threshold = _decimal(rules.get("materiality_threshold", "0"), "materiality threshold")
+    normalized_exceptions = tuple(
+        replace(
+            item,
+            status="ignored" if pending_policy == "exclude" and item.control_code == "pending_transaction" else item.status,
+        )
+        for item in raw_reconciliation.exceptions
+    )
     reconciliation = ReconciliationResult(
         tuple(
             replace(
@@ -440,13 +506,36 @@ def derive_close_execution(
                 item,
                 exception_id=f"exception-{sha256('|'.join((item.control_code, *item.source_transaction_ids)).encode()).hexdigest()[:24]}",
             )
-            for item in raw_reconciliation.exceptions
+            for item in normalized_exceptions
         ),
         raw_reconciliation.statuses,
     )
     entries, unsupported_journal_facts = _entries(facts)
-    report, report_status = _report_payload(entries, banks, ledgers, mapping, unsupported_journal_facts)
-    input_hash = sha256(_canonical([{"id": item.version_id, "provider": item.provider, "payload": item.payload} for item in facts]).encode()).hexdigest()
+    material_exceptions = tuple(
+        item
+        for item in reconciliation.exceptions
+        if item.status == "open" and abs(item.amount) > materiality_threshold
+    )
+    report, report_status = _report_payload(
+        entries,
+        banks,
+        ledgers,
+        mapping,
+        _provider_reports(facts),
+        len(material_exceptions),
+        unsupported_journal_facts,
+    )
+    report = {**report, "materiality_threshold": str(materiality_threshold)}
+    input_hash = sha256(
+        _canonical(
+            {
+                "facts": [{"id": item.version_id, "provider": item.provider, "payload": item.payload} for item in facts],
+                "configuration": configuration,
+                "period_start": period_start.isoformat() if period_start else None,
+                "period_end": period_end.isoformat() if period_end else None,
+            }
+        ).encode()
+    ).hexdigest()
     report_hash = sha256(_canonical(report).encode()).hexdigest()
     bank_by_id = {item.transaction_id: item for item in banks}
     exception_facts: dict[str, tuple[Mapping[str, str], ...]] = {}
@@ -475,7 +564,7 @@ def derive_close_execution(
     # stay safe and simply contain no auto-proposal.
     proposals = tuple(
         proposal
-        for exception in reconciliation.exceptions
+        for exception in material_exceptions
         if (proposal := _proposal_for_exception(exception, bank_by_id, bank_account_by_id, mapping, configuration)) is not None
     )
     return DerivedCloseExecution(reconciliation, input_hash, report, report_hash, report_status, proposals, exception_facts)

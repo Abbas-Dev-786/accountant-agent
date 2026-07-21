@@ -23,7 +23,17 @@ from .close_mapping import PersistedCloseMapping
 from .connections import ConnectionHealth, ConnectionStatus
 from .close_execution import CloseExecutionError, derive_close_execution
 from .domain import CloseRun, CloseService, DeploymentConfig, RunState
-from .evidence import EmailPolicy, EmailRequest, EmailTemplate, EvidenceCollector, EvidencePolicyError, EvidenceScope
+from .evidence import (
+    ChecklistRequirement,
+    ChecklistVersion,
+    EmailPolicy,
+    EmailRequest,
+    EmailTemplate,
+    EvidenceCollector,
+    EvidencePolicyError,
+    EvidenceScope,
+    evaluate_checklist,
+)
 from .google_oauth import GoogleOAuthClient, GoogleOAuthConfig, GoogleOAuthError
 from .groq import GroqConfig, GroqError, GroqExplanationModel
 from .provider_runtime import GmailHttpClient, GoogleDriveHttpClient, XeroDraftHttpClient
@@ -34,9 +44,16 @@ from .provider_runtime import (
     XeroDemoHttpClient,
     XeroProductionHttpClient,
 )
-from .providers import PlaidProductionAdapter, PlaidSandboxAdapter, ProviderReadError, XeroDemoAdapter, XeroProductionAdapter
+from .providers import (
+    PlaidCursorState,
+    PlaidProductionAdapter,
+    PlaidSandboxAdapter,
+    ProviderReadError,
+    XeroDemoAdapter,
+    XeroProductionAdapter,
+)
 from .secrets_store import SecretStoreError, secret_store_from_environment
-from .supabase_db import PersistedTask
+from .supabase_db import PersistedPlaidSyncRequest, PersistedTask
 from .xero_oauth import XeroOAuthClient, XeroOAuthConfig, XeroOAuthError
 
 
@@ -236,7 +253,7 @@ class ProductionPreflightExecutor:
         run = self.store.get_close_run(task.run_id)
         if run is None:
             raise TaskBlocked("close run is unavailable for production preflight")
-        mapping = self.store.active_close_mapping(run.organization_id)
+        mapping = self.store.mapping_for_run(task.run_id)
         if mapping is None:
             raise TaskBlocked("an accountant-approved close mapping is required before production preflight")
         configuration = _mapping_configuration(mapping)
@@ -282,10 +299,16 @@ class SourceSnapshotStore(Protocol):
     def connections_for_organization(self, organization_id: str):
         ...
 
-    def active_close_mapping(self, organization_id: str):
+    def mapping_for_run(self, run_id: str):
         ...
 
     def connection_secret_ref(self, organization_id: str, provider: str, provider_target: str) -> str | None:
+        ...
+
+    def plaid_item_id_for_accounts(self, organization_id: str, account_ids):
+        ...
+
+    def plaid_sync_state_for_item(self, organization_id: str, item_id: str):
         ...
 
     def persist_source_snapshot(self, **kwargs):
@@ -406,8 +429,8 @@ class ProductionSourceSyncExecutor:
         try:
             xero_config = XeroOAuthConfig.from_environment(self.env)
             secrets = secret_store_from_environment(self.env)
-            mapping_reader = getattr(self.store, "active_close_mapping", None)
-            mapping = mapping_reader(run.organization_id) if callable(mapping_reader) else None
+            mapping_reader = getattr(self.store, "mapping_for_run", None)
+            mapping = mapping_reader(task.run_id) if callable(mapping_reader) else None
             if mapping is not None:
                 configuration = _mapping_configuration(mapping)
                 expected_tenant = str(configuration["xero_tenant_id"])
@@ -474,6 +497,12 @@ class ProductionSourceSyncExecutor:
             )
             close_service = CloseService(self.deployment)
             xero_batch = xero.read_batch()
+            sync_state_reader = getattr(self.store, "plaid_sync_state_for_item", None)
+            persisted_state = (
+                sync_state_reader(run.organization_id, plaid_item_id)
+                if callable(sync_state_reader)
+                else None
+            )
             plaid = PlaidProductionAdapter(
                 PlaidProductionHttpClient(
                     client_id=self.env.get("PLAID_CLIENT_ID", "").strip(),
@@ -482,6 +511,10 @@ class ProductionSourceSyncExecutor:
                     transport=UrllibJsonTransport(),
                 ),
                 secrets.resolve(plaid_access_ref),
+                state=PlaidCursorState(
+                    persisted_state.cursor if persisted_state is not None else None,
+                    dict(persisted_state.records) if persisted_state is not None else {},
+                ),
             )
             plaid_batch = plaid.read_batch()
             _validate_selected_plaid_accounts(plaid_batch, selected_accounts)
@@ -493,6 +526,11 @@ class ProductionSourceSyncExecutor:
                 provider_identities={
                     "xero": expected_tenant,
                     "plaid": plaid_item_id,
+                },
+                plaid_sync_state={
+                    "item_id": plaid_item_id,
+                    "cursor": plaid.state.cursor,
+                    "records": plaid.state.records,
                 },
             )
         except TaskBlocked:
@@ -507,11 +545,112 @@ def _validate_selected_plaid_accounts(batch, selected_accounts: frozenset[str]) 
 
     for record in batch.record_versions:
         payload = json.loads(record.payload_json)
-        if payload.get("removed") is True:
-            continue
         account_id = payload.get("account_id")
         if not isinstance(account_id, str) or account_id not in selected_accounts:
             raise TaskBlocked("Plaid source contains a transaction outside the approved account selection")
+
+
+class PlaidWebhookSyncStore(Protocol):
+    def claim_next_plaid_sync_request(self, worker_id: str, *, lease_seconds: int = 60) -> PersistedPlaidSyncRequest | None:
+        ...
+
+    def complete_plaid_sync_request(self, request: PersistedPlaidSyncRequest, worker_id: str) -> None:
+        ...
+
+    def block_plaid_sync_request(self, request: PersistedPlaidSyncRequest, worker_id: str, error: str) -> None:
+        ...
+
+    def retry_plaid_sync_request(self, request: PersistedPlaidSyncRequest, worker_id: str, error: str) -> str:
+        ...
+
+    def plaid_accounts_for_item(self, organization_id: str, item_id: str):
+        ...
+
+    def connection_secret_ref(self, organization_id: str, provider: str, provider_target: str) -> str | None:
+        ...
+
+    def plaid_sync_state_for_item(self, organization_id: str, item_id: str):
+        ...
+
+    def persist_plaid_sync_state(self, **kwargs) -> None:
+        ...
+
+
+class PlaidWebhookSyncWorker:
+    """Advance persisted Plaid Transactions Sync state for verified webhook events."""
+
+    def __init__(
+        self,
+        store: PlaidWebhookSyncStore,
+        *,
+        worker_id: str,
+        env: Mapping[str, str] | None = None,
+        lease_seconds: int = 300,
+    ) -> None:
+        self.store = store
+        self.worker_id = worker_id
+        self.env = os.environ if env is None else env
+        self.lease_seconds = lease_seconds
+
+    def process_once(self) -> WorkerResult:
+        request = self.store.claim_next_plaid_sync_request(self.worker_id, lease_seconds=self.lease_seconds)
+        if request is None:
+            return WorkerResult(None, None, "idle")
+        try:
+            self._sync(request)
+        except TaskBlocked as exc:
+            error = str(exc) or "Plaid webhook sync is blocked pending operator action"
+            self.store.block_plaid_sync_request(request, self.worker_id, error)
+            return WorkerResult(request.request_id, "sync_plaid_webhook", "blocked", error)
+        except Exception:
+            error = "Plaid webhook sync failed; retrying within the persisted attempt budget"
+            state = self.store.retry_plaid_sync_request(request, self.worker_id, error)
+            return WorkerResult(request.request_id, "sync_plaid_webhook", "retrying" if state == "ready" else "failed", error)
+        self.store.complete_plaid_sync_request(request, self.worker_id)
+        return WorkerResult(request.request_id, "sync_plaid_webhook", "succeeded")
+
+    def _sync(self, request: PersistedPlaidSyncRequest) -> None:
+        try:
+            secrets = secret_store_from_environment(self.env)
+            client_id = self.env.get("PLAID_CLIENT_ID", "").strip()
+            secret_ref = self.env.get("PLAID_SECRET_REF", "").strip()
+            if not client_id or not secret_ref:
+                raise TaskBlocked("Plaid production application credentials are not configured")
+            secrets.resolve(secret_ref)
+            account_ids = frozenset(str(value) for value in self.store.plaid_accounts_for_item(request.organization_id, request.item_id))
+            if not account_ids:
+                raise TaskBlocked("Plaid webhook Item is no longer connected to a healthy production account")
+            access_refs = {
+                self.store.connection_secret_ref(request.organization_id, "plaid", account_id)
+                for account_id in account_ids
+            }
+            if None in access_refs or len(access_refs) != 1:
+                raise TaskBlocked("Plaid webhook Item does not have one healthy production access token")
+            state = self.store.plaid_sync_state_for_item(request.organization_id, request.item_id)
+            adapter = PlaidProductionAdapter(
+                PlaidProductionHttpClient(
+                    client_id=client_id,
+                    client_secret_secret_ref=secret_ref,
+                    secret_resolver=secrets,
+                    transport=UrllibJsonTransport(),
+                ),
+                secrets.resolve(next(iter(access_refs))),
+                state=PlaidCursorState(state.cursor, dict(state.records)),
+            )
+            batch = adapter.read_batch()
+            _validate_selected_plaid_accounts(batch, account_ids)
+            if not adapter.state.cursor:
+                raise TaskBlocked("Plaid webhook sync completed without a durable cursor")
+            self.store.persist_plaid_sync_state(
+                organization_id=request.organization_id,
+                item_id=request.item_id,
+                cursor_value=adapter.state.cursor,
+                records=adapter.state.records,
+            )
+        except TaskBlocked:
+            raise
+        except (ProviderReadError, SecretStoreError, ValueError) as exc:
+            raise TaskBlocked("Plaid webhook synchronization could not complete; inspect provider configuration and logs") from exc
 
 
 class EvidenceStore(Protocol):
@@ -521,7 +660,7 @@ class EvidenceStore(Protocol):
     def persist_evidence_batch(self, **kwargs) -> None:
         ...
 
-    def active_close_mapping(self, organization_id: str):
+    def mapping_for_run(self, run_id: str):
         ...
 
     def connection_secret_ref(self, organization_id: str, provider: str, provider_target: str) -> str | None:
@@ -545,7 +684,7 @@ class GoogleEvidenceExecutor:
         if run is None or run.snapshot_id is None:
             raise TaskBlocked("evidence collection requires the committed source snapshot")
         try:
-            mapping = self.store.active_close_mapping(run.organization_id)
+            mapping = self.store.mapping_for_run(task.run_id)
             if mapping is None:
                 raise TaskBlocked("Google evidence collection requires an accountant-approved close mapping")
             configuration = _mapping_configuration(mapping)
@@ -578,7 +717,12 @@ class GoogleEvidenceExecutor:
                 GoogleDriveHttpClient(access_token_ref, secrets, transport),
                 GmailHttpClient(access_token_ref, secrets, transport),
             ).collect(scope)
-            self.store.persist_evidence_batch(run_id=task.run_id, batch=batch)
+            checklist = _evidence_checklist(evidence)
+            evaluation = evaluate_checklist(checklist, batch)
+            self.store.persist_evidence_batch(run_id=task.run_id, batch=batch, evaluation=evaluation)
+            if not evaluation.ready:
+                missing = ", ".join(item.requirement_id for item in evaluation.missing)
+                raise TaskBlocked(f"evidence checklist is incomplete: {missing}")
         except TaskBlocked:
             raise
         except (EvidencePolicyError, ProviderReadError, GoogleOAuthError, SecretStoreError, ValueError) as exc:
@@ -628,12 +772,17 @@ class DurableReconciliationExecutor:
         run = self.store.get_close_run(task.run_id)
         if run is None or run.snapshot_id is None:
             raise TaskBlocked("reconciliation requires a committed source snapshot")
-        mapping = self.store.active_close_mapping(run.organization_id)
+        mapping = self.store.mapping_for_run(task.run_id)
         if mapping is None:
             raise TaskBlocked("reconciliation requires an accountant-approved close mapping")
         try:
             configuration = _mapping_configuration(mapping)
-            execution = derive_close_execution(self.store.snapshot_facts_for_run(task.run_id), configuration)
+            execution = derive_close_execution(
+                self.store.snapshot_facts_for_run(task.run_id),
+                configuration,
+                period_start=date.fromisoformat(run.period_start),
+                period_end=date.fromisoformat(run.period_end),
+            )
             self.store.persist_close_execution(run_id=task.run_id, execution=execution)
             self._explain_open_exceptions(run, configuration)
             # The generated proposals are deterministic facts tied to the same
@@ -960,6 +1109,61 @@ class GmailRecoveryActionExecutor:
 
 def _mapping_configuration(mapping: PersistedCloseMapping) -> Mapping[str, object]:
     return _validate_mapping_configuration(mapping.configuration)
+
+
+def _evidence_checklist(evidence: Mapping[str, object]) -> ChecklistVersion:
+    """Rebuild the exact versioned checklist captured in the close mapping."""
+    # Existing approved mappings predate the explicit checklist field. Treat
+    # them as the same safe default the mapping model now serializes, rather
+    # than silently accepting an empty evidence batch.
+    raw = evidence.get(
+        "checklist",
+        {
+            "id": "close-evidence-v1",
+            "version": 1,
+            "requirements": [{
+                "requirement_id": "scoped-evidence",
+                "description": "At least one scoped close evidence item is required.",
+                "required_tags": [],
+                "allowed_kinds": ["document", "email"],
+            }],
+        },
+    )
+    if not isinstance(raw, Mapping):
+        raise TaskBlocked("persisted close mapping has no evidence checklist")
+    checklist_id = raw.get("id")
+    version = raw.get("version")
+    requirements = raw.get("requirements")
+    if (
+        not isinstance(checklist_id, str)
+        or not checklist_id
+        or not isinstance(version, int)
+        or not isinstance(requirements, list)
+    ):
+        raise TaskBlocked("persisted evidence checklist is invalid")
+    parsed: list[ChecklistRequirement] = []
+    for item in requirements:
+        if not isinstance(item, Mapping):
+            raise TaskBlocked("persisted evidence checklist requirement is invalid")
+        requirement_id = item.get("requirement_id")
+        description = item.get("description")
+        tags = item.get("required_tags", [])
+        kinds = item.get("allowed_kinds", [])
+        if (
+            not isinstance(requirement_id, str)
+            or not requirement_id
+            or not isinstance(description, str)
+            or not description
+            or not isinstance(tags, list)
+            or not isinstance(kinds, list)
+            or any(not isinstance(value, str) or not value for value in (*tags, *kinds))
+        ):
+            raise TaskBlocked("persisted evidence checklist requirement is invalid")
+        parsed.append(ChecklistRequirement(requirement_id, description, frozenset(tags), frozenset(kinds)))
+    try:
+        return ChecklistVersion(checklist_id, version, tuple(parsed))
+    except EvidencePolicyError as exc:
+        raise TaskBlocked("persisted evidence checklist is invalid") from exc
 
 
 def _validate_mapping_configuration(configuration: object) -> Mapping[str, object]:

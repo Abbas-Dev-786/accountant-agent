@@ -67,6 +67,32 @@ class JsonTransport(Protocol):
         ...
 
 
+_DECIMAL_SENTINEL = "__accountingos_decimal__:"
+
+
+def _json_payload(payload: Mapping[str, object] | None) -> bytes | None:
+    if payload is None:
+        return None
+
+    def default(value: object) -> str:
+        if isinstance(value, Decimal):
+            if not value.is_finite():
+                raise RuntimeConfigError("provider JSON cannot contain a non-finite decimal")
+            return f"{_DECIMAL_SENTINEL}{format(value, 'f')}"
+        raise TypeError(f"{type(value).__name__} is not JSON serializable")
+
+    encoded = json.dumps(payload, default=default, separators=(",", ":"))
+    # ``json.dumps`` has no native Decimal-number encoder. Replace only the
+    # private sentinel it created so providers receive an exact JSON number,
+    # never a rounded binary float or a quoted amount string.
+    encoded = re.sub(
+        rf'"{re.escape(_DECIMAL_SENTINEL)}(-?(?:0|[1-9]\d*)(?:\.\d+)?)"',
+        r"\1",
+        encoded,
+    )
+    return encoded.encode("utf-8")
+
+
 class UrllibJsonTransport:
     def request(
         self,
@@ -75,7 +101,7 @@ class UrllibJsonTransport:
         headers: Mapping[str, str],
         payload: Mapping[str, object] | None = None,
     ) -> JsonResponse:
-        body = json.dumps(payload).encode("utf-8") if payload is not None else None
+        body = _json_payload(payload)
         request = Request(url, data=body, headers={**headers, "Accept": "application/json", "Content-Type": "application/json"}, method=method)
         try:
             with urlopen(request, timeout=30) as response:
@@ -159,6 +185,11 @@ class XeroProductionHttpClient(XeroDemoHttpClient):
         # currency and AccountType needed to project those records safely.
         ("/api.xro/2.0/Accounts", "Accounts", "account"),
     )
+    report_resource_specs: ClassVar[tuple[tuple[str, str], ...]] = (
+        ("/api.xro/2.0/Reports/TrialBalance", "trial_balance"),
+        ("/api.xro/2.0/Reports/ProfitAndLoss", "profit_and_loss"),
+        ("/api.xro/2.0/Reports/BalanceSheet", "balance_sheet"),
+    )
     period_start: date | None = None
     period_end: date | None = None
 
@@ -230,6 +261,39 @@ class XeroProductionHttpClient(XeroDemoHttpClient):
                 decorated.setdefault("id", f"{record_type}:{native_id}")
                 decorated.setdefault("record_type", record_type)
                 records.append(decorated)
+        # Xero's general Journals endpoint is not in the approved scope profile.
+        # Persist the three explicitly authorized report responses instead, so
+        # trial balance, P&L, and balance-sheet outputs include ordinary ledger
+        # activity rather than only manual journals created by this application.
+        if page == 1:
+            if self.period_start is None or self.period_end is None:
+                raise ProviderReadError("Xero production report reads require close-period bounds")
+            for resource_path, report_kind in self.report_resource_specs:
+                url = urljoin(self.base_url.rstrip("/") + "/", resource_path.lstrip("/"))
+                report_parameters = (
+                    {"fromDate": self.period_start.isoformat(), "toDate": self.period_end.isoformat()}
+                    if report_kind == "profit_and_loss"
+                    else {"date": self.period_end.isoformat()}
+                )
+                response = self.transport.request(
+                    "GET",
+                    f"{url}?{urlencode(report_parameters)}",
+                    {"Authorization": f"Bearer {token}", "Xero-tenant-id": self.tenant_id},
+                )
+                if response.status_code >= 400:
+                    raise ProviderReadError(f"Xero production {report_kind} report request failed with HTTP {response.status_code}")
+                request_id = _request_id(response.headers)
+                if request_id:
+                    request_ids.append(request_id)
+                records.append(
+                    {
+                        "id": f"report:{report_kind}:{self.period_start.isoformat()}:{self.period_end.isoformat()}",
+                        "record_type": "report",
+                        "report_kind": report_kind,
+                        "report_payload": response.body,
+                        "Date": self.period_end.isoformat(),
+                    }
+                )
         return XeroPage(
             page,
             tuple(records),
@@ -300,7 +364,7 @@ class XeroDraftHttpClient:
         lines = []
         for account_code, debit, credit, _ in request.lines:
             amount = Decimal(debit) if Decimal(debit) > 0 else -Decimal(credit)
-            lines.append({"AccountCode": account_code, "LineAmount": float(amount)})
+            lines.append({"AccountCode": account_code, "LineAmount": amount})
         body = self._request(
             "POST", "/api.xro/2.0/ManualJournals",
             {"ManualJournals": [{"Narration": request.narration, "Date": request.journal_date,

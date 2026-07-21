@@ -22,7 +22,7 @@ from .close_mapping import CloseMappingDraft, PersistedCloseMapping
 from .close_execution import DerivedCloseExecution, SnapshotFact
 from .connections import ConnectionHealth, ConnectionStatus
 from .domain import CloseRun, JournalProposal, PolicyError, SourceBatch, SourceSnapshot
-from .evidence import EvidenceBatch
+from .evidence import ChecklistEvaluation, EvidenceBatch
 from .security import OAuthTransaction
 
 
@@ -107,6 +107,25 @@ class PersistedConnection:
 
 
 @dataclass(frozen=True)
+class PersistedPlaidSyncState:
+    cursor: str | None
+    records: Mapping[str, Mapping[str, object]]
+
+
+@dataclass(frozen=True)
+class PersistedPlaidSyncRequest:
+    request_id: str
+    organization_id: str
+    item_id: str
+    provider_event_id: str
+    state: str
+    attempt: int
+    lease_owner: str | None
+    lease_expires_at: datetime | None
+    last_error: str | None
+
+
+@dataclass(frozen=True)
 class PersistedTask:
     task_id: str
     run_id: str
@@ -149,6 +168,7 @@ class ReviewData:
     mapping: PersistedCloseMapping | None
     source_batches: tuple[Mapping[str, object], ...]
     evidence_items: tuple[Mapping[str, object], ...]
+    evidence_checklist: Mapping[str, object] | None
     review_package: Mapping[str, object] | None
     journal_proposals: tuple[Mapping[str, object], ...]
     reconciliation_matches: tuple[Mapping[str, object], ...] = ()
@@ -528,6 +548,24 @@ class SupabaseWorkflowStore:
         finally:
             self._close(connection)
 
+    def controller_subject_for_organization(self, organization_id: str) -> str | None:
+        connection = connect(self.config)
+        try:
+            with transaction(connection) as cursor:
+                cursor.execute(
+                    """
+                    select d.controller_subject
+                    from workflow.organizations o
+                    join workflow.deployments d on d.id = o.deployment_id
+                    where o.id = %s and o.status = 'active'
+                    """,
+                    (organization_id,),
+                )
+                row = cursor.fetchone()
+            return str(row[0]) if row is not None else None
+        finally:
+            self._close(connection)
+
     def bootstrap_organization(
         self,
         *,
@@ -659,6 +697,26 @@ class SupabaseWorkflowStore:
                     where organization_id = %s and status = 'active'
                     """,
                     (organization_id,),
+                )
+                row = cursor.fetchone()
+            return self._mapping_from_row(row) if row is not None else None
+        finally:
+            self._close(connection)
+
+    def mapping_for_run(self, run_id: str) -> PersistedCloseMapping | None:
+        """Return the immutable mapping version captured when this run started."""
+        connection = connect(self.config)
+        try:
+            with transaction(connection) as cursor:
+                cursor.execute(
+                    """
+                    select m.id::text, m.organization_id, m.version, m.status, m.configuration_json,
+                           m.approved_by_subject, m.created_at
+                    from workflow.close_runs r
+                    join workflow.close_mappings m on m.id = r.mapping_id
+                    where r.id = %s::uuid
+                    """,
+                    (run_id,),
                 )
                 row = cursor.fetchone()
             return self._mapping_from_row(row) if row is not None else None
@@ -823,12 +881,22 @@ class SupabaseWorkflowStore:
                             (id, run_id, organization_id, control_code, source_transaction_ids,
                              evidence_ids, amount, currency, remediation, facts_json, explanation_status)
                         values (%s, %s::uuid, %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s::jsonb,
-                                case when %s = 'unmatched_ledger' then 'unavailable' else 'pending' end)
+                                case when %s = 'unmatched_ledger' or %s <> 'open'
+                                     then 'unavailable' else 'pending' end)
                         """,
                         (exception.exception_id, run_id, organization_id, exception.control_code,
                          dumps(list(exception.source_transaction_ids)), dumps(list(exception.evidence_ids)),
                          exception.amount, exception.currency, exception.remediation,
-                         dumps(list(execution.exception_facts.get(exception.exception_id, ()))), exception.control_code),
+                         dumps(list(execution.exception_facts.get(exception.exception_id, ()))),
+                         exception.control_code, exception.status),
+                    )
+                    cursor.execute(
+                        """
+                        update workflow.reconciliation_exceptions
+                        set status = %s
+                        where id = %s and run_id = %s::uuid
+                        """,
+                        (exception.status, exception.exception_id, run_id),
                     )
                 cursor.execute(
                     """
@@ -864,7 +932,7 @@ class SupabaseWorkflowStore:
                     """
                     select id, facts_json, amount, currency, source_transaction_ids, evidence_ids, control_code
                     from workflow.reconciliation_exceptions
-                    where run_id = %s::uuid and explanation_status = 'pending'
+                    where run_id = %s::uuid and status = 'open' and explanation_status = 'pending'
                       and control_code <> 'unmatched_ledger'
                     order by created_at, id
                     """,
@@ -961,6 +1029,7 @@ class SupabaseWorkflowStore:
             "run_id": review.run_id,
             "snapshot_id": review.snapshot_id,
             "mapping_version": review.mapping.version if review.mapping else None,
+            "evidence_checklist": dict(review.evidence_checklist) if review.evidence_checklist else None,
             "matches": list(review.reconciliation_matches),
             "exceptions": list(review.reconciliation_exceptions),
             "report": review.report,
@@ -1060,6 +1129,29 @@ class SupabaseWorkflowStore:
                         "tags": list(row[6] or []),
                     }
                     for row in cursor.fetchall()
+                )
+                cursor.execute(
+                    """
+                    select checklist_id, checklist_version, evidence_batch_id, ready,
+                           satisfied_json, missing_json, evaluated_at
+                    from workflow.evidence_checklist_evaluations
+                    where run_id = %s::uuid
+                    """,
+                    (run_id,),
+                )
+                checklist_row = cursor.fetchone()
+                evidence_checklist = (
+                    {
+                        "id": str(checklist_row[0]),
+                        "version": int(checklist_row[1]),
+                        "evidence_batch_id": str(checklist_row[2]),
+                        "ready": bool(checklist_row[3]),
+                        "satisfied": list(checklist_row[4] or []),
+                        "missing": list(checklist_row[5] or []),
+                        "evaluated_at": checklist_row[6].isoformat() if checklist_row[6] is not None else None,
+                    }
+                    if checklist_row is not None
+                    else None
                 )
                 cursor.execute(
                     """
@@ -1183,7 +1275,7 @@ class SupabaseWorkflowStore:
                 } for row in cursor.fetchall())
             return ReviewData(
                 str(run_row[0]), str(run_row[1]) if run_row[1] is not None else None, mapping,
-                source_batches, evidence_items, review_package, journal_proposals,
+                source_batches, evidence_items, evidence_checklist, review_package, journal_proposals,
                 reconciliation_matches, reconciliation_exceptions, report, artifacts, actions,
             )
         finally:
@@ -1228,6 +1320,194 @@ class SupabaseWorkflowStore:
             if set(found) != set(account_ids) or len(set(found.values())) != 1:
                 return None
             return next(iter(found.values()))
+        finally:
+            self._close(connection)
+
+    def plaid_sync_state_for_item(self, organization_id: str, item_id: str) -> PersistedPlaidSyncState:
+        """Load the durable cursor and record cache for one approved Plaid Item."""
+        connection = connect(self.config)
+        try:
+            with transaction(connection) as cursor:
+                cursor.execute(
+                    """
+                    select cursor, records_json
+                    from normalized.plaid_sync_states
+                    where organization_id = %s and item_id = %s
+                    """,
+                    (organization_id, item_id),
+                )
+                row = cursor.fetchone()
+            if row is None:
+                return PersistedPlaidSyncState(None, {})
+            raw_records = row[1] if isinstance(row[1], Mapping) else {}
+            records = {
+                str(record_id): dict(record)
+                for record_id, record in raw_records.items()
+                if isinstance(record_id, str) and isinstance(record, Mapping)
+            }
+            if len(records) != len(raw_records):
+                raise SupabaseConfigError("persisted Plaid cursor state is malformed")
+            return PersistedPlaidSyncState(str(row[0]) if row[0] is not None else None, records)
+        finally:
+            self._close(connection)
+
+    def plaid_accounts_for_item(self, organization_id: str, item_id: str) -> tuple[str, ...]:
+        """Return only healthy production accounts whose persisted Item is the requested one."""
+        connection = connect(self.config)
+        try:
+            with transaction(connection) as cursor:
+                cursor.execute(
+                    """
+                    select provider_tenant_or_account_id
+                    from workflow.connections
+                    where organization_id = %s and provider = 'plaid'
+                      and provider_environment = 'production' and status = 'healthy'
+                      and metadata_json ->> 'plaid_item_id' = %s
+                    order by provider_tenant_or_account_id
+                    """,
+                    (organization_id, item_id),
+                )
+                rows = cursor.fetchall()
+            return tuple(str(row[0]) for row in rows)
+        finally:
+            self._close(connection)
+
+    def persist_plaid_sync_state(
+        self,
+        *,
+        organization_id: str,
+        item_id: str,
+        cursor_value: str,
+        records: Mapping[str, Mapping[str, object]],
+    ) -> None:
+        if (
+            not organization_id
+            or not item_id
+            or not cursor_value
+            or any(not isinstance(record_id, str) or not isinstance(record, Mapping) for record_id, record in records.items())
+        ):
+            raise SupabaseConfigError("Plaid incremental cursor state is invalid")
+        connection = connect(self.config)
+        try:
+            with transaction(connection) as cursor:
+                cursor.execute(
+                    """
+                    insert into normalized.plaid_sync_states
+                        (organization_id, item_id, cursor, records_json, updated_at)
+                    values (%s, %s, %s, %s::jsonb, now())
+                    on conflict (organization_id, item_id) do update
+                    set cursor = excluded.cursor, records_json = excluded.records_json, updated_at = now()
+                    """,
+                    (organization_id, item_id, cursor_value, dumps(dict(records))),
+                )
+        finally:
+            self._close(connection)
+
+    def claim_next_plaid_sync_request(
+        self,
+        worker_id: str,
+        *,
+        lease_seconds: int = 60,
+    ) -> PersistedPlaidSyncRequest | None:
+        if not worker_id or not 1 <= lease_seconds <= 900:
+            raise SupabaseConfigError("worker id and lease duration are invalid")
+        connection = connect(self.config)
+        try:
+            with transaction(connection) as cursor:
+                cursor.execute(
+                    """
+                    update workflow.plaid_sync_requests
+                    set state = 'failed', lease_owner = null, lease_expires_at = null,
+                        last_error = 'Plaid webhook sync lease expired after retry budget', updated_at = now()
+                    where state = 'running' and lease_expires_at < now() and attempt >= max_attempts
+                    """
+                )
+                cursor.execute(
+                    """
+                    update workflow.plaid_sync_requests
+                    set state = 'ready', lease_owner = null, lease_expires_at = null, updated_at = now()
+                    where state = 'running' and lease_expires_at < now() and attempt < max_attempts
+                    """
+                )
+                cursor.execute(
+                    """
+                    select id::text, organization_id, item_id, provider_event_id, state, attempt,
+                           lease_owner, lease_expires_at, last_error
+                    from workflow.plaid_sync_requests
+                    where state = 'ready'
+                    order by created_at, id
+                    for update skip locked
+                    limit 1
+                    """
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    return None
+                cursor.execute(
+                    """
+                    update workflow.plaid_sync_requests
+                    set state = 'running', attempt = attempt + 1, lease_owner = %s,
+                        lease_expires_at = now() + (%s * interval '1 second'), updated_at = now()
+                    where id = %s::uuid
+                    returning id::text, organization_id, item_id, provider_event_id, state, attempt,
+                              lease_owner, lease_expires_at, last_error
+                    """,
+                    (worker_id, lease_seconds, row[0]),
+                )
+                claimed = cursor.fetchone()
+            return self._plaid_sync_request_from_row(claimed) if claimed is not None else None
+        finally:
+            self._close(connection)
+
+    def complete_plaid_sync_request(self, request: PersistedPlaidSyncRequest, worker_id: str) -> None:
+        self._finish_plaid_sync_request(request, worker_id, state="succeeded", error=None)
+
+    def block_plaid_sync_request(self, request: PersistedPlaidSyncRequest, worker_id: str, error: str) -> None:
+        self._finish_plaid_sync_request(request, worker_id, state="blocked", error=error)
+
+    def retry_plaid_sync_request(self, request: PersistedPlaidSyncRequest, worker_id: str, error: str) -> str:
+        connection = connect(self.config)
+        try:
+            with transaction(connection) as cursor:
+                cursor.execute(
+                    """
+                    update workflow.plaid_sync_requests
+                    set state = case when attempt >= max_attempts then 'failed' else 'ready' end,
+                        lease_owner = null, lease_expires_at = null, last_error = %s, updated_at = now()
+                    where id = %s::uuid and state = 'running' and lease_owner = %s and lease_expires_at > now()
+                    returning state
+                    """,
+                    (error, request.request_id, worker_id),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    raise SupabaseConfigError("Plaid webhook sync request is not owned by this worker")
+            return str(row[0])
+        finally:
+            self._close(connection)
+
+    def _finish_plaid_sync_request(
+        self,
+        request: PersistedPlaidSyncRequest,
+        worker_id: str,
+        *,
+        state: str,
+        error: str | None,
+    ) -> None:
+        connection = connect(self.config)
+        try:
+            with transaction(connection) as cursor:
+                cursor.execute(
+                    """
+                    update workflow.plaid_sync_requests
+                    set state = %s, lease_owner = null, lease_expires_at = null,
+                        last_error = %s, updated_at = now()
+                    where id = %s::uuid and state = 'running' and lease_owner = %s and lease_expires_at > now()
+                    """,
+                    (state, error, request.request_id, worker_id),
+                )
+                if cursor.rowcount != 1:
+                    raise SupabaseConfigError("Plaid webhook sync request is not owned by this worker")
         finally:
             self._close(connection)
 
@@ -1336,6 +1616,43 @@ class SupabaseWorkflowStore:
                 )
                 inserted = cursor.fetchone()
                 if inserted is not None:
+                    item_id = payload.get("item_id")
+                    webhook_type = payload.get("webhook_type")
+                    webhook_code = payload.get("webhook_code")
+                    transaction_updates = {
+                        "SYNC_UPDATES_AVAILABLE",
+                        "INITIAL_UPDATE",
+                        "HISTORICAL_UPDATE",
+                        "DEFAULT_UPDATE",
+                    }
+                    if (
+                        isinstance(item_id, str)
+                        and item_id
+                        and webhook_type == "TRANSACTIONS"
+                        and webhook_code in transaction_updates
+                    ):
+                        cursor.execute(
+                            """
+                            select distinct organization_id
+                            from workflow.connections
+                            where provider = 'plaid' and provider_environment = 'production'
+                              and status = 'healthy' and metadata_json ->> 'plaid_item_id' = %s
+                            """,
+                            (item_id,),
+                        )
+                        organizations = [str(row[0]) for row in cursor.fetchall()]
+                        if len(organizations) > 1:
+                            raise SupabaseConfigError("Plaid Item is associated with more than one organization")
+                        if organizations:
+                            cursor.execute(
+                                """
+                                insert into workflow.plaid_sync_requests
+                                    (organization_id, item_id, provider_event_id, state)
+                                values (%s, %s, %s, 'ready')
+                                on conflict (provider_event_id) do nothing
+                                """,
+                                (organizations[0], item_id, provider_event_id),
+                            )
                     return True
                 cursor.execute(
                     """
@@ -1712,17 +2029,23 @@ class SupabaseWorkflowStore:
         run_id: str,
         package_hash: str,
         actor_subject: str,
+        comment: str = "",
     ) -> PersistedCloseRun:
         connection = connect(self.config)
         try:
             with transaction(connection) as cursor:
                 cursor.execute(
                     """
-                    select r.organization_id, r.snapshot_id::text, p.id::text
+                    select r.organization_id, r.snapshot_id::text, p.id::text,
+                           d.controller_subject, report.control_status, checklist.ready
                     from workflow.close_runs r
                     join workflow.review_packages p on p.run_id = r.id
+                    join workflow.organizations o on o.id = r.organization_id
+                    join workflow.deployments d on d.id = o.deployment_id
+                    left join workflow.close_reports report on report.run_id = r.id
+                    left join workflow.evidence_checklist_evaluations checklist on checklist.run_id = r.id
                     where r.id = %s::uuid and r.state = 'awaiting_approval' and p.package_hash = %s
-                    for update
+                    for update of r, p
                     """,
                     (run_id, package_hash),
                 )
@@ -1730,14 +2053,20 @@ class SupabaseWorkflowStore:
                 if row is None:
                     raise SupabaseConfigError("approval must reference the current frozen review package")
                 organization_id, snapshot_id, package_id = str(row[0]), str(row[1]), str(row[2])
+                if str(row[3]) != actor_subject:
+                    raise SupabaseConfigError("only the configured deployment controller may approve this close")
+                if row[4] != "passed":
+                    raise SupabaseConfigError("approval is blocked until the frozen close report controls pass")
+                if row[5] is not True:
+                    raise SupabaseConfigError("approval is blocked until the frozen evidence checklist is complete")
                 snapshot_hash = sha256(snapshot_id.encode()).hexdigest()
                 cursor.execute(
                     """
                     insert into workflow.approvals
-                        (run_id, package_hash, snapshot_hash, actor_subject, decision)
-                    values (%s::uuid, %s, %s, %s, 'approved')
+                        (run_id, package_hash, snapshot_hash, actor_subject, decision, comment)
+                    values (%s::uuid, %s, %s, %s, 'approved', %s)
                     """,
-                    (run_id, package_hash, snapshot_hash, actor_subject),
+                    (run_id, package_hash, snapshot_hash, actor_subject, comment),
                 )
                 cursor.execute(
                     "select count(*) from workflow.journal_proposals where review_package_id = %s::uuid",
@@ -1765,6 +2094,10 @@ class SupabaseWorkflowStore:
                     )
                 next_state = "applying_approved_actions" if proposal_count else "approved"
                 cursor.execute(
+                    "update workflow.review_packages set status = 'finalized' where id = %s::uuid",
+                    (package_id,),
+                )
+                cursor.execute(
                     """
                     update workflow.close_runs set state = %s, updated_at = now()
                     where id = %s::uuid
@@ -1781,6 +2114,68 @@ class SupabaseWorkflowStore:
                     task_id=None,
                     event_type="review_package_approved",
                     payload={"package_hash": package_hash, "proposal_count": proposal_count},
+                )
+            return self._run_from_row(run_row)
+        finally:
+            self._close(connection)
+
+    def request_review_changes(
+        self,
+        *,
+        run_id: str,
+        package_hash: str,
+        actor_subject: str,
+        comment: str,
+    ) -> PersistedCloseRun:
+        """Record a controller's rejection against the exact frozen package."""
+        if len(comment.strip()) < 3:
+            raise SupabaseConfigError("a review change request needs a comment")
+        connection = connect(self.config)
+        try:
+            with transaction(connection) as cursor:
+                cursor.execute(
+                    """
+                    select r.organization_id, r.snapshot_id::text, d.controller_subject
+                    from workflow.close_runs r
+                    join workflow.review_packages p on p.run_id = r.id
+                    join workflow.organizations o on o.id = r.organization_id
+                    join workflow.deployments d on d.id = o.deployment_id
+                    where r.id = %s::uuid and r.state = 'awaiting_approval' and p.package_hash = %s
+                    for update of r, p
+                    """,
+                    (run_id, package_hash),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    raise SupabaseConfigError("change request must reference the current frozen review package")
+                organization_id, snapshot_id, controller_subject = str(row[0]), str(row[1]), str(row[2])
+                if controller_subject != actor_subject:
+                    raise SupabaseConfigError("only the configured deployment controller may request changes")
+                cursor.execute(
+                    """
+                    insert into workflow.approvals
+                        (run_id, package_hash, snapshot_hash, actor_subject, decision, comment)
+                    values (%s::uuid, %s, %s, %s, 'changes_requested', %s)
+                    """,
+                    (run_id, package_hash, sha256(snapshot_id.encode()).hexdigest(), actor_subject, comment.strip()),
+                )
+                cursor.execute(
+                    """
+                    update workflow.close_runs set state = 'changes_requested', updated_at = now()
+                    where id = %s::uuid
+                    returning id::text, organization_id, period_start::text, period_end::text,
+                              state, deployment_mode, data_class, snapshot_id::text, package_hash
+                    """,
+                    (run_id,),
+                )
+                run_row = cursor.fetchone()
+                self._record_task_event(
+                    cursor,
+                    organization_id=organization_id,
+                    run_id=run_id,
+                    task_id=None,
+                    event_type="review_changes_requested",
+                    payload={"package_hash": package_hash, "comment": comment.strip()},
                 )
             return self._run_from_row(run_row)
         finally:
@@ -2106,6 +2501,7 @@ class SupabaseWorkflowStore:
         batches: Sequence[SourceBatch],
         snapshot: SourceSnapshot,
         provider_identities: Mapping[str, str],
+        plaid_sync_state: Mapping[str, object] | None = None,
     ) -> PersistedCloseRun:
         """Commit source batches, normalized facts, raw facts, and one snapshot atomically."""
         connection = connect(self.config)
@@ -2147,6 +2543,19 @@ class SupabaseWorkflowStore:
                     raw_bank_table = "raw_bank_demo.records"
                 else:
                     raise SupabaseConfigError("close run has an invalid deployment/data boundary")
+                if plaid_sync_state is not None:
+                    item_id = plaid_sync_state.get("item_id")
+                    cursor_value = plaid_sync_state.get("cursor")
+                    records = plaid_sync_state.get("records")
+                    if (
+                        not isinstance(item_id, str)
+                        or not item_id
+                        or not isinstance(cursor_value, str)
+                        or not isinstance(records, Mapping)
+                        or provider_identities.get("plaid") != item_id
+                        or any(not isinstance(key, str) or not isinstance(value, Mapping) for key, value in records.items())
+                    ):
+                        raise SupabaseConfigError("Plaid incremental cursor state is invalid")
                 for batch in batches:
                     expected_environment = expected_environments.get(batch.provider)
                     if expected_environment is None or batch.provider_environment != expected_environment:
@@ -2242,6 +2651,22 @@ class SupabaseWorkflowStore:
                                     record.observed_at,
                                 ),
                             )
+                if plaid_sync_state is not None:
+                    cursor.execute(
+                        """
+                        insert into normalized.plaid_sync_states
+                            (organization_id, item_id, cursor, records_json, updated_at)
+                        values (%s, %s, %s, %s::jsonb, now())
+                        on conflict (organization_id, item_id) do update
+                        set cursor = excluded.cursor, records_json = excluded.records_json, updated_at = now()
+                        """,
+                        (
+                            organization_id,
+                            str(plaid_sync_state["item_id"]),
+                            str(plaid_sync_state["cursor"]),
+                            dumps(dict(plaid_sync_state["records"])),
+                        ),
+                    )
                 cursor.execute(
                     """
                     insert into normalized.source_snapshots
@@ -2300,7 +2725,13 @@ class SupabaseWorkflowStore:
         finally:
             self._close(connection)
 
-    def persist_evidence_batch(self, *, run_id: str, batch: EvidenceBatch) -> None:
+    def persist_evidence_batch(
+        self,
+        *,
+        run_id: str,
+        batch: EvidenceBatch,
+        evaluation: ChecklistEvaluation | None = None,
+    ) -> None:
         """Write scoped evidence metadata only; document/email bodies stay with providers."""
         batch.validate()
         connection = connect(self.config)
@@ -2353,13 +2784,53 @@ class SupabaseWorkflowStore:
                         str(persisted_context[0]), str(persisted_context[1])
                     ) != (organization_id, run_id):
                         raise SupabaseConfigError("evidence item identity is already bound to another close run")
+                if evaluation is None:
+                    raise SupabaseConfigError("an evaluated evidence checklist is required before reconciliation")
+                if evaluation.evidence_batch_id != batch.batch_id:
+                    raise SupabaseConfigError("evidence checklist evaluation does not match the persisted batch")
+                cursor.execute(
+                    """
+                    insert into workflow.evidence_checklist_evaluations
+                        (run_id, organization_id, checklist_id, checklist_version, evidence_batch_id,
+                         ready, satisfied_json, missing_json, evaluated_at)
+                    values (%s::uuid, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, now())
+                    on conflict (run_id) do update
+                    set checklist_id = excluded.checklist_id,
+                        checklist_version = excluded.checklist_version,
+                        evidence_batch_id = excluded.evidence_batch_id,
+                        ready = excluded.ready,
+                        satisfied_json = excluded.satisfied_json,
+                        missing_json = excluded.missing_json,
+                        evaluated_at = now()
+                    """,
+                    (
+                        run_id,
+                        organization_id,
+                        evaluation.checklist_id,
+                        evaluation.checklist_version,
+                        evaluation.evidence_batch_id,
+                        evaluation.ready,
+                        dumps(list(evaluation.satisfied)),
+                        dumps([
+                            {"requirement_id": missing.requirement_id, "description": missing.description}
+                            for missing in evaluation.missing
+                        ]),
+                    ),
+                )
                 self._record_task_event(
                     cursor,
                     organization_id=organization_id,
                     run_id=run_id,
                     task_id=None,
                     event_type="evidence_batch_committed",
-                    payload={"evidence_count": len(batch.items), "query_ids": list(batch.query_ids)},
+                    payload={
+                        "evidence_count": len(batch.items),
+                        "query_ids": list(batch.query_ids),
+                        "checklist_id": evaluation.checklist_id,
+                        "checklist_version": evaluation.checklist_version,
+                        "checklist_ready": evaluation.ready,
+                        "missing_requirements": [item.requirement_id for item in evaluation.missing],
+                    },
                 )
         finally:
             self._close(connection)
@@ -2638,6 +3109,20 @@ class SupabaseWorkflowStore:
             row[6],
             str(row[7]) if row[7] is not None else None,
             tuple(str(item) for item in (row[8] or ())) if len(row) > 8 else (),
+        )
+
+    @staticmethod
+    def _plaid_sync_request_from_row(row: Sequence[object]) -> PersistedPlaidSyncRequest:
+        return PersistedPlaidSyncRequest(
+            str(row[0]),
+            str(row[1]),
+            str(row[2]),
+            str(row[3]),
+            str(row[4]),
+            int(row[5]),
+            str(row[6]) if row[6] is not None else None,
+            row[7],
+            str(row[8]) if row[8] is not None else None,
         )
 
     @staticmethod

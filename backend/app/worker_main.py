@@ -18,6 +18,7 @@ from .durable_worker import (
     GoogleEvidenceExecutor,
     ProductionPreflightExecutor,
     ProductionSourceSyncExecutor,
+    PlaidWebhookSyncWorker,
     RegisteredTaskExecutor,
     XeroDraftActionExecutor,
 )
@@ -25,6 +26,21 @@ from .supabase_db import SupabaseDatabaseConfig, SupabaseWorkflowStore
 
 
 logger = logging.getLogger("accountingos.worker")
+
+
+class WorkflowWorkerCoordinator:
+    """Prioritize verified Plaid sync notifications without starving close tasks."""
+
+    def __init__(self, close_worker: DurableWorkflowWorker, plaid_worker: PlaidWebhookSyncWorker | None) -> None:
+        self.close_worker = close_worker
+        self.plaid_worker = plaid_worker
+
+    def process_once(self):
+        if self.plaid_worker is not None:
+            result = self.plaid_worker.process_once()
+            if result.status != "idle":
+                return result
+        return self.close_worker.process_once()
 
 
 def deployment_from_environment() -> DeploymentConfig:
@@ -38,7 +54,7 @@ def deployment_from_environment() -> DeploymentConfig:
     )
 
 
-def build_worker(worker_id: str) -> DurableWorkflowWorker:
+def build_worker(worker_id: str) -> WorkflowWorkerCoordinator:
     store = SupabaseWorkflowStore(SupabaseDatabaseConfig.from_environment())
     deployment = deployment_from_environment()
     if deployment.mode == "production":
@@ -64,7 +80,11 @@ def build_worker(worker_id: str) -> DurableWorkflowWorker:
     executor = RegisteredTaskExecutor(
         handlers
     )
-    return DurableWorkflowWorker(store, executor, worker_id=worker_id)
+    close_worker = DurableWorkflowWorker(store, executor, worker_id=worker_id)
+    return WorkflowWorkerCoordinator(
+        close_worker,
+        PlaidWebhookSyncWorker(store, worker_id=worker_id) if deployment.mode == "production" else None,
+    )
 
 
 def main() -> int:

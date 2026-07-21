@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 from .close_mapping import (
     BankLedgerMapping,
     CloseMappingDraft,
+    EvidenceChecklistRequirement,
     EvidenceConfiguration,
     MatchingRules,
 )
@@ -115,6 +116,12 @@ class WorkflowStore(Protocol):
         ...
 
     def approve_review_package(self, **kwargs) -> PersistedCloseRun:
+        ...
+
+    def request_review_changes(self, **kwargs) -> PersistedCloseRun:
+        ...
+
+    def controller_subject_for_organization(self, organization_id: str) -> str | None:
         ...
 
     def active_close_mapping(self, organization_id: str):
@@ -377,6 +384,8 @@ class ProposalRequest(BaseModel):
 
 class ApprovalRequest(BaseModel):
     package_hash: str
+    decision: str = Field(default="approved", pattern=r"^(approved|changes_requested)$")
+    comment: str | None = Field(default=None, max_length=2000)
 
 
 class BankMappingRequest(BaseModel):
@@ -393,12 +402,26 @@ class MatchingRulesRequest(BaseModel):
     max_aggregate_size: int = Field(ge=1, le=100)
 
 
+class EvidenceChecklistRequirementRequest(BaseModel):
+    requirement_id: str = Field(min_length=1, max_length=120)
+    description: str = Field(min_length=1, max_length=500)
+    required_tags: list[str] = Field(default_factory=list, max_length=20)
+    allowed_kinds: list[str] = Field(default_factory=lambda: ["document", "email"], min_length=1, max_length=3)
+
+
+class EvidenceChecklistRequest(BaseModel):
+    id: str = Field(default="close-evidence-v1", min_length=1, max_length=120)
+    version: int = Field(default=1, ge=1, le=10_000)
+    requirements: list[EvidenceChecklistRequirementRequest] = Field(default_factory=list, max_length=50)
+
+
 class EvidenceConfigurationRequest(BaseModel):
     drive_folder_ids: list[str] = Field(min_length=1, max_length=50)
     gmail_mailbox: str = Field(min_length=3, max_length=300)
     gmail_labels: list[str] = Field(min_length=1, max_length=50)
     allowed_recipients: list[str] = Field(min_length=1, max_length=100)
     retention_policy_version: str = Field(min_length=1, max_length=100)
+    checklist: EvidenceChecklistRequest = Field(default_factory=EvidenceChecklistRequest)
 
 
 class CloseMappingRequest(BaseModel):
@@ -430,6 +453,17 @@ class CloseMappingRequest(BaseModel):
                 tuple(self.evidence.gmail_labels),
                 tuple(self.evidence.allowed_recipients),
                 self.evidence.retention_policy_version,
+                self.evidence.checklist.id,
+                self.evidence.checklist.version,
+                tuple(
+                    EvidenceChecklistRequirement(
+                        item.requirement_id,
+                        item.description,
+                        tuple(item.required_tags),
+                        tuple(item.allowed_kinds),
+                    )
+                    for item in self.evidence.checklist.requirements
+                ),
             ),
             self.journal_adjustment_account_code,
         )
@@ -487,6 +521,13 @@ def require_organization_role(
     if role is None or role not in allowed:
         raise HTTPException(status_code=404, detail="organization was not found")
     return role
+
+
+def require_configured_controller(organization_id: str, user: SupabaseUser) -> None:
+    require_organization_role(organization_id, user, frozenset({"controller"}))
+    configured = require_store().controller_subject_for_organization(organization_id)
+    if not configured or configured != user.subject:
+        raise HTTPException(status_code=403, detail="only the configured controller may decide this close package")
 
 
 def serialize_persisted_run(run: PersistedCloseRun, *, actions: list[dict[str, object]] | None = None) -> dict[str, object]:
@@ -703,7 +744,7 @@ async def stream_close_run_events(
     if after < 0:
         raise HTTPException(status_code=422, detail="event cursor must be non-negative")
 
-    terminal_states = frozenset({"blocked", "failed", "cancelled", "awaiting_approval", "approved", "action_failed"})
+    terminal_states = frozenset({"blocked", "failed", "cancelled", "awaiting_approval", "changes_requested", "approved", "action_failed"})
     async def event_stream():
         cursor = after
         idle_cycles = 0
@@ -755,6 +796,7 @@ def get_close_run_review(run_id: str, user: CurrentUser) -> dict[str, object]:
         "mapping": serialize_close_mapping(review.mapping),
         "source_batches": [dict(item) for item in review.source_batches],
         "evidence_items": [dict(item) for item in review.evidence_items],
+        "evidence_checklist": dict(review.evidence_checklist) if review.evidence_checklist else None,
         "review_package": dict(review.review_package) if review.review_package else None,
         "journal_proposals": [dict(item) for item in review.journal_proposals],
         "reconciliation_matches": [dict(item) for item in review.reconciliation_matches],
@@ -1208,11 +1250,23 @@ def approve_close_run(run_id: str, request: ApprovalRequest, user: CurrentUser) 
     run = require_store().get_close_run(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="close run not found")
-    require_organization_role(run.organization_id, user, frozenset({"controller"}))
+    require_configured_controller(run.organization_id, user)
+    if request.decision == "changes_requested":
+        if not request.comment or len(request.comment.strip()) < 3:
+            raise HTTPException(status_code=422, detail="a change request needs a comment")
+        return serialize_persisted_run(
+            require_store().request_review_changes(
+                run_id=run_id,
+                package_hash=request.package_hash,
+                actor_subject=user.subject,
+                comment=request.comment.strip(),
+            )
+        )
     return serialize_persisted_run(
         require_store().approve_review_package(
             run_id=run_id,
             package_hash=request.package_hash,
             actor_subject=user.subject,
+            comment=request.comment.strip() if request.comment else "",
         )
     )
